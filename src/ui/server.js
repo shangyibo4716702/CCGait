@@ -1,0 +1,246 @@
+import { createServer } from 'node:http'
+import { randomBytes } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
+import { extname, join, normalize, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+/**
+ * 本地 Web 客户端服务。
+ *
+ * 安全边界（这个服务能改防火墙规则、能结束进程，必须收紧）：
+ * 1. **只监听 127.0.0.1**，不对外网暴露；
+ * 2. **校验 Host 头**：只接受 localhost / 127.0.0.1 / [::1]，防 DNS 重绑定（恶意域名解析
+ *    到本机后从浏览器里访问本服务）；
+ * 3. **会话令牌**：所有 /api/* 请求都要带启动时随机生成的令牌；令牌只写进本机页面，
+ *    跨站页面拿不到，因此站点无法伪造请求；
+ * 4. **不设 CORS 头**：其它来源读不到响应；
+ * 5. **只读静态文件且限定目录**：路径规范化后必须仍在 public/ 内。
+ */
+
+const PUBLIC_DIR = resolve(fileURLToPath(new URL('./public', import.meta.url)))
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.json': 'application/json; charset=utf-8',
+}
+
+const ALLOWED_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
+
+function hostAllowed(hostHeader) {
+  if (!hostHeader) return false
+  const hostname = hostHeader.startsWith('[')
+    ? hostHeader.slice(0, hostHeader.indexOf(']') + 1)
+    : hostHeader.split(':')[0]
+  return ALLOWED_HOSTS.has(hostname.toLowerCase())
+}
+
+function sendJson(response, status, payload) {
+  const body = JSON.stringify(payload)
+  response.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+  })
+  response.end(body)
+}
+
+async function readJsonBody(request, limitBytes = 512 * 1024) {
+  const chunks = []
+  let total = 0
+  for await (const chunk of request) {
+    total += chunk.length
+    if (total > limitBytes) throw new Error('请求体过大')
+    chunks.push(chunk)
+  }
+  if (chunks.length === 0) return {}
+  try {
+    const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('请求体必须是 JSON 对象')
+    }
+    return parsed
+  } catch (error) {
+    throw new Error(`请求体解析失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+function serveStatic(response, urlPath, token) {
+  const relative = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '')
+  const target = resolve(join(PUBLIC_DIR, normalize(relative)))
+  if (!target.startsWith(PUBLIC_DIR) || !existsSync(target)) {
+    response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
+    response.end('Not found')
+    return
+  }
+  let body = readFileSync(target)
+  const type = MIME[extname(target).toLowerCase()] ?? 'application/octet-stream'
+  // 令牌只注入页面本身；跨站页面读不到 HTML 内容（无 CORS），因此拿不到令牌。
+  if (type.startsWith('text/html')) {
+    body = Buffer.from(body.toString('utf8').replaceAll('__CCGAIT_TOKEN__', token), 'utf8')
+  }
+  response.writeHead(200, {
+    'content-type': type,
+    'content-length': body.length,
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'no-referrer',
+    'content-security-policy':
+      "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'",
+  })
+  response.end(body)
+}
+
+/** 创建一个 UI 服务实例（不自动监听，便于测试里用随机端口）。 */
+export function createUiServer({ session, logger, token = randomBytes(24).toString('hex') }) {
+  const sseClients = new Set()
+
+  const broadcast = (event) => {
+    const payload = `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`
+    for (const client of sseClients) {
+      try {
+        client.write(payload)
+      } catch {
+        sseClients.delete(client)
+      }
+    }
+  }
+  session.subscribe(broadcast)
+
+  const server = createServer((request, response) => {
+    void (async () => {
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1')
+      const path = url.pathname
+
+      if (!hostAllowed(request.headers.host)) {
+        sendJson(response, 403, { error: 'Host 不被允许（只接受本机访问）' })
+        return
+      }
+
+      if (!path.startsWith('/api/')) {
+        if (request.method !== 'GET') {
+          sendJson(response, 405, { error: '只支持 GET' })
+          return
+        }
+        serveStatic(response, path, token)
+        return
+      }
+
+      // 所有 API 都要令牌：GET 走查询参数（EventSource 不能自定义头），其余走请求头。
+      const provided = request.headers['x-ccgait-token'] ?? url.searchParams.get('token')
+      if (provided !== token) {
+        sendJson(response, 401, { error: '会话令牌无效：请通过 ccgait ui 打开的页面访问' })
+        return
+      }
+
+      if (path === '/api/events' && request.method === 'GET') {
+        response.writeHead(200, {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-store',
+          connection: 'keep-alive',
+        })
+        response.write(`event: hello\ndata: ${JSON.stringify({ type: 'hello', at: new Date().toISOString() })}\n\n`)
+        sseClients.add(response)
+        const heartbeat = setInterval(() => {
+          try {
+            response.write(': ping\n\n')
+          } catch {
+            clearInterval(heartbeat)
+          }
+        }, 20_000)
+        request.on('close', () => {
+          clearInterval(heartbeat)
+          sseClients.delete(response)
+        })
+        return
+      }
+
+      if (path === '/api/status' && request.method === 'GET') {
+        sendJson(response, 200, await session.getStatus())
+        return
+      }
+
+      if (path === '/api/logs' && request.method === 'GET') {
+        sendJson(response, 200, { logs: session.getLogs() })
+        return
+      }
+
+      if (request.method !== 'POST') {
+        sendJson(response, 405, { error: '只支持 GET / POST' })
+        return
+      }
+
+      try {
+        switch (path) {
+          case '/api/check':
+            sendJson(response, 200, { check: await session.checkNow() })
+            return
+          case '/api/guard/start':
+            sendJson(response, 200, { guard: await session.startGuard() })
+            return
+          case '/api/guard/stop': {
+            const body = await readJsonBody(request).catch(() => ({}))
+            sendJson(response, 200, { guard: await session.stopGuard({ keepBlocks: body.keepBlocks === true }) })
+            return
+          }
+          case '/api/firewall': {
+            const body = await readJsonBody(request)
+            sendJson(response, 200, { result: await session.setFirewall(body.enabled !== false) })
+            return
+          }
+          case '/api/firewall/enable-profiles':
+            sendJson(response, 200, { result: await session.enableFirewallProfiles() })
+            return
+          case '/api/kill':
+            sendJson(response, 200, await session.killProcesses())
+            return
+          case '/api/config': {
+            const body = await readJsonBody(request)
+            sendJson(response, 200, { config: await session.saveConfig(body.patch ?? body) })
+            return
+          }
+          case '/api/config/reload':
+            sendJson(response, 200, { config: await session.reloadConfig() })
+            return
+          default:
+            sendJson(response, 404, { error: `未知接口：${path}` })
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        logger?.warn?.('UI 操作失败', `${path}：${message}`)
+        sendJson(response, 400, { error: message })
+      }
+    })().catch((error) => {
+      sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
+    })
+  })
+
+  return {
+    server,
+    token,
+    listen(port, host = '127.0.0.1') {
+      return new Promise((resolvePromise, reject) => {
+        server.once('error', reject)
+        server.listen(port, host, () => {
+          server.removeListener('error', reject)
+          resolvePromise(server.address())
+        })
+      })
+    },
+    async close() {
+      for (const client of sseClients) {
+        try {
+          client.end()
+        } catch {
+          // 忽略。
+        }
+      }
+      sseClients.clear()
+      await new Promise((resolvePromise) => server.close(() => resolvePromise()))
+    },
+  }
+}

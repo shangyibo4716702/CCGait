@@ -1,0 +1,50 @@
+{
+  "$comment": "CCGait 按当前机器实际情况生成的起点配置。请按 README 的说明收紧张紧后再长期启用闸门。",
+
+  "whitelist": {
+    "$comment": "默认只允许英国（GB）。代理必须把出口固定在英国节点，否则闸门会拦截。",
+    "$comment2": "要做到固定 IP：先在代理里锁定单一英国节点，再把该 IP 填入 ips。ips 非空后，换节点就会被拦下。",
+    "ips": [],
+    "cidrs": [],
+    "countries": ["GB"],
+    "asns": [],
+    "$comment3": "true = 拒绝机房/代理出口。英国机房 IP 同样会被拦，需要住宅/ISP 出口时再打开。",
+    "requireResidential": true
+  },
+
+  "checks": {
+    "$comment": "enabled 控制是否检测；severity=block 时该维度不通过也拦截，warn 只报告。",
+    "egressIp": { "enabled": true, "severity": "block" },
+    "claudeDns": { "enabled": true, "severity": "block", "deniedCountries": ["CN"] },
+    "timezone": { "enabled": true, "severity": "warn" },
+    "language": { "enabled": true, "severity": "warn" },
+    "fonts": { "enabled": true, "severity": "warn" },
+    "dnsServers": { "enabled": true, "severity": "warn" },
+    "proxyEnvLeak": { "enabled": true, "severity": "warn" }
+  },
+
+  "enforcement": {
+    "$comment": "killProcesses：终止正在运行的 Claude 客户端；blockNetwork：防火墙按程序阻断其出站。",
+    "$comment2": "注意：你的 Windows 防火墙三个配置文件当前是关闭的，blockNetwork 需要先执行 ccgait firewall enable-profiles 才会真正生效。",
+    "killProcesses": true,
+    "blockNetwork": true,
+    "$comment3": "failClosed：判定不出结果（查询失败/多源矛盾）也按拦截处理。",
+    "failClosed": true,
+    "pollIntervalMs": 2000,
+    "recheckIntervalMs": 30000
+  },
+
+  "network": {
+    "$comment": "分流：检测与 ccgait run 启动的客户端都走这个代理。注意代理需把节点固定在英国（已观察到它在 HK/SG 之间轮换，那样会被闸门判为不通过）。",
+    "proxy": {
+      "enabled": true,
+      "url": "http://127.0.0.1:7890",
+      "required": false
+    }
+  },
+
+  "runtime": {
+    "stateDir": "",
+    "logRetentionDays": 7
+  }
+}

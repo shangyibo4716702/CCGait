@@ -1,0 +1,49 @@
+{
+  "$comment": "复制为 config.json 后按需修改：ccgait init。whitelist 是白名单，全部命中才放行。",
+
+  "whitelist": {
+    "$comment": "固定出口。ips/cidrs/asns 为空表示该项不参与判定；countries 为空则任何国家都算命中。默认只允许英国。",
+    "ips": [],
+    "cidrs": [],
+    "countries": ["GB"],
+    "asns": [],
+    "$comment2": "true = 出口被判定为机房/代理/IDC 时直接拦截。若你的固定 IP 本身就是机房或代理，请设为 false，否则会一直被拦。",
+    "requireResidential": true
+  },
+
+  "checks": {
+    "$comment": "enabled 控制是否检测；severity 为 block 时该维度不通过也拦截，warn 只报告。",
+    "egressIp": { "enabled": true, "severity": "block" },
+    "claudeDns": { "enabled": true, "severity": "block", "deniedCountries": ["CN"] },
+    "timezone": { "enabled": true, "severity": "warn" },
+    "language": { "enabled": true, "severity": "warn" },
+    "fonts": { "enabled": true, "severity": "warn" },
+    "dnsServers": { "enabled": true, "severity": "warn" },
+    "proxyEnvLeak": { "enabled": true, "severity": "warn" }
+  },
+
+  "enforcement": {
+    "$comment": "killProcesses：终止正在运行的 Claude 客户端。blockNetwork：防火墙按程序阻断其出站（需要管理员）。",
+    "killProcesses": true,
+    "blockNetwork": true,
+    "$comment2": "failClosed：判定不出结果（查询失败/多源矛盾）也按拦截处理。",
+    "failClosed": true,
+    "pollIntervalMs": 2000,
+    "recheckIntervalMs": 30000
+  },
+
+  "network": {
+    "$comment": "可选分流：给 Claude 进程注入 HTTPS_PROXY，让它固定从该出口出去；检测也走同一条路。",
+    "proxy": {
+      "enabled": false,
+      "url": "http://127.0.0.1:7890",
+      "required": false
+    }
+  },
+
+  "runtime": {
+    "$comment": "日志与状态文件目录；留空则用项目下的 .ccgait/。",
+    "stateDir": "",
+    "logRetentionDays": 7
+  }
+}
