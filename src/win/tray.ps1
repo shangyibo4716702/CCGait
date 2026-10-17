@@ -135,10 +135,15 @@ $itemCheck.add_Click({
 $itemStart = $menu.Items.Add('启动闸门')
 $itemStart.add_Click({
   if (Test-GuardRunning) { Show-Balloon -Title '闸门已在运行' -Text '无需重复启动' ; return }
-  Invoke-Ccgait @('guard') | Out-Null
+  # 执法跑在常驻界面服务进程里：这里请求它把闸门建起来（服务没开时先点「打开界面」）。
+  Invoke-Ccgait @('guard-start') -Wait | Out-Null
   Start-Sleep -Milliseconds 1500
   Update-Tray
-  if (Test-GuardRunning) { Show-Balloon -Title '闸门已启动' -Text '不满足白名单时将阻止 Claude 客户端并阻断其网络' }
+  if (Test-GuardRunning) {
+    Show-Balloon -Title '闸门已启动' -Text '不满足白名单时将阻止 Claude 客户端并阻断其网络'
+  } else {
+    Show-Balloon -Title '闸门未启动' -Text '闸门由常驻界面服务承担：先点「打开界面」把服务拉起来再试'
+  }
 })
 
 $itemStop = $menu.Items.Add('停止闸门')
@@ -181,7 +186,7 @@ $itemLogs.add_Click({ Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$S
 
 $menu.Items.Add('-') | Out-Null
 
-$itemQuit = $menu.Items.Add('退出托盘（闸门不受影响）')
+$itemQuit = $menu.Items.Add('退出托盘（闸门与界面服务继续运行）')
 $itemQuit.add_Click({
   $notify.Visible = $false
   $notify.Dispose()

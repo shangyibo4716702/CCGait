@@ -63,6 +63,9 @@ const checks = [
   ['src/win/wfp.js', 'purgeWfpFilters', '遗留过滤器清理'],
   ['src/win/wfp.js', 'listWfpProcesses', '区分常驻宿主与一次性调用'],
   ['src/cli.js', 'WFP 内核阻断：', 'CLI firewall on/off 同时管理两层'],
+  ['src/cli.js', 'guard-start', '启动闸门改由常驻界面服务进程承担'],
+  ['src/guard.js', 'guard-start.request', '启动请求文件（与停止请求对称）'],
+  ['src/ui/session.js', 'guardStartRequestPath', '服务进程巡检启动请求并建自己的闸门'],
   ['src/ui/session.js', 'wfpOrphan', '界面：宿主与 pid 记录不一致时可见'],
   ['src/ui/session.js', 'stopWfpBlock', '界面：解除阻断同时撤掉 WFP'],
   ['src/ui/public/app.js', '白名单比对', '界面：白名单逐项命中'],
@@ -85,8 +88,9 @@ const checks = [
 ]
 
 const binaryChecks = [
-  ['CCGaitClient.exe', '启动托盘时自动开闸门', '托盘启动即开闸门'],
+  ['CCGaitClient.exe', '启动时自动开闸门', '托盘启动即开闸门'],
   ['CCGaitClient.exe', 'AutoStartGuard', '自动开闸门开关'],
+  ['CCGaitClient.exe', '常驻界面服务', '执法由常驻界面服务进程承担（不再另起 guard 进程）'],
   ['CCGaitWfp.exe', 'PURGED', 'purge 模式'],
   ['CCGaitWfp.exe', '--stop-file', '宿主常驻与停止信号'],
   ['CCGaitWfp.exe', 'list-filters', '过滤器自检'],

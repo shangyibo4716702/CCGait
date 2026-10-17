@@ -49,6 +49,14 @@ let status = undefined
 let busy = new Set()
 const pending = new Set()
 
+/**
+ * 界面会话是否已失效。服务端每次启动都会生成新的会话令牌，而已经打开的页面还揣着旧令牌：
+ * 重启界面之后，这个页面的每个请求都会 401，`refresh()` 抛错、DOM 停在最后一次渲染上 ——
+ * 界面上那些结论就变成了过期数据，却看不出任何异样（实测：闸门正在拦截，页面还写着
+ * "未被拦截"）。所以这里要显式认账，而不是让旧结论一直挂在屏幕上。
+ */
+let sessionLost = false
+
 function setBusy(action, active) {
   if (active) pending.add(action)
   else pending.delete(action)
@@ -76,8 +84,43 @@ async function refresh() {
     status = await api('/api/status')
     render()
   } catch (error) {
-    toast('error', '读取状态失败', error instanceof Error ? error.message : String(error))
+    const message = error instanceof Error ? error.message : String(error)
+    // 令牌失效不是"偶发读取失败"：刷新多少次都不会好，必须让用户去重开页面。
+    if (message.includes('令牌')) {
+      markSessionLost(message)
+      return
+    }
+    toast('error', '读取状态失败', message)
   }
+}
+
+/** 会话失效后，把屏幕上已有的结论降级 —— 停在旧结论上比写着"不知道"更危险。 */
+function markSessionLost(message) {
+  if (!sessionLost) {
+    sessionLost = true
+    const banner = el('div', 'notice danger session-lost')
+    banner.append(
+      el('span', 'icon', '!'),
+      el(
+        'span',
+        undefined,
+        `${message}。服务端每次启动都会换新的会话令牌，所以这个页面读取状态、执行操作的请求都会失败 —— ` +
+          '下面显示的都不是最新状态，请重新打开界面地址（或刷新页面）再操作。',
+      ),
+    )
+    // 贴在内容区最上方（先于页面标题），不遮挡任何东西。
+    const content = document.querySelector('.content') ?? document.body
+    content.prepend(banner)
+  }
+
+  const host = document.querySelector('#access-state')
+  const sub = document.querySelector('#access-sub')
+  if (!host) return
+  sub.textContent = '会话已失效 · 显示的不是最新状态'
+  host.replaceChildren(
+    accessCard('能否打开 Claude', undefined, undefined, '▶'),
+    accessCard('能否访问网络', undefined, undefined, '🌐'),
+  )
 }
 
 /** ------------------------------------------------------------------ UI 组件 */
@@ -225,6 +268,34 @@ function renderHeader() {
 }
 
 /**
+ * 一格结论卡。三态由服务端给出：allow=可以、deny=不可以、unguarded=未被拦截
+ * （判定不通过、但此刻确实没有任何拦截在生效）。
+ *
+ * state 缺失时**不能**按"未被拦截"显示：那等于拿一个读不到的数据去下结论，而"未被拦截"
+ * 偏偏是在断言"此刻它确实能开、能联网"。实测就栽在这里 —— 页面读到的状态是过期/不完整的，
+ * 屏幕上却写着"未被拦截"，看着像一切正常。读不到就如实说读不到。
+ */
+function accessCard(title, state, reason, icon) {
+  const tone = state === 'allow' ? 'ok' : state === 'deny' ? 'deny' : state === 'unguarded' ? 'unknown' : ''
+  const label = state === 'allow' ? '可以' : state === 'deny' ? '不可以' : state === 'unguarded' ? '未被拦截' : '状态未知'
+  const tagClass = state === 'allow' ? 'tag ok' : state === 'deny' ? 'tag danger' : state === 'unguarded' ? 'tag warn' : 'tag'
+  const box = el('div', `access-card ${tone}`.trim())
+  const head = el('div', 'access-head')
+  head.append(el('span', 'access-icon', icon))
+  head.append(el('strong', undefined, title))
+  head.append(el('span', tagClass, label))
+  box.append(head)
+  box.append(
+    el(
+      'p',
+      'access-reason',
+      reason ?? (state ? '' : '这一格没有拿到结论：界面读到的状态不完整或已过期，刷新页面后重新确认。'),
+    ),
+  )
+  return box
+}
+
+/**
  * Claude 客户端现状：能不能打开、能不能联网，外加拦截记录。
  *
  * 两个结论都由服务端算好（`status.claudeAccess`）—— 界面不自己推断，
@@ -243,20 +314,9 @@ function renderClaudeAccess() {
   sub.textContent = status.guard.running ? '闸门运行中 · 实时更新' : '闸门未运行 · 仅显示阻断状态'
   host.replaceChildren()
 
-  const card = (title, ok, reason, icon) => {
-    const box = el('div', 'access-card ' + (ok ? 'ok' : 'deny'))
-    const head = el('div', 'access-head')
-    head.append(el('span', 'access-icon', icon))
-    head.append(el('strong', undefined, title))
-    head.append(el('span', `tag ${ok ? 'ok' : 'danger'}`, ok ? '可以' : '不可以'))
-    box.append(head)
-    box.append(el('p', 'access-reason', reason ?? ''))
-    return box
-  }
-
   host.append(
-    card('能否打开 Claude', access.canLaunch !== false, access.launchReason, '▶'),
-    card('能否访问网络', access.canNetwork !== false, access.networkReason, '🌐'),
+    accessCard('能否打开 Claude', access.launchState, access.launchReason, '▶'),
+    accessCard('能否访问网络', access.networkState, access.networkReason, '🌐'),
   )
 
   listHost.replaceChildren()
@@ -630,10 +690,16 @@ function updateActionButtons() {
     let label = spec.label
     let active = false
     let disabled = busy
+    let hint = ''
 
     if (spec.id === 'guard') {
-      label = running ? '停止闸门' : '启动闸门'
+      const external = Boolean(status.claudeAccess?.externalGuard)
+      label = running ? '停止闸门' : external ? '闸门已在运行（别处）' : '启动闸门'
       active = running
+      // 别的实例已经在执法时，再点一下只会在它之外多起一个闸门 —— 两个闸门各自守一套
+      // WFP 过滤器，停掉其中一个也解除不掉另一个的阻断。所以这里置灰并说清原因。
+      disabled = busy || (!running && external)
+      hint = disabled && !busy ? `闸门由${status.claudeAccess?.enforcedBy ?? '别的 CCGait 实例'}启动并维持着` : ''
       button.classList.toggle('ok', !running)
       button.classList.toggle('danger', running)
     } else if (spec.id === 'block') {
@@ -655,7 +721,7 @@ function updateActionButtons() {
     button.querySelector('[data-role="spinner"]').style.display = busy ? '' : 'none'
     button.classList.toggle('active', active)
     button.disabled = disabled
-    button.title = spec.id === 'unblock' && !net.blocked ? '当前没有生效中的阻断' : ''
+    button.title = hint || (spec.id === 'unblock' && !net.blocked ? '当前没有生效中的阻断' : '')
     // 「启用系统防火墙」只在防火墙关闭时出现。
     if (spec.needsFirewallOff) button.style.display = firewallOff ? '' : 'none'
   }
@@ -684,8 +750,14 @@ function renderStateStrip() {
   if (net.wfp) layers.push('WFP 内核过滤器')
   if (net.firewallRules > 0) layers.push(`防火墙规则 ${net.firewallRules} 条`)
 
+  // 「闸门」这一格不能只看本界面有没有自己的闸门：托盘（或另一个界面）起的闸门照样在执法，
+  // 只看自己的会把"闸门正在终止 Claude"写成"未运行"，还和右边那格"网络阻断 生效中"打架。
+  const external = Boolean(status.claudeAccess?.externalGuard)
+  const guardValue = status.guard.running ? '运行中' : external ? '运行中（别的实例）' : '未运行'
+  const guardOn = status.guard.running || external
+
   host.append(
-    cell('闸门', status.guard.running ? '运行中' : '未运行', status.guard.running ? 'on' : 'off'),
+    cell('闸门', guardValue, guardOn ? 'on' : 'off'),
     cell('网络阻断', net.blocked ? `生效中（${layers.join(' + ')}）` : '未生效', net.blocked ? 'on' : 'off'),
     cell('系统防火墙', firewallOn ? '已开' : '已关', firewallOn ? 'on' : 'warn'),
   )
@@ -713,10 +785,30 @@ function renderActions() {
   renderStateStrip()
 
   const running = status.guard.running
+  const externalGuard = Boolean(status.claudeAccess?.externalGuard)
   sub.textContent =
     running && status.guard.startedAt
       ? `运行中 · 启动于 ${new Date(status.guard.startedAt).toLocaleTimeString()}`
-      : ''
+      : externalGuard
+        ? `闸门由${status.claudeAccess?.enforcedBy ?? '别的 CCGait 实例'}启动并维持着`
+        : ''
+
+  // 执法不是本界面启动的：要说清"谁在拦"以及本界面能做什么，
+  // 否则用户会以为这里写着"未运行"就是没人在拦（实测：托盘闸门正在终止 Claude，
+  // 页面却显示"闸门 未运行"）。
+  if (!running && externalGuard) {
+    const notice = el('div', 'notice warn')
+    notice.append(
+      el('span', 'icon', '!'),
+      el(
+        'span',
+        undefined,
+        `闸门正在运行，但跑着的那个不是本界面启动的（${status.claudeAccess?.enforcedBy ?? '别的 CCGait 实例'}启动）：判定不通过时它同样会终止 Claude、阻断网络。` +
+          '本界面的「停止闸门」停不到它，所以这里也不提供重复启动 —— 要停掉它，用托盘菜单，或命令行 `ccgait guard-stop`。',
+      ),
+    )
+    notices.append(notice)
+  }
 
   if (!status.elevated) {
     const notice = el('div', 'notice warn')

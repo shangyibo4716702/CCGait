@@ -672,6 +672,11 @@ button.action:disabled:not(.active) {
   background: var(--ok-bg);
 }
 
+.access-card.unknown {
+  border-color: #f2ddb8;
+  background: var(--warn-bg);
+}
+
 .access-card.deny {
   border-color: #f0c9c5;
   background: var(--danger-bg);
@@ -690,6 +695,10 @@ button.action:disabled:not(.active) {
 
 .access-card.ok .access-head strong {
   color: var(--ok-text);
+}
+
+.access-card.unknown .access-head strong {
+  color: var(--warn-text);
 }
 
 .access-card.deny .access-head strong {

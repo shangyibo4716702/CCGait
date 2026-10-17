@@ -32,6 +32,7 @@ import {
   formatCheckReport,
   processAlive,
   readGuardPid,
+  requestGuardStart,
   requestGuardStop,
   runChecks,
   stateFilePath,
@@ -68,6 +69,7 @@ function printUsage() {
   ccgait guard [--once]          常驻执法；--once 只跑一轮后退出
          [--keep-blocks]         停止时保留防火墙规则（默认会撤掉）
   ccgait guard-stop              请求正在运行的闸门优雅停止（会撤掉防火墙阻断）
+  ccgait guard-start             请求常驻界面服务进程把闸门建起来（若已停）
   ccgait status [--json]         查看状态：闸门进程、防火墙规则、客户端路径
   ccgait targets                 列出发现的 Claude 可执行文件
   ccgait kill                    立即终止正在运行的 Claude 客户端
@@ -268,6 +270,27 @@ async function commandGuard(argv) {
   return 0
 }
 
+/**
+ * 请求常驻界面服务进程把它自己的闸门建起来。
+ *
+ * 执法现在跑在服务进程内（进程内闸门），所以"启动闸门"不能再靠另起一个 `cli.js guard`
+ * 进程 —— 那会变成第二个闸门、多一套 WFP 过滤器。这里只写一个请求文件，服务进程
+ * 每秒巡检一次，读到就把闸门建起来。
+ */
+async function commandGuardStart() {
+  const { config } = await loadOrExit()
+  const stateDir = resolveStateDir(config)
+  const pid = readGuardPid(stateDir)
+  if (pid && processAlive(pid)) {
+    console.log(`闸门已在运行（PID ${pid}）`)
+    return 0
+  }
+  requestGuardStart(stateDir)
+  console.log('已请求闸门启动：常驻界面服务进程会在 1 秒内建起自己的闸门')
+  console.log('（若界面服务没在运行，先打开界面：ccgait desktop）')
+  return 0
+}
+
 async function commandGuardStop() {
   const { config } = await loadOrExit()
   const stateDir = resolveStateDir(config)
@@ -280,12 +303,14 @@ async function commandGuardStop() {
   console.log(`已请求闸门（PID ${pid}）停止：它会在下一轮巡检收尾（撤掉防火墙阻断后退出）`)
   for (let attempt = 0; attempt < 20; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 500))
-    if (!processAlive(readGuardPid(stateDir) ?? pid)) {
-      console.log('闸门已停止')
+    // 闸门现在跑在常驻界面服务进程里，停掉的只是它的执法循环 —— 服务进程本身不会退出，
+    // 所以这里看的是 guard.pid 有没有被撤掉，而不是 PID 对应的进程在不在（否则永远等不到）。
+    if (readGuardPid(stateDir) === undefined) {
+      console.log('闸门已停止（常驻界面服务仍在运行，界面上的「启动闸门」可随时再开）')
       return 0
     }
   }
-  console.log('闸门尚未退出（可能正在执行检测），稍后可再用 ccgait status 查看')
+  console.log('闸门尚未停止（可能正在执行检测），稍后可再用 ccgait status 查看')
   return 0
 }
 
@@ -515,6 +540,19 @@ async function commandUi(argv) {
   const url = `http://127.0.0.1:${address.port}/`
   console.log(`CCGait 界面已启动：${url}`)
   console.log('（只监听本机回环地址；所有操作都需要页面内的会话令牌）')
+
+  // 常驻服务进程就是执法进程：它用自己的线程（进程内闸门）承担执法，托盘与应用窗口
+  // 只负责把服务拉起来。别处已经有闸门在跑（另一个界面服务、或手工起的 `ccgait guard`）
+  // 时不再起第二个 —— 两个闸门各守一套 WFP 过滤器，停掉其中一个也解不掉另一个的阻断。
+  // 放在监听之后做：先让端口就绪，别让开机时的检测拖慢界面弹出。
+  if (!argv.includes('--no-guard')) {
+    const status = await session.getStatus()
+    if (!status.guard.running && !status.claudeAccess.externalGuard) {
+      await session.startGuard()
+      console.log('已在界面服务进程内启动闸门（不满足白名单时将终止客户端并阻断其网络）')
+    }
+  }
+
   const elevated = await isElevated()
   if (!elevated) {
     console.log('提示：当前不是管理员，网络阻断相关操作会失败；需要时请以管理员身份重新运行。')
@@ -716,6 +754,8 @@ async function main() {
       return commandCheck(argv)
     case 'guard':
       return commandGuard(argv)
+    case 'guard-start':
+      return commandGuardStart()
     case 'guard-stop':
       return commandGuardStop()
     case 'status':

@@ -147,7 +147,7 @@ namespace Ccgait
         }
 
         /// <summary>启动服务（隐藏）并等待端口就绪。</summary>
-        private static bool EnsureServer()
+        internal static bool EnsureServer()
         {
             if (PortOpen(UiPort)) return true;
             RunCli("ui --port " + UiPort + " --no-open", false, 0);
@@ -185,7 +185,22 @@ namespace Ccgait
 
         private static void OpenDesktop()
         {
+            // 打开软件就该在执法。执法者现在由**常驻界面服务进程**自己承担（进程内闸门、
+            // 界面服务自己的线程），所以这里只需要把服务拉起来 —— 不再另起一个独立的
+            // `cli.js guard` 进程：那会变成"别的实例"，界面上写"运行中（别的实例）"且停不掉，
+            // 而且两个闸门各守一套 WFP 过滤器，停掉其中一个也解不掉另一个的阻断。
+            // 已经有闸门在跑时（另一个界面服务起的、或上一次留下的），服务自己也不会再起第二个。
             bool serverReady = EnsureServer();
+            if (serverReady && GuardAutoStart.IsEnabled())
+            {
+                // 等闸门登记进 guard.pid（服务一启动就建自己的闸门），
+                // 这样窗口第一次渲染时状态条就能如实写"运行中"。
+                for (int attempt = 0; attempt < 12 && !Program.ReadStatus().GuardRunning; attempt++)
+                {
+                    System.Threading.Thread.Sleep(250);
+                }
+            }
+
             bool windowOpened = serverReady && OpenWindow();
             if (!windowOpened)
             {
@@ -509,7 +524,10 @@ namespace Ccgait
                     ShowBalloon("闸门已在运行", "无需重复启动", ToolTipIcon.Info);
                     return;
                 }
-                Run("guard", false);
+                // 执法由常驻界面服务进程承担：先把服务拉起来（它启动即建自己的闸门），
+                // 再写一个"启动请求"——服务在跑但闸门被停过时，靠这个请求把它建回来。
+                Program.EnsureServer();
+                Run("guard-start", true);
                 System.Threading.Thread.Sleep(1500);
                 Refresh();
                 if (Program.ReadStatus().GuardRunning)
@@ -586,7 +604,7 @@ namespace Ccgait
             };
             menu.Items.Add(startupItem);
 
-            var autoGuardItem = new ToolStripMenuItem("启动托盘时自动开闸门")
+            var autoGuardItem = new ToolStripMenuItem("启动时自动开闸门（常驻界面服务执法）")
             {
                 CheckOnClick = true,
                 Checked = GuardAutoStart.IsEnabled(),
@@ -596,7 +614,9 @@ namespace Ccgait
                 GuardAutoStart.Set(autoGuardItem.Checked);
                 ShowBalloon(
                     autoGuardItem.Checked ? "已开启自动开闸门" : "已关闭自动开闸门",
-                    autoGuardItem.Checked ? "下次启动托盘会自动开始执法" : "启动托盘后需要手动点「启动闸门」",
+                    autoGuardItem.Checked
+                        ? "下次启动会自动拉起界面服务并开始执法"
+                        : "启动后需要手动点「启动闸门」",
                     ToolTipIcon.Info);
             };
             menu.Items.Add(autoGuardItem);
@@ -613,7 +633,7 @@ namespace Ccgait
 
             menu.Items.Add(new ToolStripSeparator());
 
-            var quit = new ToolStripMenuItem("退出托盘（闸门不受影响）");
+            var quit = new ToolStripMenuItem("退出托盘（闸门与界面服务继续运行）");
             quit.Click += (s, e) =>
             {
                 _icon.Visible = false;
@@ -631,8 +651,8 @@ namespace Ccgait
 
             Refresh();
 
-            // 默认行为：托盘一起来就开始执法，不用每次手动点「启动闸门」。
-            // 闸门本身仍然是"进程即策略"：托盘退出不影响已经在跑的闸门，闸门退出即恢复网络。
+            // 默认行为：托盘一起来就把常驻界面服务拉起来（服务启动即建自己的闸门开始执法），
+            // 不用每次手动点「启动闸门」。闸门跑在服务进程里，所以退出托盘、关掉窗口都不会停掉执法。
             if (GuardAutoStart.IsEnabled() && !Program.ReadStatus().GuardRunning)
             {
                 StartGuardQuietly();
@@ -640,15 +660,28 @@ namespace Ccgait
 
             if (!Program.ReadStatus().HasCheck)
             {
-                ShowBalloon("CCGait 托盘已就绪", "已按默认设置启动闸门；右键图标可检测环境、启停闸门", ToolTipIcon.Info);
+                ShowBalloon("CCGait 托盘已就绪", "已按默认设置开始执法；右键图标可检测环境、启停闸门", ToolTipIcon.Info);
             }
         }
 
         /// <summary>启动闸门并把结果告诉用户（失败必须说清楚，不能默默不干活）。</summary>
         private void StartGuardQuietly()
         {
-            Run("guard", false);
-            System.Threading.Thread.Sleep(1500);
+            // 执法由常驻界面服务进程承担：这里把它拉起来（服务一启动就建自己的闸门），
+            // 再写一个"启动请求"兜底 —— 服务已经在跑、但闸门被停过时也照样能建回来。
+            if (!Program.EnsureServer())
+            {
+                ShowBalloon(
+                    "界面服务未能启动",
+                    "未找到 Node.js（需要 20 以上版本），无法开始执法",
+                    ToolTipIcon.Warning);
+                return;
+            }
+            Run("guard-start", true);
+            for (int attempt = 0; attempt < 12 && !Program.ReadStatus().GuardRunning; attempt++)
+            {
+                System.Threading.Thread.Sleep(250);
+            }
             Refresh();
             if (Program.ReadStatus().GuardRunning)
             {

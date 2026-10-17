@@ -18,9 +18,12 @@ export const CONFIG_PATH = process.env.CCGAIT_CONFIG?.trim() || join(PROJECT_ROO
  *   1. 出口白名单：IP / CIDR / 国家 / ASN / 要求住宅出口，以及多源一致性与 failClosed；
  *   2. Claude 域名解析是否落到被禁地区。
  *
- * 中文用户环境相关各项（时区 / 语言 / 字体 / Emoji 国旗渲染 / 本机 DNS / 系统代理）
- * **只提示、不门控**：它们衡量的是"这台机器的特征"，而改时区、删系统字体属于改系统设置，
- * 不该由闸门替用户决定能不能用。需要更严时，在界面「检查项严重度」里把某一项改成「阻断」。
+ * 中文用户环境相关各项分两档：
+ * - **只提示**（时区 / 语言 / 字体 / Emoji 国旗渲染）：它们衡量的是"这台机器的特征"，
+ *   而改时区、删系统字体属于改系统设置，不该由闸门替用户决定能不能用。需要更严时，在界面
+ *   「检查项严重度」里把某一项改成「阻断」。
+ * - **默认阻断**（本机 DNS / 系统代理）：这两项不是"设备特征"，而是**出口路径本身** ——
+ *   解析走国内服务器、CLI 直连暴露国内 IP，都属于"这次请求从哪出去"，与白名单是同一件事。
  */
 export const DEFAULT_SEVERITY = {
   egressIp: 'block',
@@ -29,8 +32,8 @@ export const DEFAULT_SEVERITY = {
   language: 'warn',
   fonts: 'warn',
   emojiFlags: 'warn',
-  dnsServers: 'warn',
-  proxyEnvLeak: 'warn',
+  dnsServers: 'block',
+  proxyEnvLeak: 'block',
 }
 
 export const DEFAULT_CONFIG = {

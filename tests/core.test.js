@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, describe, it } from 'node:test'
@@ -12,6 +12,15 @@ import {
   validateConfig,
 } from '../src/config.js'
 import { decide, evaluateEgress } from '../src/verdict.js'
+import {
+  clearGuardStartRequest,
+  clearGuardStopRequest,
+  guardStartRequestPath,
+  guardStopRequestPath,
+  requestGuardStart,
+  requestGuardStop,
+} from '../src/guard.js'
+import { buildClaudeAccess, readGuardCheck } from '../src/ui/session.js'
 import { classifyProcess } from '../src/claude-targets.js'
 import { normalizeProfileEnabled } from '../src/firewall.js'
 import { parseKeyValueText } from '../src/http.js'
@@ -34,6 +43,9 @@ describe('config', () => {
     assert.equal(config.enforcement.failClosed, true)
     assert.equal(config.checks.egressIp.severity, 'block')
     assert.equal(config.checks.timezone.severity, 'warn')
+    // DNS 与系统代理属于"出口路径本身"，默认即阻断。
+    assert.equal(config.checks.dnsServers.severity, 'block')
+    assert.equal(config.checks.proxyEnvLeak.severity, 'block')
     assert.deepEqual(config.checks.claudeDns.deniedCountries, ['CN'])
   })
 
@@ -189,7 +201,7 @@ describe('verdict', () => {
     assert.ok(verdict.blockedBy.some((item) => item.id === 'claude-dns-denied'))
   })
 
-  it('reports environment traits as warnings by default', () => {
+  it('reports device traits as warnings by default', () => {
     const verdict = decide({
       config: baseConfig,
       egress: goodEgress,
@@ -197,15 +209,27 @@ describe('verdict', () => {
         timezone: { intl: 'Asia/Shanghai', domestic: true, matched: 'Asia/Shanghai' },
         language: { uiLanguages: ['zh-CN', 'en-US'], chinese: true, matched: 'zh-CN' },
         fonts: { found: [{ file: 'Deng.ttf', label: '等线 DengXian', strong: true }], strong: true },
-        dnsServers: { servers: ['114.114.114.114'], domestic: ['114.114.114.114'] },
-        systemProxy: { hasAny: false, system: { enabled: false }, envVars: {} },
       },
     })
-    assert.equal(verdict.allow, true, '默认只报告，不因环境特征拦截')
+    assert.equal(verdict.allow, true, '时区/语言/字体是设备特征，默认只报告、不门控')
     assert.deepEqual(
       verdict.warnings.map((item) => item.id).sort(),
-      ['dns-servers-domestic', 'fonts-domestic', 'language-chinese', 'timezone-domestic'],
+      ['fonts-domestic', 'language-chinese', 'timezone-domestic'],
     )
+  })
+
+  it('blocks DNS and system proxy leaks by default', () => {
+    const verdict = decide({
+      config: baseConfig,
+      egress: goodEgress,
+      environment: {
+        dnsServers: { servers: ['114.114.114.114'], domestic: ['114.114.114.114'] },
+        systemProxy: { hasAny: true, system: { enabled: true, server: '127.0.0.1:7890' }, envVars: {} },
+      },
+    })
+    assert.equal(verdict.allow, false, 'DNS/代理属于出口路径本身，默认即门控')
+    assert.ok(verdict.blockedBy.some((item) => item.id === 'dns-servers-domestic'))
+    assert.ok(verdict.blockedBy.some((item) => item.id === 'proxy-leak'))
   })
 
   it('escalates an environment check to blocking when configured', () => {
@@ -341,5 +365,133 @@ describe('endpoint classification used by the risk gate', () => {
     const config = normalizeConfig(raw)
     assert.deepEqual(config.whitelist.countries, ['US'])
     assert.equal(config.checks.fonts.enabled, true, '非对象写法回落到默认')
+  })
+})
+
+describe('claude access three-state verdict', () => {
+  const denyCheck = { allow: false, blocked: [{ id: 'egress-country', title: '出口国家不在白名单：CN' }] }
+  const allowCheck = { allow: true, blocked: [] }
+  const config = { enforcement: { killProcesses: true } }
+
+  it('denies launch only when enforcement is active and the verdict fails', () => {
+    const result = buildClaudeAccess({
+      check: denyCheck,
+      ownGuard: true,
+      externalGuards: [],
+      networkBlocked: true,
+      networkLayers: ['WFP 内核过滤器'],
+      config,
+    })
+    assert.equal(result.launchState, 'deny')
+    assert.equal(result.networkState, 'deny')
+  })
+
+  it('marks "unguarded" when the verdict fails but nothing is enforcing', () => {
+    // 关键回归：判定不通过、但闸门没在跑时，不能显示绿色"可以"——
+    // 那会掩盖"此刻其实没人拦"的事实（实测用户就是因此误以为一切正常）。
+    const result = buildClaudeAccess({
+      check: denyCheck,
+      ownGuard: false,
+      externalGuards: [],
+      networkBlocked: false,
+      networkLayers: [],
+      config,
+    })
+    assert.equal(result.launchState, 'unguarded')
+    assert.equal(result.networkState, 'unguarded')
+    assert.match(result.networkReason, /确实能联网/)
+  })
+
+  it('allows when the verdict passes', () => {
+    const result = buildClaudeAccess({
+      check: allowCheck,
+      ownGuard: true,
+      externalGuards: [],
+      networkBlocked: false,
+      networkLayers: [],
+      config,
+    })
+    assert.equal(result.launchState, 'allow')
+    assert.equal(result.networkState, 'allow')
+  })
+
+  it('counts a guard in another process as enforcement', () => {
+    const result = buildClaudeAccess({
+      check: denyCheck,
+      ownGuard: false,
+      externalGuards: [1234],
+      networkBlocked: true,
+      networkLayers: ['防火墙规则 11 条'],
+      config,
+    })
+    assert.equal(result.launchState, 'deny')
+    assert.match(result.launchReason, /另一个 CCGait 进程/)
+  })
+})
+
+describe('guard verdict read from another process', () => {
+  // 别的进程里的闸门（另一个界面服务进程内闸门、或手工起的 cli.js guard）判定不通过、
+  // 正在终止 Claude 时，刚打开的界面必须能读到这份判定，否则会显示"尚未检测"，
+  // 而"能否打开"那一格还会是绿色的"可以"。
+  it('maps the guard state file onto a check result', () => {
+    const dir = tempDir()
+    writeFileSync(
+      join(dir, 'state.json'),
+      JSON.stringify({
+        guardPid: 4242,
+        updatedAt: '2026-10-17T05:34:10.404Z',
+        allow: false,
+        blocked: [{ id: 'egress-country', title: '出口国家不在白名单：CN' }],
+        warnings: [{ id: 'fonts-domestic', title: '系统装有国内专有字体' }],
+        egress: { ip: '36.161.21.75', country: 'CN' },
+        failedClosed: false,
+        durationMs: 15662,
+      }),
+      'utf8',
+    )
+
+    const check = readGuardCheck(dir)
+    assert.equal(check.allow, false)
+    assert.equal(check.at, '2026-10-17T05:34:10.404Z', '时间取闸门的 updatedAt')
+    assert.equal(check.blocked[0].id, 'egress-country')
+    assert.equal(check.warnings.length, 1)
+    assert.equal(check.egress.country, 'CN')
+    assert.equal(check.from, 'guard')
+  })
+
+  it('returns null when there is no usable state file', () => {
+    // 没有文件：按"没检测过"处理，不能凭空造一个判定出来。
+    assert.equal(readGuardCheck(tempDir()), null)
+
+    const dir = tempDir()
+    writeFileSync(join(dir, 'state.json'), '{ 写到一半', 'utf8')
+    assert.equal(readGuardCheck(dir), null, '内容读不懂时也不能当成判定')
+
+    const wrongShape = tempDir()
+    writeFileSync(join(wrongShape, 'state.json'), JSON.stringify({ updatedAt: '2026-10-17T00:00:00Z' }), 'utf8')
+    assert.equal(readGuardCheck(wrongShape), null, '没有 allow 字段的不算判定')
+  })
+})
+
+describe('guard start/stop request files', () => {
+  // 启停都是"文件即请求"：执法跑在常驻界面服务进程里，托盘/CLI 只能靠写请求文件
+  // 让它建起 / 停掉自己的闸门。这两个方向的语义必须对称，否则会出现
+  // "点了启动没反应""点了停止停不掉"这类说不清的现象。
+  it('writes and clears the start request', () => {
+    const dir = tempDir()
+    assert.equal(existsSync(guardStartRequestPath(dir)), false)
+    requestGuardStart(dir)
+    assert.equal(existsSync(guardStartRequestPath(dir)), true)
+    clearGuardStartRequest(dir)
+    assert.equal(existsSync(guardStartRequestPath(dir)), false)
+  })
+
+  it('writes and clears the stop request', () => {
+    const dir = tempDir()
+    assert.equal(existsSync(guardStopRequestPath(dir)), false)
+    requestGuardStop(dir)
+    assert.equal(existsSync(guardStopRequestPath(dir)), true)
+    clearGuardStopRequest(dir)
+    assert.equal(existsSync(guardStopRequestPath(dir)), false)
   })
 })

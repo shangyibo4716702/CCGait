@@ -1,7 +1,14 @@
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { CONFIG_PATH, loadConfig, normalizeConfig, resolveStateDir, validateConfig } from '../config.js'
-import { createGuard, readGuardPid, runChecks } from '../guard.js'
+import {
+  clearGuardStartRequest,
+  createGuard,
+  guardStartRequestPath,
+  processAlive,
+  readGuardPid,
+  runChecks,
+} from '../guard.js'
 import {
   applyBlockForPaths,
   enableProfiles,
@@ -87,51 +94,148 @@ export function applyConfigPatch(current, patch) {
 /**
  * Claude 客户端此刻的可用性结论。
  *
- * 两个问题分开回答，因为它们的成因不同：
- *  - **能不能打开**：取决于闸门是否在执法 + 判定是否通过 + 是否配置了"终止进程"。
- *    闸门没在跑时没有任何东西拦它，所以能打开 —— 但要如实说明"没有执法在生效"，
- *    否则用户会误以为有闸门在保护。
- *  - **能不能联网**：只看当前有没有生效中的阻断（WFP 或防火墙规则）。它与判定无关：
- *    即使闸门没跑，之前手动建的阻断依然会让它连不上网。
+ * 三态，而不是两态 —— 因为"判定不通过但没人拦"和"判定通过"是完全不同的处境，
+ * 都显示绿色"可以"会掩盖风险（实测用户就因为它误以为一切正常）：
+ *   allow      → 可以
+ *   deny       → 不可以（有执法在生效，且判定不通过）
+ *   unguarded  → 未被拦截（判定不通过，但闸门没在跑，所以此刻确实能开/能联网）
  */
-function buildClaudeAccess({ check, guardRunning, networkBlocked, networkLayers, externalBlock, config }) {
+export function buildClaudeAccess({ check, ownGuard, externalGuards, networkBlocked, networkLayers, externalBlock, config }) {
   const killEnabled = config?.enforcement?.killProcesses !== false
+  const enforcing = Boolean(ownGuard) || externalGuards.length > 0
+  // 说"谁在执法"时不要写死成"托盘"：托盘、应用窗口、另一个界面都可能起闸门（它们都是
+  // 独立的 `cli.js guard` 进程），写错了只会让人去错的地方找。
+  const who = ownGuard ? '本界面' : externalGuards.length > 0 ? '另一个 CCGait 进程' : undefined
   const verdictKnown = Boolean(check)
-  const verdictDeny = verdictKnown && check.allow === false
+  const deny = verdictKnown && check.allow === false
+  const blockedTitles = (check?.blocked ?? []).map((item) => item.title).join('；')
 
-  let canLaunch
+  let launchState
   let launchReason
-  if (!guardRunning) {
-    canLaunch = true
-    launchReason = verdictKnown && verdictDeny
-      ? '闸门未运行，没有执法在生效（但当前环境判定为不通过）'
-      : '闸门未运行，没有执法在生效'
-  } else if (!verdictKnown) {
-    canLaunch = true
-    launchReason = '闸门运行中，但还没跑过检测；点「立即检测」后才有结论'
-  } else if (verdictDeny && killEnabled) {
-    canLaunch = false
-    launchReason = `判定不通过，启动就会被终止：${check.blocked.map((item) => item.title).join('；') || '见下方拦截记录'}`
-  } else if (verdictDeny && !killEnabled) {
-    canLaunch = true
+  if (enforcing && deny && killEnabled) {
+    launchState = 'deny'
+    launchReason = `判定不通过，启动就会被终止（执行者：${who}启动的闸门）：${blockedTitles || '见下方拦截记录'}`
+  } else if (enforcing && deny && !killEnabled) {
+    launchState = 'allow'
     launchReason = '判定不通过，但配置里关闭了「终止客户端进程」，所以不会被终止'
+  } else if (enforcing) {
+    launchState = 'allow'
+    launchReason = verdictKnown
+      ? `闸门在运行（${who}启动的闸门）且判定通过，可以正常启动`
+      : `闸门在运行（${who}启动的闸门），但还没跑过检测；点「立即检测」后才有结论`
+  } else if (deny) {
+    launchState = 'unguarded'
+    launchReason = '判定不通过，但当前没有拦截在生效（闸门没在运行）—— 此刻它确实能打开。点「启动闸门」立即接管。'
   } else {
-    canLaunch = true
-    launchReason = '闸门运行中且判定通过，可以正常启动'
+    launchState = 'allow'
+    launchReason = verdictKnown ? '闸门未运行；当前环境判定通过' : '闸门未运行，没有执法在生效'
+  }
+
+  let networkState
+  let networkReason
+  if (networkBlocked) {
+    networkState = 'deny'
+    networkReason =
+      `已被阻断，连不上网（${networkLayers.join(' + ') || '阻断生效中'}）` +
+      (externalBlock ? '。这个阻断不是本界面建立的（很可能是安装版托盘的闸门在维持），点「解除阻断」后可能被它立刻重建 —— 要彻底解除，请先在托盘里停止闸门。' : '')
+  } else if (deny) {
+    networkState = 'unguarded'
+    networkReason = '判定不通过，但当前没有生效中的阻断 —— 此刻它确实能联网。点「启动闸门」立即拦截。'
+  } else {
+    networkState = 'allow'
+    networkReason = '当前没有生效中的阻断，网络可用'
   }
 
   return {
-    canLaunch,
+    launchState,
     launchReason,
-    canNetwork: !networkBlocked,
-    networkReason: networkBlocked
-      ? `已被阻断，连不上网（${networkLayers.join(' + ') || '阻断生效中'}）` +
-        (externalBlock ? '。注意：这个阻断不是本界面建立的（很可能是安装版托盘的闸门在维持），点「解除阻断」后可能被它立刻重建 —— 要彻底解除，请先在托盘里停止闸门。' : '')
-      : '当前没有生效中的阻断，网络可用',
+    networkState,
+    networkReason,
+    // 兼容旧字段名（界面与测试可能仍在读）
+    canLaunch: launchState === 'deny' ? false : true,
+    canNetwork: networkState === 'deny' ? false : true,
     externalBlock: Boolean(externalBlock),
+    externalGuard: externalGuards.length > 0,
     verdict: verdictKnown ? (check.allow ? 'allow' : 'deny') : 'unknown',
-    guardRunning,
+    guardRunning: enforcing,
+    enforcedBy: who,
   }
+}
+
+/**
+ * 闸门进程写下 `state.json` 的文件名（与 `src/guard.js` 的 STATE_FILE 一致）。
+ * 界面和闸门常常不是同一个进程（托盘起的是另一个 `cli.js guard`），这个文件是它们之间
+ * 唯一共同的事实来源。
+ */
+const GUARD_STATE_FILE = 'state.json'
+
+/**
+ * 读闸门自己算出的最近一次判定，作为界面的起点。
+ *
+ * 为什么界面要读它：界面进程只知道自己这边的检测。装在托盘里的闸门是**另一个进程**，
+ * 它判定不通过、正在终止 Claude 与断网时，刚打开界面的用户看到的却是"尚未检测"和绿色的
+ * "可以打开" —— 界面说可以，闸门在杀进程。判定明明就在状态文件里，读一下就不会对不上。
+ *
+ * 状态文件里的字段比一次完整检测少（没有 DNS/环境特征/白名单明细），所以它只当兜底：
+ * 界面自己跑过检测时以自己那份为准。
+ */
+export function readGuardCheck(stateDir) {
+  try {
+    const state = JSON.parse(readFileSync(join(stateDir, GUARD_STATE_FILE), 'utf8'))
+    if (typeof state.allow !== 'boolean') return null
+    return {
+      at: state.updatedAt ?? null,
+      allow: state.allow,
+      blocked: state.blocked ?? [],
+      warnings: state.warnings ?? [],
+      egress: state.egress ?? {},
+      failedClosed: Boolean(state.failedClosed),
+      durationMs: state.durationMs,
+      from: 'guard',
+    }
+  } catch {
+    // 没有状态文件、或内容读不懂（写到一半被中断）时按"没检测过"处理。
+    return null
+  }
+}
+
+/**
+ * 检测"别的 CCGait 实例正在执法"（例如另一个界面服务进程内的闸门、或手工起的 `ccgait guard`）。
+ *
+ * 为什么需要：界面里的闸门对象只代表**本进程**启动的那个。执法现在跑在常驻界面服务进程内，
+ * 也就是另一个进程里；如果界面只按"自己的闸门在不在跑"来回答"能否打开"，就会给出"可以"
+ * 这种与实际相反的结论。两个信号合起来看：
+ * 1. `guard.pid` 指向的进程不是本进程且还活着 —— 覆盖"闸门跑在另一个界面服务进程里"；
+ * 2. 命令行里带 `guard` 的 `cli.js` 进程 —— 覆盖手工起的独立闸门进程。
+ */
+async function detectExternalGuard(stateDir) {
+  const found = new Set()
+  const pid = stateDir ? readGuardPid(stateDir) : undefined
+  if (pid && pid !== process.pid && processAlive(pid)) found.add(pid)
+  if (process.platform !== 'win32') return [...found]
+  try {
+    const { execFile } = await import('node:child_process')
+    const { promisify } = await import('node:util')
+    const run = promisify(execFile)
+    const { stdout } = await run(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        // 末尾的 (?![-\\w]) 是为了不把 `guard-stop` 这类同前缀的短命进程算进来。
+        "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'cli\\.js[\" ]+guard(?![-\\w])' } | Select-Object -ExpandProperty ProcessId",
+      ],
+      { windowsHide: true, timeout: 10_000 },
+    )
+    for (const line of stdout.split(/\r?\n/)) {
+      const value = Number(line.trim())
+      if (Number.isInteger(value) && value > 0 && value !== process.pid) found.add(value)
+    }
+  } catch {
+    // 查不到就当没有别的实例（本进程自己的闸门状态不受影响）。
+  }
+  return [...found]
 }
 
 export function createUiSession(options = {}) {
@@ -166,11 +270,13 @@ export function createUiSession(options = {}) {
   let configProblems = validateConfig(loaded.config)
   let guard = null
   let guardStartedAt = undefined
+  // 界面自己跑过检测时用自己那份；没跑过就用闸门写下的判定兜底（可能是另一个进程里的闸门）。
   let lastCheck = null
   let lastEnforcement = null
   let lastError = undefined
   let queue = Promise.resolve()
   let watchTimer = null
+  let watchStartTimer = null
   let watchSignature = null
 
   const emit = (event) => {
@@ -244,6 +350,12 @@ export function createUiSession(options = {}) {
     const wfpPid = deps.readWfpPid(stateDir)
     const wfpOrphan = wfpHosts.length > 0 && !wfpHosts.includes(wfpPid)
     const activeRules = rules.filter((rule) => rule.enabled)
+    // 别的实例是不是也在执法 —— 决定"能否打开 Claude"要怎么回答。
+    // （自己的闸门在跑时不用查：guard.pid 就是本进程，答案必然是"没有别的"。）
+    const externalGuards = guard === null ? await detectExternalGuard(stateDir) : []
+    // 判定：界面自己的检测优先，没跑过就认闸门写下的那份（托盘起的闸门在另一个进程里，
+    // 不读这个文件的话，界面会一边写着"尚未检测/可以打开"，一边被它终止进程）。
+    const check = lastCheck ?? readGuardCheck(stateDir)
 
     return {
       at: nowIso(),
@@ -271,8 +383,9 @@ export function createUiSession(options = {}) {
       // Claude 此刻能不能打开、能不能联网 —— 用户最关心的两个结论。
       // 由服务端按「判定结果 + 执法开关 + 实际阻断状态」算好，界面直接显示，不在前端猜。
       claudeAccess: buildClaudeAccess({
-        check: lastCheck,
-        guardRunning: guard !== null,
+        check,
+        ownGuard: guard !== null,
+        externalGuards,
         networkBlocked: wfpHosts.length > 0 || activeRules.length > 0,
         networkLayers: [wfpHosts.length > 0 ? 'WFP 内核过滤器' : undefined, activeRules.length > 0 ? `防火墙规则 ${activeRules.length} 条` : undefined].filter(Boolean),
         // 阻断不是本界面建立的（例如安装版托盘的闸门在维持）：要说清楚，
@@ -291,7 +404,7 @@ export function createUiSession(options = {}) {
         startedAt: guardStartedAt,
         lastState: guard?.lastState ?? null,
       },
-      lastCheck,
+      lastCheck: check,
       lastEnforcement,
       ...(lastError ? { lastError } : {}),
       logs: logs.slice(-LOG_RING_SIZE),
@@ -536,12 +649,27 @@ export function createUiSession(options = {}) {
       void snapshot()
       watchTimer = setInterval(() => void snapshot(), intervalMs)
       if (typeof watchTimer.unref === 'function') watchTimer.unref()
+
+      // 托盘/CLI 的"启动闸门"请求（`ccgait guard-start`）：执法已经挪进这个常驻服务
+      // 进程，别处再也起不了闸门（起了就是第二个、多一套 WFP 过滤器），所以它们只能
+      // 请求本进程把自己的闸门对象建起来。单独用 1 秒的轻量定时器盯着，别和上面 6 秒
+      // 的状态比对混在一起 —— 托盘点完只等 1.5 秒就会去核对结果。
+      watchStartTimer = setInterval(() => {
+        if (!stateDir || !existsSync(guardStartRequestPath(stateDir))) return
+        clearGuardStartRequest(stateDir)
+        if (guard === null) void startGuard()
+      }, 1000)
+      if (typeof watchStartTimer.unref === 'function') watchStartTimer.unref()
     },
     /** 退出时收尾：停掉闸门并撤掉阻断，避免留下"上不了网"的残留。 */
     async dispose() {
       if (watchTimer) {
         clearInterval(watchTimer)
         watchTimer = null
+      }
+      if (watchStartTimer) {
+        clearInterval(watchStartTimer)
+        watchStartTimer = null
       }
       if (guard) {
         try {

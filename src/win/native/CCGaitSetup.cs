@@ -61,7 +61,9 @@ namespace CcgaitSetup
                 try
                 {
                     if (uninstall) Uninstaller.Run(log, true);
-                    else Installer.Run(log, new InstallOptions { CreateDesktopShortcut = true, EnableAutoStart = true, StartTray = false });
+                    // 静默安装也要把托盘拉起来：托盘的默认行为就是"启动即开闸门"，
+                    // 否则装完什么执法都没有，用户还得自己找菜单点一遍。
+                    else Installer.Run(log, new InstallOptions { CreateDesktopShortcut = true, EnableAutoStart = true, StartTray = true });
                     WriteLog(log.ToString());
                     return 0;
                 }
@@ -321,6 +323,51 @@ namespace CcgaitSetup
                 {
                     // 读不到路径（权限/位数不同）就跳过，不影响安装。
                 }
+            }
+            found.AddRange(FindNodeHelpers(root));
+            return found;
+        }
+
+        /// <summary>
+        /// 找出"藏在 node.exe 里的 CCGait 进程"：托盘起的闸门（`cli.js guard`）与界面服务
+        /// （`cli.js ui`）。它们的映像路径是 nodejs 的 node.exe，不在安装目录下，所以上面按
+        /// 路径筛的那一圈看不见它们 —— 于是升级时它们照样活着，后果实测有两个：
+        ///
+        ///  - 旧闸门继续守着一个 WFP 宿主，那个宿主锁着 `CCGaitWfp.exe`，解包这一步必然失败
+        ///    （报 .NET 的英文"being used by another process"）；`guard-stop` 也拦不住它：
+        ///    停止请求是发给状态文件里记的 pid，那个 pid 可能早就对不上，它反而会重新拉起宿主。
+        ///  - 旧界面服务进程内存里还是旧代码，却从磁盘读到了刚装好的新前端，于是"新界面 + 旧数据"，
+        ///    显示的结论是错的（实测：闸门正在拦截，页面写着"未被拦截"）。
+        /// </summary>
+        private static List<Process> FindNodeHelpers(string root)
+        {
+            var found = new List<Process>();
+            try
+            {
+                using (var searcher = new System.Management.ManagementObjectSearcher(
+                    "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name = 'node.exe'"))
+                {
+                    foreach (System.Management.ManagementBaseObject item in searcher.Get())
+                    {
+                        string commandLine = item["CommandLine"] as string;
+                        if (commandLine == null) continue;
+                        // 只看跑"安装目录里的 cli.js"的 node 进程：别的 node 程序不会被误伤。
+                        if (commandLine.IndexOf(root, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        if (commandLine.IndexOf("cli.js", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        try
+                        {
+                            found.Add(Process.GetProcessById(Convert.ToInt32(item["ProcessId"])));
+                        }
+                        catch
+                        {
+                            // 进程已经退出了。
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // WMI 拿不到时不要卡住安装：最坏情况退回"需要手动结束"的老行为。
             }
             return found;
         }

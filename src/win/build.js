@@ -207,7 +207,9 @@ export async function buildInstaller({ rootDir = PROJECT_ROOT, distDir } = {}) {
     sources: [setupSourceCopy],
     icon: icons.ico,
     resources: [`${payloadPath},CcgaitPayload`],
-    references: ['System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll'],
+    // System.Management：安装前要用 WMI 找出"藏在 node.exe 里的"闸门/界面进程
+    // （它们锁着 CCGaitWfp.exe 并拿着旧代码，见 CCGaitSetup.FindNodeHelpers）。
+    references: ['System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll', 'System.Management.dll'],
   })
   if (!setupResult.ok) {
     return { ok: false, error: `安装程序编译失败：\n${setupResult.output}`, log }

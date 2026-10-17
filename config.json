@@ -19,8 +19,9 @@
     "timezone": { "enabled": true, "severity": "warn" },
     "language": { "enabled": true, "severity": "warn" },
     "fonts": { "enabled": true, "severity": "warn" },
-    "dnsServers": { "enabled": true, "severity": "warn" },
-    "proxyEnvLeak": { "enabled": true, "severity": "warn" }
+    "$comment4": "DNS 与系统代理按默认值改为阻断：解析走国内服务器、CLI 直连暴露国内 IP 都属于出口路径，与白名单同一档。",
+    "dnsServers": { "enabled": true, "severity": "block" },
+    "proxyEnvLeak": { "enabled": true, "severity": "block" }
   },
 
   "enforcement": {

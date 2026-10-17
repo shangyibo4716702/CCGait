@@ -33,6 +33,7 @@ import { requestWfpStop, resolveWfpHelper, startWfpBlock, stopWfpBlock } from '.
 export const STATE_FILE = 'state.json'
 export const GUARD_PID_FILE = 'guard.pid'
 export const GUARD_STOP_FILE = 'guard-stop.request'
+export const GUARD_START_FILE = 'guard-start.request'
 
 export function stateFilePath(stateDir) {
   return join(stateDir, STATE_FILE)
@@ -44,6 +45,10 @@ export function guardPidPath(stateDir) {
 
 export function guardStopRequestPath(stateDir) {
   return join(stateDir, GUARD_STOP_FILE)
+}
+
+export function guardStartRequestPath(stateDir) {
+  return join(stateDir, GUARD_START_FILE)
 }
 
 /**
@@ -64,6 +69,26 @@ export function clearGuardStopRequest(stateDir) {
     rmSync(guardStopRequestPath(stateDir), { force: true })
   } catch {
     // 文件不存在或删不掉都不影响启动。
+  }
+}
+
+/**
+ * 请求常驻服务里的闸门启动 —— 与停止请求同一套"文件即请求"语义。
+ *
+ * 为什么需要：执法现在跑在**常驻界面服务进程内**，托盘/CLI 无法再靠"起一个
+ * `cli.js guard` 进程"来开始执法（那会变成第二个闸门、多一套 WFP 过滤器）。
+ * 服务进程在巡检时读到这个请求就把自己的闸门对象建起来。
+ */
+export function requestGuardStart(stateDir) {
+  writeFileSync(guardStartRequestPath(stateDir), `${new Date().toISOString()}
+`, 'utf8')
+}
+
+export function clearGuardStartRequest(stateDir) {
+  try {
+    rmSync(guardStartRequestPath(stateDir), { force: true })
+  } catch {
+    // 同上。
   }
 }
 
@@ -420,6 +445,7 @@ export function createGuard({ config, stateDir, logger, onState, onStopRequest }
       stopping = false
       if (stateDir) {
         clearGuardStopRequest(stateDir)
+        clearGuardStartRequest(stateDir)
         try {
           writeFileSync(guardPidPath(stateDir), `${process.pid}
 `, 'utf8')

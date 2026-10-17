@@ -15,13 +15,14 @@
     "$comment": "enabled 控制是否检测；severity 为 block 时该维度不通过也拦截，warn 只报告。",
     "egressIp": { "enabled": true, "severity": "block" },
     "claudeDns": { "enabled": true, "severity": "block", "deniedCountries": ["CN"] },
-    "$comment2": "以下都是中文用户环境特征（判定口径对齐 ippure 的同类检测）：默认只提示、不门控 —— 改时区、删系统字体属于改系统设置，不该由闸门替你决定能不能用。要更严就把 severity 改成 block。",
+    "$comment2": "时区/语言/字体/Emoji 是中文用户环境特征，默认只提示、不门控 —— 改时区、删系统字体属于改系统设置，不该由闸门替你决定能不能用。要更严就把 severity 改成 block。",
     "timezone": { "enabled": true, "severity": "warn" },
     "language": { "enabled": true, "severity": "warn" },
     "fonts": { "enabled": true, "severity": "warn" },
     "emojiFlags": { "enabled": true, "severity": "warn" },
-    "dnsServers": { "enabled": true, "severity": "warn" },
-    "proxyEnvLeak": { "enabled": true, "severity": "warn" }
+    "$comment3": "DNS 与系统代理默认**阻断**：它们不是设备特征，而是出口路径本身 —— 解析走国内服务器、CLI 直连暴露国内 IP，和出口白名单是同一件事。如果你的解析/代理本来就该走国内（例如公司内网 DNS），把这两项改回 warn 或 enabled=false。",
+    "dnsServers": { "enabled": true, "severity": "block" },
+    "proxyEnvLeak": { "enabled": true, "severity": "block" }
   },
 
   "enforcement": {
