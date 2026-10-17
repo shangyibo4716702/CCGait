@@ -60,6 +60,8 @@ const checks = [
   ['src/guard.js', '已处理 ', '进程处理日志（不再报"已终止 0 个"）'],
   ['src/verdict.js', 'emoji-flags-suspect', 'Emoji 判定规则'],
   ['src/environment.js', 'probeEmojiFont', 'Emoji 字体资产探测'],
+  ['src/firewall.js', 'firewallRulesUpToDate', '第二层：规则齐全时不重写（省掉每轮十几秒）'],
+  ['src/guard.js', 'checking', '一轮判定串行执行（避免并发起多个 WFP 宿主）'],
   ['src/win/wfp.js', 'purgeWfpFilters', '遗留过滤器清理'],
   ['src/win/wfp.js', 'listWfpProcesses', '区分常驻宿主与一次性调用'],
   ['src/cli.js', 'WFP 内核阻断：', 'CLI firewall on/off 同时管理两层'],

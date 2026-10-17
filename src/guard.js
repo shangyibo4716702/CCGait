@@ -10,13 +10,20 @@ import {
   probeTimezone,
 } from './environment.js'
 import { decide } from './verdict.js'
-import { applyBlockForPaths, enableProfiles, firewallProfileState, listManagedRules, removeAllBlocks } from './firewall.js'
+import {
+  applyBlockForPaths,
+  enableProfiles,
+  firewallProfileState,
+  firewallRulesUpToDate,
+  listManagedRules,
+  removeAllBlocks,
+} from './firewall.js'
 import {
   claudeExecutablePaths,
   killAllClaudeProcesses,
   listClaudeProcesses,
 } from './process-guard.js'
-import { requestWfpStop, resolveWfpHelper, startWfpBlock, stopWfpBlock } from './win/wfp.js'
+import { isWfpBlocking, requestWfpStop, resolveWfpHelper, startWfpBlock, stopWfpBlock } from './win/wfp.js'
 
 /**
  * 闸门执行器：周期性跑检测 → 判定 → 执行（终止进程 / 阻断网络）。
@@ -315,20 +322,30 @@ export async function enforce(config, verdict, options = {}) {
         '没有找到 Claude 客户端的可执行文件，无法建立防火墙阻断（客户端未安装时属正常）',
       )
     } else {
-      const applied = await applyBlockForPaths(targets)
-      if (applied.error) {
-        result.errors.push(applied.error)
+      // 稳态（规则齐全且都在拦截）不重写：重写那条路实测十几秒，每轮复检都跑一次
+      // 会把一轮从约 3 秒拖到十几秒，还顺带推迟"客户端被终止"的时刻。
+      const upToDate = await firewallRulesUpToDate(targets)
+      if (upToDate.current) {
+        result.applied = []
+        result.verified = upToDate.verified
+        result.removed = []
+        result.failed = []
       } else {
-        // 只把「回查确认已阻断」的路径算作生效，失败的必须如实上报。
-        result.applied = applied.applied
-        result.verified = applied.verified
-        result.removed = applied.removed
-        result.failed = applied.failed
-        if (applied.verified.length > 0) {
-          logger?.block('已阻断网络（防火墙出站）', `${applied.verified.length}/${targets.length} 个程序已生效`)
-        }
-        for (const item of applied.failed) {
-          result.errors.push(`阻断失败 ${item.path}：${item.error}`)
+        const applied = await applyBlockForPaths(targets)
+        if (applied.error) {
+          result.errors.push(applied.error)
+        } else {
+          // 只把「回查确认已阻断」的路径算作生效，失败的必须如实上报。
+          result.applied = applied.applied
+          result.verified = applied.verified
+          result.removed = applied.removed
+          result.failed = applied.failed
+          if (applied.verified.length > 0) {
+            logger?.block('已阻断网络（防火墙出站）', `${applied.verified.length}/${targets.length} 个程序已生效`)
+          }
+          for (const item of applied.failed) {
+            result.errors.push(`阻断失败 ${item.path}：${item.error}`)
+          }
         }
       }
     }
@@ -369,6 +386,7 @@ export function createGuard({ config, stateDir, logger, onState, onStopRequest }
   let timer = null
   let processTimer = null
   let stopping = false
+  let checking = false
   let lastFullCheckAt = 0
   let lastState = null
 
@@ -394,6 +412,9 @@ export function createGuard({ config, stateDir, logger, onState, onStopRequest }
    * 要十几秒），放在每轮判定前做会把一次复检拖成十几秒，而且规则本来就会一直留到判定通过。
    */
   const preBlock = async () => {
+    // 已经有宿主在挂过滤器就别再起一个：多出来的宿主各挂一套自己的过滤器，
+    // 撤的时候只会撤到其中一个，剩下的会让用户"莫名其妙上不了网"。
+    if (isWfpBlocking(stateDir)) return undefined
     const targets = claudeExecutablePaths({
       localAppData: process.env.LOCALAPPDATA,
       appData: process.env.APPDATA,
@@ -404,43 +425,60 @@ export function createGuard({ config, stateDir, logger, onState, onStopRequest }
     return startWfpBlock({ paths: targets, stateDir, timeoutMs: 20_000 })
   }
 
+  /**
+   * 一轮 = 判定 + 执行。**必须串行**：触发它的有两个定时器（复检 5 秒一跳、
+   * 进程巡检 2 秒一跳），而一轮要跑十几秒（判定约 2 秒 + 写 11 条防火墙规则十几秒）。
+   *
+   * 不加这道锁会并发跑同一轮，各自去挂 WFP 过滤器：第 2 个在第一个还没写好 pid 文件时
+   * 看不到已有宿主，于是又 spawn 一个 —— 实测一口气堆出 7 个宿主进程，防火墙规则也会
+   * 写成两份（日志里出现过"已撤掉 22 条 CCGait 防火墙规则"，正是 11×2）。
+   */
   const checkAndEnforce = async (reason) => {
+    if (checking) return lastState
+    checking = true
     const started = Date.now()
-    if (config.enforcement.blockFirst && config.enforcement.blockNetwork) {
-      try {
-        const pre = await preBlock()
-        if (pre && !pre.ok) logger?.warn('先行阻断未建立', pre.error)
-      } catch (error) {
-        // 先行阻断失败不能拖住判定：判定本身还是照跑，该拦的由 enforce() 兜住。
-        logger?.warn('先行阻断失败', error instanceof Error ? error.message : String(error))
-      }
-    }
-    const result = await runChecks(config)
+    // 复检间隔从「这一轮开始」算，而不是从它结束算：否则一轮跑了十几秒后，
+    // 定时器的下一个检查点会立刻又起一轮，间隔形同虚设。
     lastFullCheckAt = started
-    const enforcement = await enforce(config, result.verdict, { logger, stateDir })
-    const state = {
-      guardPid: process.pid,
-      updatedAt: new Date().toISOString(),
-      reason,
-      allow: result.verdict.allow,
-      failedClosed: result.verdict.failedClosed,
-      blocked: result.verdict.blockedBy.map((item) => ({ id: item.id, title: item.title })),
-      warnings: result.verdict.warnings.map((item) => ({ id: item.id, title: item.title })),
-      egress: result.egress
-        ? {
-            ip: result.egress.ip,
-            country: result.egress.country,
-            asn: result.egress.asn,
-            org: result.egress.org,
-            hosting: result.egress.hosting,
-            confident: result.egress.confident,
-          }
-        : undefined,
-      enforcement,
-      durationMs: Date.now() - started,
+    try {
+      if (config.enforcement.blockFirst && config.enforcement.blockNetwork) {
+        try {
+          const pre = await preBlock()
+          if (pre && !pre.ok) logger?.warn('先行阻断未建立', pre.error)
+        } catch (error) {
+          // 先行阻断失败不能拖住判定：判定本身还是照跑，该拦的由 enforce() 兜住。
+          logger?.warn('先行阻断失败', error instanceof Error ? error.message : String(error))
+        }
+      }
+      const result = await runChecks(config)
+      const enforcement = await enforce(config, result.verdict, { logger, stateDir })
+      const state = {
+        guardPid: process.pid,
+        updatedAt: new Date().toISOString(),
+        reason,
+        allow: result.verdict.allow,
+        failedClosed: result.verdict.failedClosed,
+        blocked: result.verdict.blockedBy.map((item) => ({ id: item.id, title: item.title })),
+        warnings: result.verdict.warnings.map((item) => ({ id: item.id, title: item.title })),
+        egress: result.egress
+          ? {
+              ip: result.egress.ip,
+              country: result.egress.country,
+              asn: result.egress.asn,
+              org: result.egress.org,
+              hosting: result.egress.hosting,
+              confident: result.egress.confident,
+            }
+          : undefined,
+        enforcement,
+        durationMs: Date.now() - started,
+      }
+      persist(state)
+      return state
+    } finally {
+      // 无论判定/执行成功与否都要解锁，否则一次异常会让闸门再也不复检。
+      checking = false
     }
-    persist(state)
-    return state
   }
 
   const pollProcesses = async () => {

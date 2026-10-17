@@ -133,6 +133,36 @@ $out | ConvertTo-Json -Compress -Depth 3`
 }
 
 /**
+ * 目标程序是否已经被现有规则**完整覆盖**（都在拦截状态，且没有多余的规则）。
+ *
+ * 为什么需要它：`applyBlockForPaths` 走的是 `Get-NetFirewallRule`，实测 11 条要**十几秒**。
+ * 闸门每轮复检都调它一次，一轮就从约 3 秒变成十几秒 —— 而稳态下规则根本没变，纯属白做功；
+ * 更要紧的是"客户端被终止"的时间也被推后，环境不对的窗口被拉长。
+ * 这里用 COM 枚举（实测 0.46 秒）做一次轻量判断，稳态时直接跳过重写。
+ *
+ * 判定用规则名去掉前缀后的那一段（建规则时 DisplayName = 前缀 + 程序路径），
+ * 不依赖 COM 的 ApplicationName 字段格式。
+ *
+ * 判断不出来一律返回 current: false —— 宁可多跑一次十几秒的重写，也不能误判成"已经拦住了"。
+ */
+export async function firewallRulesUpToDate(paths) {
+  if (!firewallSupported()) return { current: false }
+  const rules = await listManagedRules()
+  const lower = (value) => String(value).toLowerCase()
+  const wanted = paths.map(lower)
+  const blocking = new Set(
+    rules
+      .filter((rule) => rule.enabled && rule.direction === 'Outbound' && rule.action === 'Block')
+      .map((rule) => lower(rule.name.slice(RULE_PREFIX.length))),
+  )
+  const missing = paths.filter((path) => !blocking.has(lower(path)))
+  // 有规则指向已不在清单里的程序（客户端路径变了）：交给 applyBlockForPaths 顺手清掉。
+  const stale = rules.filter((rule) => !wanted.includes(lower(rule.name.slice(RULE_PREFIX.length))))
+  if (missing.length > 0 || stale.length > 0) return { current: false, missing, stale }
+  return { current: true, verified: [...paths] }
+}
+
+/**
  * 把阻断规则对齐到指定程序清单：
  * - 清单里的路径 → 确保存在一条 Outbound/Block 规则；
  * - 不在清单里的 CCGait 规则 → 删除（客户端路径变化或环境恢复正常时用得到）。
