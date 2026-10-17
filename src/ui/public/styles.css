@@ -652,6 +652,130 @@ button.action:disabled:not(.active) {
   color: var(--warn-text);
 }
 
+/* ------------------------------------------------- 客户端现状 + 拦截记录 */
+
+.access-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.access-card {
+  padding: 14px 16px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--panel-inset);
+}
+
+.access-card.ok {
+  border-color: #c7e8d5;
+  background: var(--ok-bg);
+}
+
+.access-card.deny {
+  border-color: #f0c9c5;
+  background: var(--danger-bg);
+}
+
+.access-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.access-icon {
+  font-size: 13px;
+  opacity: 0.7;
+}
+
+.access-card.ok .access-head strong {
+  color: var(--ok-text);
+}
+
+.access-card.deny .access-head strong {
+  color: var(--danger-text);
+}
+
+.access-reason {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.record-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin: 20px 0 10px;
+}
+
+.record-head h4 {
+  margin: 0;
+  font-size: 13.5px;
+}
+
+.record-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.record {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  background: #ffffff;
+  font-size: 12.5px;
+}
+
+.record.block {
+  border-left-color: var(--danger-text);
+}
+
+.record.warn {
+  border-left-color: var(--warn-text);
+}
+
+.record .tag {
+  margin-left: 0;
+  flex: 0 0 auto;
+}
+
+.record-time {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.record-body {
+  min-width: 0;
+}
+
+.record-message {
+  color: var(--text);
+  word-break: break-word;
+}
+
+.record-detail {
+  margin-top: 3px;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+
+.record-more {
+  padding: 6px 2px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
 button.action .spinner {
   width: 13px;
   height: 13px;

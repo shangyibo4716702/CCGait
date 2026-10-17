@@ -65,9 +65,15 @@ export function normalizeProfileEnabled(value) {
 export async function firewallProfileState() {
   if (!firewallSupported()) return { supported: false, profiles: [], anyEnabled: false }
   try {
-    const stdout = await runPowerShell(
-      'Get-NetFirewallProfile | Select-Object Name,Enabled | ConvertTo-Json -Compress',
-    )
+    // 同样走 COM：`Get-NetFirewallProfile` 本机实测 2.3 秒，COM 属性读取是毫秒级。
+    // FirewallEnabled 的入参是 profile 位：1=Domain 2=Private 4=Public。
+    const script = `
+$policy = New-Object -ComObject HNetCfg.FwPolicy2
+$out = foreach ($pair in @(@{n='Domain';b=1}, @{n='Private';b=2}, @{n='Public';b=4})) {
+  [pscustomobject]@{ Name = $pair.n; Enabled = [bool]$policy.FirewallEnabled($pair.b) }
+}
+$out | ConvertTo-Json -Compress`
+    const stdout = await runPowerShell(script)
     const parsed = stdout ? JSON.parse(stdout) : []
     const profiles = (Array.isArray(parsed) ? parsed : [parsed]).map((item) => ({
       name: item.Name,
@@ -84,22 +90,31 @@ export async function firewallProfileState() {
   }
 }
 
-/** 当前由 CCGait 创建的阻断规则。 */
+/**
+ * 当前由 CCGait 创建的阻断规则。
+ *
+ * 用 COM（HNetCfg.FwPolicy2）而不是 `Get-NetFirewallRule`：
+ * 后者会把**全部**防火墙规则拉出来在 PowerShell 侧过滤，本机实测要 **13.7 秒**，
+ * 而界面每次刷新状态都要调它 —— 结果是面板永远显示十几秒前的状态（用户会认为"状态不准"）。
+ * 换成 COM 枚举是 **0.46 秒**，快 30 倍。
+ */
 export async function listManagedRules() {
   if (!firewallSupported()) return []
   const script = `
-$rules = Get-NetFirewallRule -DisplayName '${RULE_PREFIX}*' -ErrorAction SilentlyContinue
-if (-not $rules) { Write-Output '[]'; exit 0 }
-$out = foreach ($rule in $rules) {
-  $filter = $rule | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
-  [pscustomobject]@{
-    Name = $rule.DisplayName
-    Enabled = ($rule.Enabled -eq 'True')
-    Direction = $rule.Direction.ToString()
-    Action = $rule.Action.ToString()
-    Program = $filter.Program
+$policy = New-Object -ComObject HNetCfg.FwPolicy2
+$out = foreach ($rule in $policy.Rules) {
+  if ($rule.Name -like '${RULE_PREFIX}*') {
+    # COM 的方向/动作是枚举：Direction 1=入站 2=出站；Action 0=阻止 1=允许
+    [pscustomobject]@{
+      Name = [string]$rule.Name
+      Enabled = [bool]$rule.Enabled
+      Direction = $(if ($rule.Direction -eq 2) { 'Outbound' } else { 'Inbound' })
+      Action = $(if ($rule.Action -eq 0) { 'Block' } else { 'Allow' })
+      Program = [string]$rule.ApplicationName
+    }
   }
 }
+if (-not $out) { Write-Output '[]'; exit 0 }
 $out | ConvertTo-Json -Compress -Depth 3`
   try {
     const stdout = await runPowerShell(script)

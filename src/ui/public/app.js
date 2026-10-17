@@ -183,6 +183,7 @@ function asnMatches(egressAsn, allowed) {
 function render() {
   if (!status) return
   renderHeader()
+  renderClaudeAccess()
   renderEnvironment()
   renderActions()
   renderInventory()
@@ -221,6 +222,62 @@ function renderHeader() {
       ? badge('neutral', '系统防火墙已开')
       : badge('warn', '系统防火墙已关'),
   )
+}
+
+/**
+ * Claude 客户端现状：能不能打开、能不能联网，外加拦截记录。
+ *
+ * 两个结论都由服务端算好（`status.claudeAccess`）—— 界面不自己推断，
+ * 否则"界面显示可以打开、闸门却在杀进程"这种事迟早会发生。
+ */
+function renderClaudeAccess() {
+  const host = document.querySelector('#access-state')
+  const sub = document.querySelector('#access-sub')
+  const listHost = document.querySelector('#interception-list')
+  const listSub = document.querySelector('#interception-sub')
+  if (!host) return
+
+  const access = status.claudeAccess ?? {}
+  const records = list(status.interceptions)
+
+  sub.textContent = status.guard.running ? '闸门运行中 · 实时更新' : '闸门未运行 · 仅显示阻断状态'
+  host.replaceChildren()
+
+  const card = (title, ok, reason, icon) => {
+    const box = el('div', 'access-card ' + (ok ? 'ok' : 'deny'))
+    const head = el('div', 'access-head')
+    head.append(el('span', 'access-icon', icon))
+    head.append(el('strong', undefined, title))
+    head.append(el('span', `tag ${ok ? 'ok' : 'danger'}`, ok ? '可以' : '不可以'))
+    box.append(head)
+    box.append(el('p', 'access-reason', reason ?? ''))
+    return box
+  }
+
+  host.append(
+    card('能否打开 Claude', access.canLaunch !== false, access.launchReason, '▶'),
+    card('能否访问网络', access.canNetwork !== false, access.networkReason, '🌐'),
+  )
+
+  listHost.replaceChildren()
+  listSub.textContent = records.length === 0 ? '暂无' : `最近 ${records.length} 条`
+  if (records.length === 0) {
+    listHost.append(el('div', 'empty', '还没有拦截记录：没有出现过不通过的判定，也没有执行过阻断。'))
+    return
+  }
+  for (const item of records.slice(0, 40)) {
+    const row = el('div', 'record ' + (item.level === 'block' ? 'block' : 'warn'))
+    row.append(el('span', `tag ${item.level === 'block' ? 'danger' : 'warn'}`, item.level === 'block' ? '拦截' : '提示'))
+    row.append(el('span', 'record-time', item.at ? new Date(item.at).toLocaleString() : ''))
+    const body = el('div', 'record-body')
+    body.append(el('div', 'record-message', item.message ?? ''))
+    if (item.detail) body.append(el('div', 'record-detail', item.detail))
+    row.append(body)
+    listHost.append(row)
+  }
+  if (records.length > 40) {
+    listHost.append(el('div', 'record-more', `只显示最近 40 条，共 ${records.length} 条`))
+  }
 }
 
 function renderEnvironment() {
@@ -632,6 +689,20 @@ function renderStateStrip() {
     cell('网络阻断', net.blocked ? `生效中（${layers.join(' + ')}）` : '未生效', net.blocked ? 'on' : 'off'),
     cell('系统防火墙', firewallOn ? '已开' : '已关', firewallOn ? 'on' : 'warn'),
   )
+
+  // 闸门对象在、pid 文件却指向别的进程：说明这个"运行中"不可信，必须明说。
+  if (status.guard.running && status.guard.pidMatches === false) {
+    const warn = el('div', 'notice warn')
+    warn.append(
+      el('span', 'icon', '!'),
+      el(
+        'span',
+        undefined,
+        `闸门状态可疑：pid 文件记录的是 ${status.guard.pid ?? '未知'}，不是当前界面进程。请点「停止闸门」再重新「启动闸门」以恢复一致。`,
+      ),
+    )
+    host.append(warn)
+  }
 }
 
 function renderActions() {
@@ -855,7 +926,7 @@ events.addEventListener('log', (event) => {
   const payload = JSON.parse(event.data)
   appendLog(payload.entry)
 })
-for (const type of ['status', 'check', 'guard']) {
+for (const type of ['status', 'check', 'guard', 'interception']) {
   events.addEventListener(type, () => void refresh())
 }
 events.addEventListener('error', () => {
@@ -865,9 +936,12 @@ events.addEventListener('error', () => {
 
 void refresh()
 setInterval(() => {
-  // 兜底轮询：SSE 断线时界面仍能自更新（管理员/防火墙状态等本地信息变化不会推事件）。
-  if (document.visibilityState === 'visible') void refresh()
-}, 15_000)
+  // 兜底轮询：SSE 只推送"本界面自己"的动作 —— 托盘那边的闸门建立的阻断不会推事件，
+  // 必须靠轮询兜住。这里**不再判断标签页是否在前台**：切到后台就不刷新，会让用户
+  // 回来时看到过期状态（实测：托盘已经把网络断掉了，界面还写着"可以访问网络"）。
+  // 本机回环请求很便宜，8 秒一次可以接受。
+  void refresh()
+}, 8_000)
 
 /**
  * 侧栏导航：滚动时高亮当前所在面板（对齐 MoA Studio 的导航态）。

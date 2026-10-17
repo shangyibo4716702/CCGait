@@ -377,6 +377,8 @@ async function commandKill() {
 
 async function commandFirewall(argv) {
   const action = argv[0]
+  const { config } = await loadOrExit()
+  const stateDir = resolveStateDir(config)
   if (action === 'list') {
     const rules = await listManagedRules()
     if (rules.length === 0) {
@@ -387,12 +389,20 @@ async function commandFirewall(argv) {
     return 0
   }
   if (action === 'off') {
+    // 两层都撤：只删防火墙规则会把 WFP 内核过滤器留下继续断网，
+    // 用户看到的是"已解除"、程序却依然上不了网 —— 最难排查的一种残留。
+    const wfp = await stopWfpBlock({ stateDir, waitMs: 10_000 })
     const result = await removeAllBlocks()
     if (result.error) {
       console.error(`解除阻断失败：${result.error}`)
       return 1
     }
     console.log(`已移除 ${result.removed} 条 CCGait 防火墙规则`)
+    console.log(
+      wfp.stopped
+        ? `WFP 内核阻断已解除${wfp.purged ? `，另清理遗留过滤器 ${wfp.purged} 条` : ''}`
+        : 'WFP 内核阻断：本就没有宿主在运行',
+    )
     return 0
   }
   if (action === 'on') {
@@ -405,12 +415,23 @@ async function commandFirewall(argv) {
       console.error('没有发现 Claude 客户端，无法建立阻断')
       return 1
     }
+    // 第一层：WFP 内核过滤器（不依赖系统防火墙是否开启）。
+    const wfp = await startWfpBlock({ paths: targets, stateDir, detached: true })
+    if (!wfp.ok) {
+      console.error(`WFP 内核阻断建立失败：${wfp.error}`)
+    } else if (wfp.alreadyRunning) {
+      console.log(`WFP 内核阻断：已在生效中（宿主 PID ${wfp.pid}）`)
+    } else {
+      console.log(`WFP 内核阻断：${wfp.filters} 条过滤器生效（宿主 PID ${wfp.pid}）`)
+    }
+
+    // 第二层：防火墙规则。
     const result = await applyBlockForPaths(targets)
     if (result.error) {
       console.error(`建立阻断失败：${result.error}`)
       return 1
     }
-    console.log(`已阻断：${result.verified.length}/${targets.length} 个程序`)
+    console.log(`已阻断：${result.verified.length}/${targets.length} 个程序（防火墙规则）`)
     for (const item of result.failed) {
       console.error(`  失败：${item.path} —— ${item.error}`)
     }
@@ -474,6 +495,9 @@ async function commandUi(argv) {
   const logger = createLogger({ logFile: defaultLogFile(stateDir) })
   const session = createUiSession({ configPath: CONFIG_PATH, logger })
   const ui = createUiServer({ session, logger })
+  // 开始监视阻断状态的变化：阻断可能是安装版托盘的闸门建立的，那种变化不会触发
+  // 本会话的事件，只能主动比对后广播，否则界面会显示过期状态。
+  session.startWatching()
 
   let address
   try {

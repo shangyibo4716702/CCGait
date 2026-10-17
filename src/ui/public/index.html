@@ -25,6 +25,10 @@
 
         <div class="side-section">状态</div>
         <nav class="side-nav">
+          <a class="nav-item" href="#sec-access" data-target="sec-access">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 3l7 3v6c0 4.4-2.9 7.9-7 9-4.1-1.1-7-4.6-7-9V6z" /><path d="M9 12l2 2 4-4" /></svg>
+            客户端现状
+          </a>
           <a class="nav-item" href="#sec-env" data-target="sec-env">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3c2.5 2.6 3.8 5.7 3.8 9S14.5 18.4 12 21c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3z" /></svg>
             当前环境
@@ -85,6 +89,24 @@
             <div class="verdict" id="verdict"></div>
           </div>
         </header>
+
+        <section class="panel" id="sec-access">
+          <div class="panel-header">
+            <div>
+              <h3>Claude 客户端现状</h3>
+              <p>此刻能不能打开、能不能联网；下面同时列出最近的拦截记录。</p>
+            </div>
+            <span class="panel-sub" id="access-sub"></span>
+          </div>
+          <div class="panel-body">
+            <div class="access-grid" id="access-state"></div>
+            <div class="record-head">
+              <h4>拦截记录</h4>
+              <span class="panel-sub" id="interception-sub"></span>
+            </div>
+            <div class="record-list" id="interception-list"></div>
+          </div>
+        </section>
 
         <section class="panel" id="sec-env">
           <div class="panel-header">

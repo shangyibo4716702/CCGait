@@ -49,6 +49,10 @@ const binaryHas = (name, needle) => {
 
 const checks = [
   ['src/firewall.js', 'normalizeProfileEnabled', '防火墙状态读数修复（GpoBoolean 被序列化成 1）'],
+  ['src/firewall.js', 'HNetCfg.FwPolicy2', '规则枚举改用 COM（13.7 秒 → 0.9 秒）'],
+  ['src/ui/session.js', 'startWatching', '阻断状态变化主动广播（不等轮询）'],
+  ['src/ui/session.js', 'externalBlock', '界面：说明阻断来自别的实例'],
+  ['src/ui/public/app.js', '!visibilityState', '界面：后台标签页也要轮询（不该有这个判断）'],
   ['src/config.js', 'enableFirewallProfiles', '第二层防火墙规则自动开启 profile'],
   ['src/config.js', 'emojiFlags', 'Emoji 国旗渲染检查项'],
   ['src/providers.js', 'proxyFallback', '代理连不上时回退直连'],
@@ -57,11 +61,27 @@ const checks = [
   ['src/verdict.js', 'emoji-flags-suspect', 'Emoji 判定规则'],
   ['src/environment.js', 'probeEmojiFont', 'Emoji 字体资产探测'],
   ['src/win/wfp.js', 'purgeWfpFilters', '遗留过滤器清理'],
+  ['src/win/wfp.js', 'listWfpProcesses', '区分常驻宿主与一次性调用'],
+  ['src/cli.js', 'WFP 内核阻断：', 'CLI firewall on/off 同时管理两层'],
+  ['src/ui/session.js', 'wfpOrphan', '界面：宿主与 pid 记录不一致时可见'],
+  ['src/ui/session.js', 'stopWfpBlock', '界面：解除阻断同时撤掉 WFP'],
   ['src/ui/public/app.js', '白名单比对', '界面：白名单逐项命中'],
   ['src/ui/public/app.js', 'tag-detail', '界面：每行状态标签'],
   ['src/ui/public/app.js', 'proxyFallback', '界面：代理回退说明'],
+  ['src/ui/public/app.js', 'renderStateStrip', '界面：操作面板状态条'],
+  ['src/ui/public/app.js', '已阻断网络', '界面：按钮显示阻断状态'],
+  ['src/ui/public/app.js', 'renderClaudeAccess', '界面：客户端现状（能否打开/联网）'],
+  ['src/ui/public/app.js', 'interception-list', '界面：拦截记录列表'],
+  ['src/ui/session.js', 'buildClaudeAccess', '服务端：客户端可用性结论'],
+  ['src/ui/session.js', 'readInterceptionsFromLog', '拦截记录跨重启回填'],
+  ['src/ui/public/index.html', 'sec-access', '界面：客户端现状面板'],
+  ['src/ui/session.js', 'networkBlock', '接口：暴露网络阻断实时状态'],
+  ['src/ui/public/index.html', 'action-state', '界面：状态条容器'],
+  ['src/ui/public/styles.css', 'state-cell', '界面：状态条样式'],
+  ['src/ui/public/styles.css', 'button.action.active', '界面：激活态按钮样式'],
   ['README.md', '不拦截、不门控', '文档：环境项只提示'],
   ['README.md', 'Emoji 国旗渲染', '文档：Emoji 检查项'],
+  ['README.md', '界面上怎么看出当前状态', '文档：状态标识说明'],
 ]
 
 const binaryChecks = [
@@ -74,10 +94,14 @@ const binaryChecks = [
 
 console.log(`载荷文件数：${files.size}\n`)
 let missing = 0
-for (const [file, needle, why] of checks) {
-  const ok = textHas(file, needle)
+for (const [file, rawNeedle, why] of checks) {
+  // 以 ! 开头的条目表示"这个字符串不该出现"（用于钉住已经修掉的写法别被改回来）。
+  const absent = rawNeedle.startsWith('!')
+  const needle = absent ? rawNeedle.slice(1) : rawNeedle
+  const present = textHas(file, needle)
+  const ok = absent ? !present : present
   if (!ok) missing++
-  console.log(`  ${ok ? '有' : '缺'}  ${file} ← ${needle}　（${why}）`)
+  console.log(`  ${ok ? '有' : '缺'}  ${file} ← ${absent ? '不含 ' : ''}${needle}　（${why}）`)
 }
 
 console.log('\n编译产物（.cs 源不进载荷，功能在 exe 里）：')
@@ -85,6 +109,21 @@ for (const [file, needle, why] of binaryChecks) {
   const ok = binaryHas(file, needle)
   if (!ok) missing++
   console.log(`  ${ok ? '有' : '缺'}  ${file} ← ${needle}　（${why}）`)
+}
+
+// 安装程序本体不在载荷里（它是内嵌载荷的那个 exe），单独查 dist 下的产物。
+// 这条针对一个真实事故：日志框用了 Consolas，而它没有中文字形（实测 4/4 缺），
+// 于是界面中文全渲染成方块 —— 字体名必须能在产物里查到。
+const setupExePath = new URL('../dist/CCGaitSetup.exe', import.meta.url)
+if (existsSync(setupExePath)) {
+  const setupData = readFileSync(setupExePath)
+  const hasYaHei = setupData.includes(Buffer.from('Microsoft YaHei UI', 'utf16le'))
+  const hasConsolas = setupData.includes(Buffer.from('Consolas', 'utf16le'))
+  if (!hasYaHei) missing++
+  if (hasConsolas) missing++
+  console.log('\n安装程序本体（dist/CCGaitSetup.exe）：')
+  console.log(`  ${hasYaHei ? '有' : '缺'}  Microsoft YaHei UI　（日志框字体，有中文字形）`)
+  console.log(`  ${hasConsolas ? '仍含' : '无'}  Consolas　（没有中文字形，出现在日志框会导致方块乱码）`)
 }
 
 console.log(`\n结论：${missing === 0 ? '载荷与编译产物均包含全部关键修复' : `有 ${missing} 项缺失 —— 很可能改了源码但没重新打包`}`)

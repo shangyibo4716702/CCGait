@@ -1,6 +1,7 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { CONFIG_PATH, loadConfig, normalizeConfig, resolveStateDir, validateConfig } from '../config.js'
-import { createGuard, runChecks } from '../guard.js'
+import { createGuard, readGuardPid, runChecks } from '../guard.js'
 import {
   applyBlockForPaths,
   enableProfiles,
@@ -11,7 +12,7 @@ import {
 } from '../firewall.js'
 import { claudeDiscovery, killAllClaudeProcesses, listClaudeProcesses } from '../process-guard.js'
 import { startupStatus } from '../startup.js'
-import { isWfpBlocking, listWfpHosts, readWfpPid } from '../win/wfp.js'
+import { isWfpBlocking, listWfpHosts, readWfpPid, startWfpBlock, stopWfpBlock } from '../win/wfp.js'
 
 /**
  * UI 会话层：把 CLI 已有的能力包成一组可调用的动作 + 一个事件流，供 Web 前端使用。
@@ -25,6 +26,40 @@ import { isWfpBlocking, listWfpHosts, readWfpPid } from '../win/wfp.js'
  */
 
 const LOG_RING_SIZE = 500
+const INTERCEPTION_RING_SIZE = 80
+
+/**
+ * 从日志文件里回填拦截记录。
+ *
+ * 为什么要读文件而不是只留内存：拦截记录的价值在于"事后回看"，
+ * 而界面进程重启后内存里的东西就没了。日志文件本来就有 ISO 时间戳与级别，
+ * 直接复用即可，不需要另建一套存储。
+ */
+function readInterceptionsFromLog(stateDir, limit = INTERCEPTION_RING_SIZE) {
+  try {
+    const dir = stateDir
+    if (!existsSync(dir)) return []
+    const files = readdirSync(dir)
+      .filter((name) => name.startsWith('ccgait-') && name.endsWith('.log'))
+      .sort()
+    const picked = []
+    for (const name of files.slice(-2)) {
+      const text = readFileSync(join(dir, name), 'utf8')
+      for (const line of text.split(/\r?\n/)) {
+        // 形如：2026-10-17T01:52:08.144Z BLOCK 已阻断网络（防火墙出站） 11/11 个程序已生效
+        const match = /^(\S+) (OK|WARN|BLOCK|INFO|ERR)\s+(.*)$/.exec(line.trim())
+        if (!match) continue
+        const [, at, tag, rest] = match
+        const level = tag === 'BLOCK' ? 'block' : tag === 'WARN' ? 'warn' : tag === 'ERR' ? 'error' : tag === 'OK' ? 'ok' : 'info'
+        if (level !== 'block' && level !== 'warn') continue
+        picked.push({ at, level, message: rest })
+      }
+    }
+    return picked.slice(-limit)
+  } catch {
+    return []
+  }
+}
 
 function nowIso() {
   return new Date().toISOString()
@@ -49,6 +84,56 @@ export function applyConfigPatch(current, patch) {
   return normalizeConfig(merged)
 }
 
+/**
+ * Claude 客户端此刻的可用性结论。
+ *
+ * 两个问题分开回答，因为它们的成因不同：
+ *  - **能不能打开**：取决于闸门是否在执法 + 判定是否通过 + 是否配置了"终止进程"。
+ *    闸门没在跑时没有任何东西拦它，所以能打开 —— 但要如实说明"没有执法在生效"，
+ *    否则用户会误以为有闸门在保护。
+ *  - **能不能联网**：只看当前有没有生效中的阻断（WFP 或防火墙规则）。它与判定无关：
+ *    即使闸门没跑，之前手动建的阻断依然会让它连不上网。
+ */
+function buildClaudeAccess({ check, guardRunning, networkBlocked, networkLayers, externalBlock, config }) {
+  const killEnabled = config?.enforcement?.killProcesses !== false
+  const verdictKnown = Boolean(check)
+  const verdictDeny = verdictKnown && check.allow === false
+
+  let canLaunch
+  let launchReason
+  if (!guardRunning) {
+    canLaunch = true
+    launchReason = verdictKnown && verdictDeny
+      ? '闸门未运行，没有执法在生效（但当前环境判定为不通过）'
+      : '闸门未运行，没有执法在生效'
+  } else if (!verdictKnown) {
+    canLaunch = true
+    launchReason = '闸门运行中，但还没跑过检测；点「立即检测」后才有结论'
+  } else if (verdictDeny && killEnabled) {
+    canLaunch = false
+    launchReason = `判定不通过，启动就会被终止：${check.blocked.map((item) => item.title).join('；') || '见下方拦截记录'}`
+  } else if (verdictDeny && !killEnabled) {
+    canLaunch = true
+    launchReason = '判定不通过，但配置里关闭了「终止客户端进程」，所以不会被终止'
+  } else {
+    canLaunch = true
+    launchReason = '闸门运行中且判定通过，可以正常启动'
+  }
+
+  return {
+    canLaunch,
+    launchReason,
+    canNetwork: !networkBlocked,
+    networkReason: networkBlocked
+      ? `已被阻断，连不上网（${networkLayers.join(' + ') || '阻断生效中'}）` +
+        (externalBlock ? '。注意：这个阻断不是本界面建立的（很可能是安装版托盘的闸门在维持），点「解除阻断」后可能被它立刻重建 —— 要彻底解除，请先在托盘里停止闸门。' : '')
+      : '当前没有生效中的阻断，网络可用',
+    externalBlock: Boolean(externalBlock),
+    verdict: verdictKnown ? (check.allow ? 'allow' : 'deny') : 'unknown',
+    guardRunning,
+  }
+}
+
 export function createUiSession(options = {}) {
   const configPath = options.configPath ?? CONFIG_PATH
   const logger = options.logger
@@ -68,10 +153,14 @@ export function createUiSession(options = {}) {
     isWfpBlocking: options.deps?.isWfpBlocking ?? isWfpBlocking,
     listWfpHosts: options.deps?.listWfpHosts ?? listWfpHosts,
     readWfpPid: options.deps?.readWfpPid ?? readWfpPid,
+    startWfpBlock: options.deps?.startWfpBlock ?? startWfpBlock,
+    stopWfpBlock: options.deps?.stopWfpBlock ?? stopWfpBlock,
   }
 
   const listeners = new Set()
   const logs = []
+  // 拦截记录：从日志文件里回填历史（跨重启保留），之后与 pushLog 同步增长。
+  const interceptions = readInterceptionsFromLog(resolveStateDir(loadConfig(configPath).config, configPath))
   let loaded = loadConfig(configPath)
   let stateDir = resolveStateDir(loaded.config, configPath)
   let configProblems = validateConfig(loaded.config)
@@ -81,6 +170,8 @@ export function createUiSession(options = {}) {
   let lastEnforcement = null
   let lastError = undefined
   let queue = Promise.resolve()
+  let watchTimer = null
+  let watchSignature = null
 
   const emit = (event) => {
     for (const listener of listeners) {
@@ -101,6 +192,15 @@ export function createUiSession(options = {}) {
     }
     logs.push(entry)
     if (logs.length > LOG_RING_SIZE) logs.splice(0, logs.length - LOG_RING_SIZE)
+    // 拦截记录与日志走同一个漏斗：block/warn 级别就是"发生过拦截/被拦下的动作"，
+    // 统一在这里登记，避免每个动作各写一遍而漏掉（闸门内部的执法也经 logger 落到这里）。
+    if (level === 'block' || level === 'warn') {
+      interceptions.push(entry)
+      if (interceptions.length > INTERCEPTION_RING_SIZE) {
+        interceptions.splice(0, interceptions.length - INTERCEPTION_RING_SIZE)
+      }
+      emit({ type: 'interception', entry })
+    }
     emit({ type: 'log', entry })
     // 同时写文件，便于事后排查。
     logger?.[level]?.(message, detail)
@@ -138,8 +238,11 @@ export function createUiSession(options = {}) {
 
     // 网络阻断到底有没有生效：这是界面上最容易看不出来、也最该看出来的一个状态。
     // WFP 是第一层（不依赖防火墙开关），防火墙规则是第二层；任一层在生效就算"阻断中"。
-    const wfpBlocking = deps.isWfpBlocking(stateDir)
+    // WFP 用**实际在跑的宿主进程**为准，而不是只看 pid 文件 —— pid 文件可能被删掉，
+    // 那时候只看文件会报"未生效"，而内核里其实还挂着过滤器（实测踩过）。
+    const wfpHosts = await deps.listWfpHosts()
     const wfpPid = deps.readWfpPid(stateDir)
+    const wfpOrphan = wfpHosts.length > 0 && !wfpHosts.includes(wfpPid)
     const activeRules = rules.filter((rule) => rule.enabled)
 
     return {
@@ -157,14 +260,34 @@ export function createUiSession(options = {}) {
       targetNotes: discovery.notes,
       startup,
       networkBlock: {
-        blocked: wfpBlocking || activeRules.length > 0,
-        wfp: wfpBlocking,
+        blocked: wfpHosts.length > 0 || activeRules.length > 0,
+        wfp: wfpHosts.length > 0,
+        wfpHosts,
         wfpPid,
+        wfpOrphan,
         firewallRules: activeRules.length,
         programs: discovery.entries.length,
       },
+      // Claude 此刻能不能打开、能不能联网 —— 用户最关心的两个结论。
+      // 由服务端按「判定结果 + 执法开关 + 实际阻断状态」算好，界面直接显示，不在前端猜。
+      claudeAccess: buildClaudeAccess({
+        check: lastCheck,
+        guardRunning: guard !== null,
+        networkBlocked: wfpHosts.length > 0 || activeRules.length > 0,
+        networkLayers: [wfpHosts.length > 0 ? 'WFP 内核过滤器' : undefined, activeRules.length > 0 ? `防火墙规则 ${activeRules.length} 条` : undefined].filter(Boolean),
+        // 阻断不是本界面建立的（例如安装版托盘的闸门在维持）：要说清楚，
+        // 否则用户点「解除阻断」会被对方立刻重建，看起来像"点了没反应"。
+        externalBlock: guard === null && (wfpHosts.length > 0 || activeRules.length > 0),
+        config: getConfig(),
+      }),
+      interceptions: interceptions.slice(-INTERCEPTION_RING_SIZE).reverse(),
       guard: {
+        // 以内存里的闸门对象为准（UI 自己启停的就是它）；另外给出 pid 一致性信号：
+        // 闸门跑在本进程里时 pid 文件应当就是本进程 PID，对不上就说明状态可疑
+        // （进程被任务管理器结束、或另有闸门在跑），界面据此提示而不是笼统显示"运行中"。
         running: guard !== null,
+        pid: readGuardPid(stateDir),
+        pidMatches: guard === null ? null : readGuardPid(stateDir) === process.pid,
         startedAt: guardStartedAt,
         lastState: guard?.lastState ?? null,
       },
@@ -227,6 +350,12 @@ export function createUiSession(options = {}) {
           error: (m, d) => pushLog('error', m, d),
         },
         onState: (state) => emit({ type: 'guard', state }),
+        // 外部停止请求（托盘/CLI 的 guard-stop 写的就是这个请求文件）必须真的走一遍收尾：
+        // 不接这个回调的话，闸门会停掉执法循环、但 pid 文件不清、guard 变量不为 null，
+        // 界面就一直显示"运行中"而实际什么都没拦 —— 说的和做的不一致，最难发现。
+        onStopRequest: () => {
+          void stopGuard()
+        },
       })
       guardStartedAt = nowIso()
       pushLog('info', '闸门已启动', `巡检 ${config.enforcement.pollIntervalMs}ms`)
@@ -254,32 +383,45 @@ export function createUiSession(options = {}) {
   const setFirewall = (enabled) =>
     serialize(async () => {
       if (!enabled) {
+        // 两层都要撤。只删防火墙规则会把 WFP 内核过滤器留在那里继续断网 ——
+        // 界面显示"已解除"、程序却依然上不了网，是最难排查的一种残留。
+        const wfp = await deps.stopWfpBlock({ stateDir, waitMs: 10_000 })
         const result = await deps.removeAllBlocks()
         if (result.error) {
           pushLog('error', '解除阻断失败', result.error)
           throw new Error(result.error)
         }
-        pushLog('warn', '已解除网络阻断', `${result.removed} 条规则`)
+        pushLog(
+          'warn',
+          '已解除网络阻断',
+          `防火墙规则 ${result.removed} 条；WFP ${wfp.stopped ? '宿主已退出' : '本就没有宿主'}${wfp.purged ? `，另清理遗留过滤器 ${wfp.purged} 条` : ''}`,
+        )
         emit({ type: 'status' })
-        return result
+        return { ...result, wfp }
       }
       const discovery = deps.claudeDiscovery(clientDiscoveryOptions())
       const targets = discovery.entries.map((item) => item.path)
       if (targets.length === 0) throw new Error('没有发现 Claude 客户端，无法建立阻断')
+
+      // 第一层：WFP 内核过滤器（不依赖防火墙开关）。
+      const wfp = await deps.startWfpBlock({ paths: targets, stateDir, detached: true })
+      if (!wfp.ok) {
+        pushLog('error', 'WFP 阻断建立失败', wfp.error)
+      } else if (!wfp.alreadyRunning) {
+        pushLog('block', '已建立 WFP 内核阻断', `${wfp.filters} 条过滤器生效（宿主 PID ${wfp.pid}）`)
+      }
+
+      // 第二层：防火墙规则。
       const result = await deps.applyBlockForPaths(targets)
       if (result.error) {
         pushLog('error', '建立阻断失败', result.error)
         throw new Error(result.error)
       }
       lastEnforcement = { at: nowIso(), kind: 'firewall-manual', verified: result.verified.length, failed: result.failed }
-      pushLog(
-        'block',
-        '已建立网络阻断',
-        `${result.verified.length}/${targets.length} 个程序已生效`,
-      )
+      pushLog('block', '已建立网络阻断', `${result.verified.length}/${targets.length} 个程序已生效`)
       for (const item of result.failed) pushLog('warn', '阻断未生效', `${item.path}：${item.error}`)
       emit({ type: 'status' })
-      return result
+      return { ...result, wfp }
     })
 
   const killProcesses = () =>
@@ -365,8 +507,42 @@ export function createUiSession(options = {}) {
       listeners.add(listener)
       return () => listeners.delete(listener)
     },
+    /**
+     * 监视"阻断状态"的变化并广播，让界面不必等轮询。
+     *
+     * 为什么需要：阻断可能是**别的实例**建立的（例如安装版托盘的闸门在跑），
+     * 那种变化不会触发本会话的任何事件，界面只能靠轮询发现 —— 实测出现过
+     * "托盘已经把网络断掉了、界面还写着可以访问网络"的过期显示。
+     * 这里只比对两个便宜的信号（常驻宿主数量、生效规则数），变了才推事件。
+     */
+    startWatching(intervalMs = 6_000) {
+      if (watchTimer) return
+      const snapshot = async () => {
+        try {
+          const hosts = await deps.listWfpHosts()
+          const rules = await deps.listManagedRules()
+          const enabled = rules.filter((rule) => rule.enabled).length
+          const blocked = hosts.length > 0 || enabled > 0
+          const signature = `${hosts.length}|${enabled}`
+          if (watchSignature !== null && watchSignature !== signature) {
+            emit({ type: 'status' })
+          }
+          watchSignature = signature
+          void blocked
+        } catch {
+          // 探测失败不改状态：下一次再比。
+        }
+      }
+      void snapshot()
+      watchTimer = setInterval(() => void snapshot(), intervalMs)
+      if (typeof watchTimer.unref === 'function') watchTimer.unref()
+    },
     /** 退出时收尾：停掉闸门并撤掉阻断，避免留下"上不了网"的残留。 */
     async dispose() {
+      if (watchTimer) {
+        clearInterval(watchTimer)
+        watchTimer = null
+      }
       if (guard) {
         try {
           await guard.stop()

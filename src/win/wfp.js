@@ -69,14 +69,43 @@ export function isWfpBlocking(stateDir) {
 }
 
 /**
- * 列出所有在跑的 WFP 宿主进程。
+ * 列出所有**常驻** WFP 宿主进程（`hold` 模式）。
  *
- * 为什么要按进程名全量扫，而不是只信 pid 文件：pid 文件可能被删掉、被上一轮覆盖，
- * 于是会出现"宿主还在挂过滤器、但 pid 文件记的是别的进程"的局面 —— 这时候再建一次
- * 阻断就会有**两个宿主并存**，而 off 只杀得掉一个，剩下的会让用户莫名其妙上不了网。
- * 这个助手是我们自己的二进制，机器上不会有第三方在跑，所以按名字全量收掉是安全的。
+ * 两个必须注意的点：
+ *  1. 不能只信 pid 文件：它可能被删掉或被上一轮覆盖，于是出现"宿主还在挂过滤器、
+ *     但 pid 文件记的是别的进程"的局面 —— 这时候再建一次阻断就会有**两个宿主并存**，
+ *     而 off 只杀得掉一个，剩下的会让用户莫名其妙上不了网。
+ *  2. 也不能只按进程名匹配：`purge` / `check` / `list-filters` 这些**一次性**调用
+ *     也叫 CCGaitWfp.exe，按名匹配会把它们算成"有宿主在跑"（实测被这个坑到过：
+ *     刚清理完就"看到"一个新宿主，其实是 purge 自己还在退出过程中），
+ *     进而让状态误报"阻断生效中"，甚至让清扫把一个正在跑的 purge 杀掉。
+ *     所以这里按命令行里是否有 `hold` 来判定。
+ *
+ * 这个助手是我们自己的二进制，机器上不会有第三方在跑，所以按名字+模式筛选是安全的。
  */
 export async function listWfpHosts() {
+  try {
+    const { stdout } = await execFileAsync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        "Get-CimInstance Win32_Process -Filter \"Name='CCGaitWfp.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match '\\shold(\\s|$)' } | Select-Object -ExpandProperty ProcessId",
+      ],
+      { windowsHide: true, timeout: 15_000 },
+    )
+    return stdout
+      .split(/\r?\n/)
+      .map((line) => Number(line.trim()))
+      .filter((pid) => Number.isInteger(pid) && pid > 0)
+  } catch {
+    return []
+  }
+}
+
+/** 所有叫这个名字的进程（含一次性调用），仅用于排查与清理确认。 */
+export async function listWfpProcesses() {
   try {
     const { stdout } = await execFileAsync(
       'powershell.exe',

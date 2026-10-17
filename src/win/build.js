@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join, relative, sep } from 'node:path'
 import { promisify } from 'node:util'
 import { PROJECT_ROOT } from '../config.js'
@@ -128,6 +128,13 @@ export async function buildInstaller({ rootDir = PROJECT_ROOT, distDir } = {}) {
   rmSync(buildDir, { recursive: true, force: true })
   mkdirSync(buildDir, { recursive: true })
 
+  // 全部产物先编到暂存目录，**全部成功后再一次性发布到 dist**。
+  // 为什么：exe 可能被正在运行的宿主/托盘占用而编译失败（实测踩过两次）。
+  // 如果直接编到 dist，失败时 dist 会留下"新客户端 + 旧安装包（内嵌旧载荷）"的混合状态，
+  // 比"没有包"更危险 —— 装出来的东西谁都说不清是哪个版本。
+  const staging = join(buildDir, 'staging')
+  mkdirSync(staging, { recursive: true })
+
   const log = []
   const icons = writeIconFiles(buildDir)
   log.push(`图标：${icons.ico}`)
@@ -136,7 +143,7 @@ export async function buildInstaller({ rootDir = PROJECT_ROOT, distDir } = {}) {
   const clientSource = join(rootDir, 'src', 'win', 'native', CLIENT_EXE_NAME.replace('.exe', '.cs'))
   const clientSourceCopy = join(buildDir, 'CCGaitClient.cs')
   writeSourceWithBom(clientSource, clientSourceCopy)
-  const clientExe = join(dist, CLIENT_EXE_NAME)
+  const clientExe = join(staging, CLIENT_EXE_NAME)
   const clientResult = await compile({
     csc,
     target: 'winexe',
@@ -154,7 +161,7 @@ export async function buildInstaller({ rootDir = PROJECT_ROOT, distDir } = {}) {
   const wfpSource = join(rootDir, 'src', 'win', 'native', 'CCGaitWfp.cs')
   const wfpSourceCopy = join(buildDir, 'CCGaitWfp.cs')
   writeSourceWithBom(wfpSource, wfpSourceCopy)
-  const wfpExe = join(dist, WFP_EXE_NAME)
+  const wfpExe = join(staging, WFP_EXE_NAME)
   const wfpResult = await compile({
     csc,
     // 用 exe 而非 winexe：它要通过 stdin 与父进程保持会话，输出也要能被读回。
@@ -184,7 +191,7 @@ export async function buildInstaller({ rootDir = PROJECT_ROOT, distDir } = {}) {
     entries.push({ absolute: extra.absolute, relative: extra.relative.split(sep).join('/') })
   }
   const payload = buildPayload(entries)
-  const payloadPath = join(buildDir, 'payload.txt')
+  const payloadPath = join(staging, 'payload.txt')
   writeFileSync(payloadPath, payload, 'utf8')
   log.push(`载荷：${entries.length} 个文件 / ${Math.round(Buffer.byteLength(payload) / 1024)} KB`)
 
@@ -192,7 +199,7 @@ export async function buildInstaller({ rootDir = PROJECT_ROOT, distDir } = {}) {
   const setupSource = join(rootDir, 'src', 'win', 'native', 'CCGaitSetup.cs')
   const setupSourceCopy = join(buildDir, 'CCGaitSetup.cs')
   writeSourceWithBom(setupSource, setupSourceCopy)
-  const setupExe = join(dist, 'CCGaitSetup.exe')
+  const setupExe = join(staging, 'CCGaitSetup.exe')
   const setupResult = await compile({
     csc,
     target: 'winexe',
@@ -205,15 +212,37 @@ export async function buildInstaller({ rootDir = PROJECT_ROOT, distDir } = {}) {
   if (!setupResult.ok) {
     return { ok: false, error: `安装程序编译失败：\n${setupResult.output}`, log }
   }
-  log.push(`安装程序：${setupExe}（${Math.round(statSync(setupExe).size / 1024)} KB）`)
+
+  // 4) 发布：三个产物全部编译成功后才覆盖 dist，避免留下混合版本。
+  const published = {
+    clientExe: join(dist, CLIENT_EXE_NAME),
+    wfpExe: join(dist, WFP_EXE_NAME),
+    setupExe: join(dist, 'CCGaitSetup.exe'),
+  }
+  try {
+    copyFileSync(clientExe, published.clientExe)
+    copyFileSync(wfpExe, published.wfpExe)
+    copyFileSync(setupExe, published.setupExe)
+    // 载荷文本留在 dist/build 下供 tests/verify-payload.mjs 核对。
+    copyFileSync(payloadPath, join(buildDir, 'payload.txt'))
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        `发布失败：${error instanceof Error ? error.message : String(error)}\n` +
+        '通常是有程序正在使用 dist 里的 exe（运行中的托盘/宿主）。先停掉再重试；dist 里的旧产物未被改动。',
+      log,
+    }
+  }
+  log.push(`安装程序：${published.setupExe}（${Math.round(statSync(published.setupExe).size / 1024)} KB）`)
 
   return {
     ok: true,
-    setupExe,
-    clientExe,
-    wfpExe,
+    setupExe: published.setupExe,
+    clientExe: published.clientExe,
+    wfpExe: published.wfpExe,
     distDir: dist,
-    sizeBytes: statSync(setupExe).size,
+    sizeBytes: statSync(published.setupExe).size,
     log,
   }
 }

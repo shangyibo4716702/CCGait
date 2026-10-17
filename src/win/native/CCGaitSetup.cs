@@ -242,6 +242,41 @@ namespace CcgaitSetup
         }
     }
 
+    /// <summary>
+    /// 停闸门：走 CLI 自己的停止语义，而不是直接杀进程。
+    ///
+    /// 为什么不能直接杀：闸门退出时会撤掉防火墙规则与 WFP 内核过滤器；直接杀进程
+    /// 会把这些阻断留在机器上，用户升级/卸载完发现"某个程序还是上不了网"。
+    /// </summary>
+    internal static class GuardControl
+    {
+        internal static void Stop(StringBuilder log)
+        {
+            string node = Program.ResolveNode();
+            if (node == null) return;
+            try
+            {
+                var info = new ProcessStartInfo(node)
+                {
+                    Arguments = "\"" + Path.Combine(Program.InstallDir, "src", "cli.js") + "\" guard-stop",
+                    WorkingDirectory = Program.InstallDir,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                };
+                using (Process process = Process.Start(info))
+                {
+                    if (process != null) process.WaitForExit(15000);
+                }
+                log.AppendLine("已请求闸门停止并清理阻断");
+            }
+            catch (Exception error)
+            {
+                log.AppendLine("停止闸门失败：" + error.Message);
+            }
+        }
+    }
+
     internal sealed class PayloadFile
     {
         internal string RelativePath;
@@ -254,14 +289,133 @@ namespace CcgaitSetup
         internal bool StartTray;
         /// <summary>开机自启（HKCU Run 项）。安装界面默认勾选。</summary>
         internal bool EnableAutoStart = true;
+        /// <summary>解包前是否先结束正在运行的 CCGait 进程（托盘 / WFP 宿主）。默认是。</summary>
+        internal bool StopRunning = true;
     }
 
     internal static class Installer
     {
+        /// <summary>
+        /// 找出正在从安装目录运行的本程序进程（托盘、WFP 阻断宿主）。
+        ///
+        /// 为什么必须处理：WFP 宿主 `CCGaitWfp.exe` 常驻期间会锁住自己的 exe，
+        /// 直接覆盖会抛 "The process cannot access the file ... because it is being
+        /// used by another process" —— 那是 .NET 的英文异常，用户看了完全不知道要做什么。
+        /// 实测就是这样：升级安装必然失败，除非先手动结束它。
+        /// </summary>
+        internal static List<Process> RunningInstances()
+        {
+            var found = new List<Process>();
+            string root = Program.InstallDir.TrimEnd('\\') + "\\";
+            foreach (Process process in Process.GetProcesses())
+            {
+                try
+                {
+                    string path = process.MainModule.FileName;
+                    if (path != null && path.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                    {
+                        found.Add(process);
+                    }
+                }
+                catch
+                {
+                    // 读不到路径（权限/位数不同）就跳过，不影响安装。
+                }
+            }
+            return found;
+        }
+
+        /// <summary>结束这些进程并等它们真的退出。返回被结束的数量。</summary>
+        internal static int StopRunningInstances(StringBuilder log)
+        {
+            List<Process> running = RunningInstances();
+            if (running.Count == 0)
+            {
+                log.AppendLine("没有正在运行的 CCGait 进程");
+                return 0;
+            }
+
+            // 先请闸门按自己的语义收尾（撤掉防火墙规则与 WFP 过滤器），再结束进程。
+            // 直接杀进程会把阻断留在机器上，用户会以为"卸载/升级后还上不了网"。
+            GuardControl.Stop(log);
+
+            int killed = 0;
+            foreach (Process process in running)
+            {
+                int pid = 0;
+                string name = "?";
+                try
+                {
+                    pid = process.Id;
+                    name = process.ProcessName;
+                    process.Kill();
+                    process.WaitForExit(5000);
+                    killed++;
+                    log.AppendLine("已结束进程：" + name + "（PID " + pid + "）");
+                }
+                catch (Exception error)
+                {
+                    // 进程已经自己退出了不算失败 —— 前面的 guard-stop 会让宿主正常收尾，
+                    // 等我们动手时它可能已经没了。报"失败"会让人以为没处理干净。
+                    if (process.HasExited)
+                    {
+                        killed++;
+                        log.AppendLine("进程已自行退出：" + name + "（PID " + pid + "）");
+                    }
+                    else
+                    {
+                        log.AppendLine("结束进程失败：" + pid + " —— " + error.Message);
+                    }
+                }
+                finally
+                {
+                    process.Dispose();
+                }
+            }
+            // 文件句柄释放有一点点延迟，给系统一点时间，否则紧接着的覆盖仍可能失败。
+            Thread.Sleep(600);
+            return killed;
+        }
+
+        /// <summary>写文件；被占用时重试几次，最后给出中文可操作的报错。</summary>
+        private static void WriteFileWithRetry(string destination, byte[] content)
+        {
+            // 注意：不能用 `catch (...) when (...)` 异常过滤器 —— 那是 C# 6 语法，
+            // 随 .NET Framework 附带的 csc 只支持到 C# 5。
+            const int attempts = 5;
+            Exception last = null;
+            for (int attempt = 1; attempt <= attempts; attempt++)
+            {
+                try
+                {
+                    File.WriteAllBytes(destination, content);
+                    return;
+                }
+                catch (Exception error)
+                {
+                    last = error;
+                    bool retryable = error is IOException || error is UnauthorizedAccessException;
+                    if (!retryable || attempt == attempts) break;
+                    Thread.Sleep(400);
+                }
+            }
+            throw new IOException(
+                "无法写入 " + destination + "：" + (last == null ? "未知原因" : last.Message) +
+                "\n常见原因：CCGait 或它的网络阻断宿主还在运行（托盘图标 / CCGaitWfp.exe）。" +
+                "\n请先退出托盘程序再重试；也可以在任务管理器里结束 CCGaitWfp.exe。",
+                last);
+        }
+
         /// <summary>执行安装；抛异常表示失败，调用方负责展示与退出码。</summary>
         internal static void Run(StringBuilder log, InstallOptions options)
         {
             log.AppendLine("安装目录：" + Program.InstallDir);
+
+            // 先结束占用安装目录的进程，否则解包必然失败。
+            if (options.StopRunning)
+            {
+                StopRunningInstances(log);
+            }
 
             List<PayloadFile> payload = Program.ReadPayload();
             log.AppendLine("载荷文件数：" + payload.Count);
@@ -271,7 +425,7 @@ namespace CcgaitSetup
             {
                 string destination = Path.Combine(Program.InstallDir, file.RelativePath.Replace('/', '\\'));
                 Directory.CreateDirectory(Path.GetDirectoryName(destination));
-                File.WriteAllBytes(destination, file.Content);
+                WriteFileWithRetry(destination, file.Content);
             }
             log.AppendLine("已解包 " + payload.Count + " 个文件");
 
@@ -488,30 +642,8 @@ namespace CcgaitSetup
                 }
             }
 
-            // 2) 用 CLI 自己的停止语义收尾闸门（会撤掉防火墙阻断）。
-            string node = Program.ResolveNode();
-            if (node == null) return;
-            try
-            {
-                // 用 CLI 自己的停止语义收尾（会撤掉防火墙阻断），再等它退出。
-                var info = new ProcessStartInfo(node)
-                {
-                    Arguments = "\"" + Path.Combine(Program.InstallDir, "src", "cli.js") + "\" guard-stop",
-                    WorkingDirectory = Program.InstallDir,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    WindowStyle = ProcessWindowStyle.Hidden,
-                };
-                using (Process process = Process.Start(info))
-                {
-                    if (process != null) process.WaitForExit(15000);
-                }
-                log.AppendLine("已请求闸门停止并清理防火墙规则");
-            }
-            catch (Exception error)
-            {
-                log.AppendLine("停止闸门失败：" + error.Message);
-            }
+            // 2) 用 CLI 自己的停止语义收尾闸门（会撤掉防火墙阻断与 WFP 过滤器）。
+            GuardControl.Stop(log);
         }
 
         private static void DeleteTreeExcept(string root, string[] keep)
@@ -660,7 +792,9 @@ namespace CcgaitSetup
                 ScrollBars = ScrollBars.Vertical,
                 BackColor = Color.FromArgb(250, 250, 250),
                 ForeColor = Color.FromArgb(74, 74, 74),
-                Font = new Font("Consolas", 8.5f),
+                // 日志框里有中文。Consolas 没有中文字形，WinForms 在这里不会自动回退，
+                // 结果中文全渲染成方块（实测：日志框一片 □，而用微软雅黑的标题正常）。
+                Font = new Font("Microsoft YaHei UI", 8.5f),
                 BorderStyle = BorderStyle.FixedSingle,
             };
 
@@ -684,12 +818,51 @@ namespace CcgaitSetup
             try
             {
                 Log("开始安装到 " + Program.InstallDir);
+
+                // 正在运行就先问一句。不问直接杀、或直接抛英文异常，都不合适：
+                // 前者会让用户莫名其妙发现"我的阻断没了"，后者他根本看不懂要做什么。
+                List<Process> running = Installer.RunningInstances();
+                if (running.Count > 0)
+                {
+                    var names = new List<string>();
+                    foreach (Process process in running)
+                    {
+                        try
+                        {
+                            names.Add(process.ProcessName + "（PID " + process.Id + "）");
+                        }
+                        catch
+                        {
+                            // 拿不到名字就只报数量。
+                        }
+                    }
+                    string detail = names.Count > 0 ? string.Join("、", names.ToArray()) : ("共 " + running.Count + " 个进程");
+                    DialogResult answer = MessageBox.Show(
+                        "CCGait 正在运行：\n\n" + detail +
+                        "\n\n安装需要覆盖这些正在使用的程序文件，必须先把它们结束。\n" +
+                        "结束后：托盘图标会消失，生效中的网络阻断会被撤掉（安装完成后会自动重新启动托盘）。\n\n" +
+                        "现在就结束并继续安装吗？",
+                        "CCGait 安装程序",
+                        MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Warning,
+                        MessageBoxDefaultButton.Button1);
+                    if (answer != DialogResult.Yes)
+                    {
+                        Log("已取消：CCGait 正在运行，安装需要先结束它。");
+                        _progress.Value = 0;
+                        _install.Enabled = true;
+                        return;
+                    }
+                    Log("正在结束正在运行的 CCGait 进程…");
+                }
+
                 _startTrayRequested = _startTray.Checked;
                 Installer.Run(log, new InstallOptions
                 {
                     CreateDesktopShortcut = _desktop.Checked,
                     EnableAutoStart = _autoStart.Checked,
                     StartTray = false, // 界面线程里不直接拉起托盘，安装完成后按需启动
+                    StopRunning = true,
                 });
                 _progress.Value = 85;
                 foreach (string line in log.ToString().Split('\n'))
@@ -793,7 +966,9 @@ namespace CcgaitSetup
                 ScrollBars = ScrollBars.Vertical,
                 BackColor = Color.FromArgb(250, 250, 250),
                 ForeColor = Color.FromArgb(74, 74, 74),
-                Font = new Font("Consolas", 8.5f),
+                // 日志框里有中文。Consolas 没有中文字形，WinForms 在这里不会自动回退，
+                // 结果中文全渲染成方块（实测：日志框一片 □，而用微软雅黑的标题正常）。
+                Font = new Font("Microsoft YaHei UI", 8.5f),
             };
             Controls.Add(_status);
         }
