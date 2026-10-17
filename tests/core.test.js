@@ -41,6 +41,8 @@ describe('config', () => {
     const config = normalizeConfig({})
     assert.deepEqual(config.whitelist.countries, [])
     assert.equal(config.enforcement.failClosed, true)
+    // 判定前先挂 WFP 过滤器：关掉"第一轮判定还没出结果"这段能连出去的窗口。
+    assert.equal(config.enforcement.blockFirst, true)
     assert.equal(config.checks.egressIp.severity, 'block')
     assert.equal(config.checks.timezone.severity, 'warn')
     // DNS 与系统代理属于"出口路径本身"，默认即阻断。

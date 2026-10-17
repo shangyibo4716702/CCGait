@@ -170,6 +170,18 @@ describe('ui server', () => {
     })
   })
 
+  it('serves a favicon so the app window has a taskbar icon', async () => {
+    // 应用窗口是 Edge/Chrome 的 APP 模式：任务栏那一格的图标取自页面图标。
+    // 没有它，任务栏按钮就是个空的默认图标（用户实测报过这一点）。
+    await withServer(async ({ base }) => {
+      const response = await fetch(`${base}/favicon.ico`)
+      assert.equal(response.status, 200)
+      assert.match(response.headers.get('content-type') ?? '', /icon/)
+      const bytes = Buffer.from(await response.arrayBuffer())
+      assert.deepEqual([...bytes.subarray(0, 6)], [0, 0, 1, 0, 6, 0], '应当是包含 6 个尺寸的 ICO')
+    })
+  })
+
   it('rejects api calls without the token', async () => {
     await withServer(async ({ base }) => {
       const response = await fetch(`${base}/api/status`)

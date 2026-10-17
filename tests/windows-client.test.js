@@ -144,6 +144,17 @@ describe('icon encoder', () => {
     assert.deepEqual([...ico.subarray(firstOffset + 1, firstOffset + 4)], [0x50, 0x4e, 0x47])
   })
 
+  it('records the real pixel size of every ICO entry', () => {
+    // 目录里写错尺寸会让外壳按错误的尺寸挑图，任务栏/通知区就会拿到被放大的糊图。
+    const ico = buildIco()
+    ;[16, 32, 48, 64, 128, 256].forEach((size, index) => {
+      const offset = 6 + 16 * index
+      const encoded = size >= 256 ? 0 : size
+      assert.equal(ico[offset], encoded, `${size}px 项的宽度字节`)
+      assert.equal(ico[offset + 1], encoded, `${size}px 项的高度字节`)
+    })
+  })
+
   it('draws an opaque rounded square with transparent corners', () => {
     const size = 32
     const rgba = renderIconRgba(size)

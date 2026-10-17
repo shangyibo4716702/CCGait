@@ -62,7 +62,11 @@ describe('installer payload', () => {
     const html = readFileSync(`${PROJECT_ROOT}/src/ui/public/index.html`, 'utf8')
     const referenced = [...html.matchAll(/(?:src|href)="(\/[^"#]+)"/g)].map((match) => match[1])
     assert.ok(referenced.length > 0, 'index.html 没有引用任何资源？')
+    // /favicon.ico 不在 public/ 里：它由服务端现场用 src/win/icon.js 生成，
+    // 因此不按"文件存在"判断（由 tests/ui.test.js 的接口用例保证它真的能取到）。
+    const generatedByServer = new Set(['/favicon.ico'])
     for (const ref of referenced) {
+      if (generatedByServer.has(ref)) continue
       const asset = `${PROJECT_ROOT}/src/ui/public${ref}`
       assert.ok(existsSync(asset), `index.html 引用的资源不存在：${ref}`)
     }

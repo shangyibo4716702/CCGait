@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { extname, join, normalize, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { buildIco } from '../win/icon.js'
 
 /**
  * 本地 Web 客户端服务。
@@ -69,6 +70,19 @@ async function readJsonBody(request, limitBytes = 512 * 1024) {
   }
 }
 
+/** 图标只生成一次（每次请求重新编码 6 张 PNG 没必要）。 */
+let cachedIco = null
+
+function sendFavicon(response) {
+  if (!cachedIco) cachedIco = buildIco()
+  response.writeHead(200, {
+    'content-type': 'image/x-icon',
+    'content-length': cachedIco.length,
+    'cache-control': 'no-store',
+  })
+  response.end(cachedIco)
+}
+
 function serveStatic(response, urlPath, token) {
   const relative = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '')
   const target = resolve(join(PUBLIC_DIR, normalize(relative)))
@@ -124,6 +138,12 @@ export function createUiServer({ session, logger, token = randomBytes(24).toStri
       if (!path.startsWith('/api/')) {
         if (request.method !== 'GET') {
           sendJson(response, 405, { error: '只支持 GET' })
+          return
+        }
+        // 应用窗口是 Edge/Chrome 的 APP 模式承载的：任务栏那一格的图标取自**页面图标**。
+        // 不提供 favicon 的话，任务栏按钮就落回一个空的默认图标（实测就是"没有图标"）。
+        if (path === '/favicon.ico') {
+          sendFavicon(response)
           return
         }
         serveStatic(response, path, token)

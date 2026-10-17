@@ -8,13 +8,37 @@ import { join } from 'node:path'
  * 为什么自己画：Windows 客户端的托盘、快捷方式、任务栏都需要一个图标文件，
  * 而项目坚持零依赖 —— 手写编码器约百行，换来"克隆下来就能跑、不装任何东西"。
  *
- * 图形：深色圆角方块 + 强调色盾牌轮廓 + 对勾（与环境闸门的语义一致）。
+ * 图形：深色圆角方块 + **实心**亮蓝盾牌 + 白色粗对勾。
+ * 实心而不是描边，是为了小尺寸：任务栏/通知区只有 16px，1~2px 的描边在那个尺寸上
+ * 会碎成一段段浅色，看着就是"糊的"；实心色块 + 一个粗对勾，缩到 16px 仍然是
+ * 一眼能认出的剪影。
  * 用 4 倍超采样再降采样做抗锯齿，避免锯齿边缘。
  */
 
-const ACCENT = [79, 140, 255]
-const BACKGROUND = [22, 25, 34]
-const CHECK = [54, 211, 153]
+/** 底色：上浅下深的冷灰，让图标在浅色任务栏上也有明确边界。 */
+const BACKGROUND_TOP = [32, 37, 51]
+const BACKGROUND_BOTTOM = [15, 18, 25]
+/** 盾牌：亮蓝到深蓝的竖向渐变（填充，不描边）。 */
+const SHIELD_TOP = [124, 178, 255]
+const SHIELD_BOTTOM = [43, 102, 236]
+/** 对勾：纯白，在蓝底上有最高对比度。 */
+const CHECK = [255, 255, 255]
+
+/** 盾牌几何（归一化坐标）：顶部平边 → 两侧直下 → 下半部收成圆角尖。 */
+const SHIELD_TOP_Y = 0.175
+const SHIELD_SHOULDER_Y = 0.545
+const SHIELD_BOTTOM_Y = 0.845
+const SHIELD_HALF_WIDTH = 0.275
+
+function insideShield(u, v) {
+  if (v < SHIELD_TOP_Y || v > SHIELD_BOTTOM_Y) return false
+  const dx = Math.abs(u - 0.5)
+  if (dx > SHIELD_HALF_WIDTH) return false
+  if (v <= SHIELD_SHOULDER_Y) return true
+  const t = (v - SHIELD_SHOULDER_Y) / (SHIELD_BOTTOM_Y - SHIELD_SHOULDER_Y)
+  // 指数 < 1 让收拢来得晚一点，底部收成圆角尖而不是三角。
+  return dx <= SHIELD_HALF_WIDTH * (1 - t) ** 0.72
+}
 
 function crc32(buffer) {
   let table = crc32.table
@@ -79,8 +103,12 @@ export function encodeIco(pngBuffers) {
   pngBuffers.forEach((png, index) => {
     const size = png.length
     const entry = 16 * index
-    directory[entry] = 0 // width 256 encoded as 0
-    directory[entry + 1] = 0 // height 256 encoded as 0
+    // IHDR 里的真实宽高。ICO 目录必须写对尺寸：假尺寸会让外壳按错误的尺寸挑图，
+    // 结果就是任务栏/通知区拿到被放大的糊图（256 记作 0，其余按实际像素写）。
+    const dimension = png.readUInt32BE(16)
+    const encoded = dimension >= 256 ? 0 : dimension
+    directory[entry] = encoded
+    directory[entry + 1] = encoded
     directory[entry + 2] = 0 // palette
     directory[entry + 3] = 0
     directory.writeUInt16LE(1, entry + 4) // color planes
@@ -108,52 +136,32 @@ function distanceToSegment(px, py, x1, y1, x2, y2) {
 
 /**
  * 在归一化坐标（0..1）上采样一个点：返回 [r,g,b,a]。
- * 形状用纯几何描述：圆角矩形（背景）、盾牌（描边）、对勾（描边）。
+ * 形状用纯几何描述：圆角矩形（底）、实心盾牌（填充）、粗对勾（描边）。
  */
 function sample(u, v) {
-  // 背景：圆角矩形，圆角半径 0.22
+  // 底：圆角正方形，圆角半径 0.22、内缩 0.02
   const radius = 0.22
   const inset = 0.02
-  const left = inset
-  const right = 1 - inset
-  const top = inset
-  const bottom = 1 - inset
-  const dx = Math.max(left + radius - u, 0, u - (right - radius))
-  const dy = Math.max(top + radius - v, 0, v - (bottom - radius))
-  const insideRounded = Math.hypot(dx, dy) <= radius
-  if (!insideRounded) return [0, 0, 0, 0]
+  const dx = Math.max(inset + radius - u, 0, u - (1 - inset - radius))
+  const dy = Math.max(inset + radius - v, 0, v - (1 - inset - radius))
+  if (Math.hypot(dx, dy) > radius) return [0, 0, 0, 0]
 
-  let color = BACKGROUND
-  let alpha = 255
-
-  // 盾牌轮廓：中心 (0.5,0.46)，宽 0.5，高 0.56，底端收成尖角
-  const sx = (u - 0.5) / 0.25
-  const sy = (v - 0.2) / 0.56
-  const strokeWidth = 0.032
-  const shieldOutline = (() => {
-    if (sy < 0 || sy > 1) return false
-    const halfWidth = sy < 0.62 ? 1 : 1 - (sy - 0.62) / 0.38
-    const edge = Math.abs(Math.abs(sx) - halfWidth) < strokeWidth / 0.25
-    const topEdge = sy < strokeWidth / 0.56 && Math.abs(sx) < 1
-    return edge || topEdge
-  })()
-
-  // 对勾：两段粗线
-  const checkStroke = 0.031
-  const check =
-    distanceToSegment(u, v, 0.4, 0.5, 0.472, 0.585) < checkStroke ||
-    distanceToSegment(u, v, 0.472, 0.585, 0.615, 0.4) < checkStroke
-
-  if (check) color = CHECK
-  else if (shieldOutline) color = ACCENT
-
-  // 背景做轻微上深下浅，避免纯色发闷
-  if (color === BACKGROUND) {
-    const shade = mix(0.86, 1.12, v)
-    color = BACKGROUND.map((channel) => Math.min(255, Math.round(channel * shade)))
+  if (insideShield(u, v)) {
+    const t = (v - SHIELD_TOP_Y) / (SHIELD_BOTTOM_Y - SHIELD_TOP_Y)
+    let color = SHIELD_TOP.map((channel, index) => Math.round(mix(channel, SHIELD_BOTTOM[index], t)))
+    // 对勾：两段粗线（圆头端点），宽度 0.05 —— 比原来细描边粗一倍，缩到 16px 也不会断。
+    const stroke = 0.05
+    const check =
+      distanceToSegment(u, v, 0.383, 0.494, 0.466, 0.583) < stroke ||
+      distanceToSegment(u, v, 0.466, 0.583, 0.638, 0.4) < stroke
+    if (check) color = CHECK
+    return [...color, 255]
   }
 
-  return [...color, alpha]
+  return [
+    ...BACKGROUND_TOP.map((channel, index) => Math.round(mix(channel, BACKGROUND_BOTTOM[index], v))),
+    255,
+  ]
 }
 
 /** 生成指定尺寸的图标 RGBA（4 倍超采样抗锯齿）。 */

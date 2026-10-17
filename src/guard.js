@@ -383,8 +383,38 @@ export function createGuard({ config, stateDir, logger, onState, onStopRequest }
     onState?.(state)
   }
 
+  /**
+   * block-first：判定还没出来之前，先把网络阻断挂上。
+   *
+   * 为什么需要：闸门是"跑完判定再拦"，那第一轮判定（网络探测要跑一两秒）出结果之前是
+   * 没有任何拦截的 —— 客户端恰好在这几秒里启动，它的请求会直接出去。先挂过滤器，
+   * 判定通过时紧跟其后的 enforce() 会立刻把它撤掉。
+   *
+   * 只挂 WFP 这一层：它在内核里、起停约一秒；防火墙规则那层要写 N 条系统规则（实测 11 条
+   * 要十几秒），放在每轮判定前做会把一次复检拖成十几秒，而且规则本来就会一直留到判定通过。
+   */
+  const preBlock = async () => {
+    const targets = claudeExecutablePaths({
+      localAppData: process.env.LOCALAPPDATA,
+      appData: process.env.APPDATA,
+      home: process.env.USERPROFILE,
+    })
+    if (targets.length === 0) return undefined
+    if (!resolveWfpHelper()) return undefined
+    return startWfpBlock({ paths: targets, stateDir, timeoutMs: 20_000 })
+  }
+
   const checkAndEnforce = async (reason) => {
     const started = Date.now()
+    if (config.enforcement.blockFirst && config.enforcement.blockNetwork) {
+      try {
+        const pre = await preBlock()
+        if (pre && !pre.ok) logger?.warn('先行阻断未建立', pre.error)
+      } catch (error) {
+        // 先行阻断失败不能拖住判定：判定本身还是照跑，该拦的由 enforce() 兜住。
+        logger?.warn('先行阻断失败', error instanceof Error ? error.message : String(error))
+      }
+    }
     const result = await runChecks(config)
     lastFullCheckAt = started
     const enforcement = await enforce(config, result.verdict, { logger, stateDir })

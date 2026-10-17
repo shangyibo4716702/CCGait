@@ -54,6 +54,10 @@ export const DEFAULT_CONFIG = {
     killProcesses: true,
     // 是否阻断其网络。真正的断网由 WFP 完成（不依赖系统防火墙开关）。
     blockNetwork: true,
+    // 判定之前先把 WFP 过滤器挂上，判定通过再撤（block-first）。
+    // 为的是关掉"闸门刚起来、第一轮判定还没出结果"这个窗口 —— 那几秒里客户端启动
+    // 是能连出去的。代价是判定期间客户端也被拦（正常环境下也就几秒）。
+    blockFirst: true,
     // 第二层：Windows 防火墙按程序阻断。默认打开 = "阻断网络全开"。
     firewallRules: true,
     // 防火墙规则只在 profile 启用时才生效；默认允许闸门自己打开三个 profile，
@@ -141,6 +145,8 @@ export function normalizeConfig(input = {}) {
     enforcement: {
       killProcesses: asBoolean(enforcement.killProcesses, true),
       blockNetwork: asBoolean(enforcement.blockNetwork, true),
+      // 判定前先行挂 WFP 过滤器（关掉"第一轮判定还没出结果"这段空窗）。
+      blockFirst: asBoolean(enforcement.blockFirst, true),
       // 第二层：Windows 防火墙按程序阻断。默认打开（"阻断网络全开"）。
       firewallRules: asBoolean(enforcement.firewallRules, true),
       // 防火墙规则只在 profile 启用时才生效；默认允许闸门自己把三个 profile 打开，
