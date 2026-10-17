@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 
@@ -157,13 +157,43 @@ export function probeFonts() {
   }
 }
 
+/**
+ * Emoji 国旗渲染检测（对齐 ippure 的「Emoji 国旗渲染差异」）。
+ *
+ * 那边是在浏览器里用 Canvas 逐像素探测国旗是否被渲染成单色，我们在 Node 里做不到同款，
+ * 于是退一步看**系统字体资产**：正常系统带完整彩色 emoji 字体（Segoe UI Emoji，约 12 MB），
+ * 而屏蔽国旗的系统会换成被裁剪的版本（体积小一个数量级）或干脆没有。这是近似判定，
+ * 所以默认只提示（severity=warn），不当作硬门槛。
+ */
+export function probeEmojiFont() {
+  if (process.platform !== 'win32') return { checked: false }
+  const path = 'C:\\Windows\\Fonts\\seguiemj.ttf'
+  if (!existsSync(path)) {
+    return { checked: true, present: false, suspect: true, reason: '系统没有 Segoe UI Emoji（国旗 emoji 无法彩色渲染）' }
+  }
+  let sizeBytes = 0
+  try {
+    sizeBytes = statSync(path).size
+  } catch {
+    return { checked: false }
+  }
+  // 完整的彩色 emoji 字体在 10 MB 量级；被裁剪成单色/去国旗的版本只有 1 MB 上下。
+  const suspect = sizeBytes < 4 * 1024 * 1024
+  return {
+    checked: true,
+    present: true,
+    sizeBytes,
+    suspect,
+    reason: suspect ? `Segoe UI Emoji 体积异常小（${Math.round(sizeBytes / 1024)} KB），可能是被裁剪/单色版本` : undefined,
+  }
+}
+
 /** 系统配置的 DNS 服务器（落地在国内 = 解析可能被本地化）。 */
 export async function probeDnsServers() {
   if (process.platform !== 'win32') return { servers: [], domestic: [] }
   try {
     const stdout = await runPowerShell(
-      "Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.ServerAddresses } | ForEach-Object { $_.ServerAddresses } | Sort-Object -Unique",
-    )
+      "Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.ServerAddresses } | ForEach-Object { $_.ServerAddresses } | Sort-Object -Unique",    )
     const servers = stdout
       .split(/\r?\n/)
       .map((line) => line.trim())

@@ -43,6 +43,7 @@ import { createUiServer } from './ui/server.js'
 import { DEFAULT_UI_PORT, openDesktopClient } from './win/desktop.js'
 import { writeIconFiles } from './win/icon.js'
 import { installShortcuts, uninstallShortcuts } from './win/shortcuts.js'
+import { isWfpBlocking, purgeWfpFilters, resolveWfpHelper, startWfpBlock, stopWfpBlock } from './win/wfp.js'
 import { buildInstaller } from './win/build.js'
 
 /**
@@ -76,6 +77,7 @@ function printUsage() {
   Windows 客户端：
   ccgait desktop [--port N]     应用窗口（无地址栏；关窗口不影响闸门）
   ccgait tray                   托盘客户端（状态图标 + 右键菜单）
+  ccgait wfp on|off|status      WFP 断网（不依赖系统防火墙）
   ccgait build-installer        编译 Windows 客户端与安装包（输出到 dist/）
   ccgait install-shortcut [--desktop]
                                  安装开始菜单（可选桌面）快捷方式
@@ -621,6 +623,66 @@ async function commandBuildInstaller() {
   return 0
 }
 
+/** WFP 断网的手动控制：不依赖 Windows 防火墙。 */
+async function commandWfp(argv) {
+  const action = argv[0] ?? "status"
+  const { config } = await loadOrExit()
+  const stateDir = resolveStateDir(config)
+  const helper = resolveWfpHelper()
+
+  if (action === "status") {
+    const blocking = isWfpBlocking(stateDir)
+    console.log(`WFP 助手：${helper ?? "未找到（先执行 ccgait build-installer）"}`)
+    console.log(`当前阻断：${blocking ? "生效中" : "未生效"}`)
+    console.log("说明：阻断只在这个宿主进程存活期间有效，进程退出即恢复网络（不会残留）。")
+    return 0
+  }
+
+  if (action === "off") {
+    const stopped = await stopWfpBlock({ stateDir })
+    if (stopped.stopped) console.log(`已解除 WFP 阻断（PID ${stopped.pid}）`)
+    else console.log("没有正在生效的 WFP 阻断")
+    return 0
+  }
+
+  if (action === "on") {
+    const discovery = claudeDiscovery({})
+    const targets = discovery.entries.map((item) => item.path)
+    if (targets.length === 0) {
+      console.error("没有发现 Claude 客户端，无法建立阻断")
+      return 1
+    }
+    console.log(`将为 ${targets.length} 个程序建立 WFP 阻断…`)
+    const started = await startWfpBlock({ paths: targets, stateDir, detached: true })
+    if (!started.ok) {
+      console.error(`建立失败：${started.error}`)
+      return 1
+    }
+    if (started.alreadyRunning) {
+      // 复用已有宿主时拿不到这一轮的过滤器条数，别打印成 "null 条"。
+      console.log(`阻断已在生效中（宿主 PID ${started.pid}），无需重复建立。`)
+      return 0
+    }
+    console.log(`已阻断：${started.filters} 条过滤器生效（宿主 PID ${started.pid}）`)
+    console.log("用 ccgait wfp off 解除；宿主进程退出也会自动恢复。")
+    return 0
+  }
+
+  if (action === "purge") {
+    const purged = await purgeWfpFilters()
+    if (!purged.ok) {
+      console.error(`清理失败：${purged.error}`)
+      return 1
+    }
+    console.log(`已清掉 ${purged.removed} 条遗留过滤器。`)
+    console.log("用途：早期版本被硬杀后可能把过滤器永久留在内核里，导致某个程序莫名其妙上不了网。")
+    return 0
+  }
+
+  console.error("用法：ccgait wfp on|off|status|purge")
+  return 1
+}
+
 async function main() {
   const [command, ...argv] = process.argv.slice(2)
   switch (command) {
@@ -646,6 +708,8 @@ async function main() {
       return commandUi(argv)
     case 'desktop':
       return commandDesktop(argv)
+    case 'wfp':
+      return commandWfp(argv)
     case 'build-installer':
       return commandBuildInstaller()
     case 'tray':

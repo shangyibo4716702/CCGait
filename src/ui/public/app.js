@@ -13,7 +13,8 @@ const CHECK_LABELS = {
   claudeDns: { name: 'Claude 域名解析落地', scope: '解析被污染时命中' },
   timezone: { name: '系统时区', scope: '如 Asia/Shanghai' },
   language: { name: '界面语言', scope: '列表含 zh-CN' },
-  fonts: { name: '中文字体指纹', scope: '等线 / 鸿蒙 / MiSans' },
+  fonts: { name: '中文字体指纹', scope: '等线 / 鸿蒙 / 阿里普惠体' },
+  emojiFlags: { name: 'Emoji 国旗渲染', scope: '系统 emoji 字体被裁剪' },
   dnsServers: { name: 'DNS 服务器位置', scope: '国内公共 DNS' },
   proxyEnvLeak: { name: '系统代理 / 分流覆盖', scope: 'CLI 是否直连' },
 }
@@ -122,6 +123,61 @@ function kvRow(term, value, extra) {
   return { dt, dd }
 }
 
+/**
+ * 每行的状态标签。
+ *
+ * 结论直接取自判定结果里的 reason id（check.blocked / check.warnings），
+ * 不在界面里另写一套判断 —— 否则"界面显示通过、闸门却在拦"这种事迟早会发生。
+ */
+function statusTag(ids, { disabled = false } = {}) {
+  const check = status.lastCheck ?? {}
+  const blockedHit = list(check.blocked).find((item) => ids.includes(item.id))
+  const warnHit = list(check.warnings).find((item) => ids.includes(item.id))
+  if (blockedHit) return { node: el('span', 'tag danger', '未通过'), reason: blockedHit }
+  if (warnHit) return { node: el('span', 'tag warn', '提示'), reason: warnHit }
+  if (disabled) return { node: el('span', 'tag', '未启用'), reason: undefined }
+  return { node: el('span', 'tag ok', '通过'), reason: undefined }
+}
+
+/** 带状态标签的一行：标签统一贴在值后面，鼠标悬停可看判定原文。 */
+function statusRow(term, value, ids, options) {
+  const row = kvRow(term, value)
+  const { node, reason } = statusTag(ids, options)
+  if (reason) {
+    row.dd.append(el('span', 'tag-detail', reason.title))
+  }
+  row.dd.append(node)
+  return row
+}
+
+/** 该检查项在配置里是否启用；关了就不该显示"通过"，那会让人以为它在把关。 */
+function checksEnabled(key) {
+  const checks = status.config?.checks
+  if (!checks || !checks[key]) return true
+  return checks[key].enabled !== false
+}
+
+/** IPv4 是否落在 CIDR 内。界面要显示白名单逐项命中情况，就得自己算，不能猜。 */
+function ipv4InCidr(ip, cidr) {
+  const [range, bitsText] = String(cidr).split('/')
+  const bits = Number(bitsText)
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(ip) || !/^\d+\.\d+\.\d+\.\d+$/.test(range) || !Number.isInteger(bits)) return false
+  const toInt = (text) => text.split('.').reduce((acc, part) => (acc << 8) + Number(part), 0) >>> 0
+  if (bits === 0) return true
+  const mask = (0xffffffff << (32 - bits)) >>> 0
+  return (toInt(ip) & mask) === (toInt(range) & mask)
+}
+
+/** ASN 命中判定，与服务端 evaluateEgress 的宽松匹配保持一致。 */
+function asnMatches(egressAsn, allowed) {
+  const asn = String(egressAsn ?? '').toUpperCase()
+  if (!asn) return false
+  return allowed.some((item) => {
+    const bare = String(item).replace(/^AS/, '')
+    return asn === String(item) || asn.endsWith(`AS${bare}`) || asn.includes(bare)
+  })
+}
+
 /** ------------------------------------------------------------------ 渲染 */
 
 function render() {
@@ -183,8 +239,28 @@ function renderEnvironment() {
   const egress = check.egress ?? {}
   const dns = check.dns
   const env = check.environment ?? {}
+  const wl = check.whitelist ?? {}
   const dl = el('dl', 'kv')
 
+  // 总体结论放在最上面：一眼看到"通过 / 未通过"，再往下看是哪一项。
+  const verdictBanner = el('div', 'verdict ' + (check.allow ? 'ok' : 'danger'))
+  verdictBanner.append(el('strong', undefined, check.allow ? '判定通过：放行' : '判定未通过：拦截'))
+  const blockCount = list(check.blocked).length
+  const warnCount = list(check.warnings).length
+  verdictBanner.append(
+    el(
+      'span',
+      undefined,
+      check.allow
+        ? warnCount > 0
+          ? `　白名单命中；另有 ${warnCount} 项提示（不影响放行）`
+          : '　白名单命中，各项特征均在阈值内'
+        : `　${blockCount} 项不通过${warnCount > 0 ? `，另有 ${warnCount} 项提示` : ''}`,
+    ),
+  )
+  body.append(verdictBanner)
+
+  // 出口：把"为什么通过/不通过"逐项摊开，而不是只给一个 GB 让人猜。
   const ipText = egress.ip ?? '未知'
   const parts = [ipText, egress.country ? `${egress.country}${egress.countryName ? `（${egress.countryName}）` : ''}` : undefined]
     .filter(Boolean)
@@ -192,19 +268,120 @@ function renderEnvironment() {
   const ipNode = el('span', 'mono', parts)
   if (egress.hosting) ipNode.append(el('span', 'tag warn', '机房/代理'))
   if (egress.mobile) ipNode.append(el('span', 'tag', '移动网络'))
-  const { dt, dd } = kvRow('出口', ipNode)
-  dl.append(dt, dd)
+  const egressRow = statusRow('出口', ipNode, [
+    'egress-unknown',
+    'egress-inconsistent',
+    'egress-country',
+    'egress-ip',
+    'egress-cidr',
+    'egress-asn',
+    'egress-hosting',
+    'egress-hosting-note',
+    'egress-proxy-fallback',
+  ])
+  dl.append(egressRow.dt, egressRow.dd)
+
+  // 代理连不上时回退直连：必须说清楚"这次判的是直连出口"，
+  // 否则用户会以为代理在生效、看到的却是物理线路的出口。
+  if (egress.proxyFallback) {
+    const note = el('div', 'notice warn')
+    note.append(el('strong', undefined, `代理 ${egress.proxyUrl ?? ''} 连不上，本次按直连出口判定`))
+    note.append(
+      el(
+        'span',
+        undefined,
+        `　出口读数为 ${egress.ip ?? '未知'}。要按代理出口判定，请先启动代理；若希望代理不可用就直接拦截，把 network.proxy.required 设为 true。`,
+      ),
+    )
+    body.append(note)
+  }
+
+  // 出口查不到时，最常见的原因是"配了代理但代理没在跑"。这种情况必须点名，
+  // 否则用户只看到"未通过"，会以为是策略判错了（对比网站明明显示正常）。
+  if (egress.ip === undefined) {
+    const failed = list(egress.failedSources).join('；')
+    const proxyDown = /ECONNREFUSED|ETIMEDOUT|ECONNRESET|socket hang up/i.test(failed)
+    const proxyUrl = status.config?.network?.proxy?.url
+    const proxyOn = status.config?.network?.proxy?.enabled === true
+    const hint = el('div', 'notice danger')
+    hint.append(
+      el(
+        'strong',
+        undefined,
+        proxyOn && proxyDown && proxyUrl
+          ? `出口检测失败：配置的代理 ${proxyUrl} 连不上`
+          : '出口检测失败：所有数据源都查询不到',
+      ),
+    )
+    hint.append(
+      el(
+        'span',
+        undefined,
+        proxyOn && proxyDown
+          ? '　代理进程没在运行（或端口不对），而检测被配置成走这个代理，所以拿不到出口 IP；按 failClosed 规则直接判拦截。请启动代理，或把「系统代理」相关配置改为直连后再检测。'
+          : `　${failed || '原因未知'}。按 failClosed 规则直接判拦截。`,
+      ),
+    )
+    body.append(hint)
+  }
+
+  // 白名单逐项比对：命中打 ✓、未命中打 ✗、没配的写"未限制"。
+  const wlItems = []
+  if (list(wl.countries).length > 0) {
+    const hit = egress.country ? wl.countries.includes(egress.country) : false
+    wlItems.push({ label: `国家 ${list(wl.countries).join('/')}`, hit, value: egress.country ?? '未知' })
+  }
+  if (list(wl.ips).length > 0) {
+    wlItems.push({ label: `固定 IP ${list(wl.ips).length} 个`, hit: list(wl.ips).includes(egress.ip), value: egress.ip ?? '未知' })
+  }
+  if (list(wl.cidrs).length > 0) {
+    wlItems.push({
+      label: `网段 ${list(wl.cidrs).join('/')}`,
+      hit: list(wl.cidrs).some((cidr) => ipv4InCidr(egress.ip ?? '', cidr)),
+      value: egress.ip ?? '未知',
+    })
+  }
+  if (list(wl.asns).length > 0) {
+    wlItems.push({
+      label: `ASN ${list(wl.asns).join('/')}`,
+      hit: asnMatches(egress.asn, list(wl.asns)),
+      value: egress.asn ?? '未知',
+    })
+  }
+  if (wl.requireResidential === true) {
+    wlItems.push({
+      label: '要求住宅出口',
+      hit: !egress.hosting,
+      value: egress.hosting ? '机房/代理' : egress.mobile ? '移动网络' : '非机房',
+    })
+  }
+  if (wlItems.length > 0) {
+    const wlNode = el('span')
+    wlItems.forEach((item, index) => {
+      if (index > 0) wlNode.append(document.createTextNode('　'))
+      const span = el('span', 'wl-item ' + (item.hit ? 'hit' : 'miss'), `${item.hit ? '✓' : '✗'} ${item.label}`)
+      span.append(el('span', 'wl-value', `（当前 ${item.value}）`))
+      wlNode.append(span)
+    })
+    const wlRow = kvRow('白名单比对', wlNode)
+    const anyMiss = wlItems.some((item) => !item.hit)
+    wlRow.dd.append(el('span', `tag ${anyMiss ? 'danger' : 'ok'}`, anyMiss ? '有不命中项' : '全部命中'))
+    dl.append(wlRow.dt, wlRow.dd)
+  }
 
   const consistent = egress.confident
     ? '一致（可信）'
     : `不一致 → IP ${JSON.stringify(egress.ipVotes ?? {})} / 国家 ${JSON.stringify(egress.countryVotes ?? {})}`
-  const row = kvRow('多源一致性', consistent)
-  if (!egress.confident) row.dd.append(el('span', 'tag danger', '按拦截处理'))
-  dl.append(row.dt, row.dd)
+  const consistentRow = statusRow('多源一致性', consistent, ['egress-inconsistent', 'egress-unknown'])
+  if (!egress.confident) consistentRow.dd.append(el('span', 'tag danger', '按拦截处理'))
+  if (check.failedClosed && !list(check.blocked).some((item) => item.id.startsWith('egress'))) {
+    consistentRow.dd.append(el('span', 'tag danger', 'failClosed 拦截'))
+  }
+  dl.append(consistentRow.dt, consistentRow.dd)
 
   if (egress.asnText) {
-    const row2 = kvRow('ASN / 机构', egress.asnText)
-    dl.append(row2.dt, row2.dd)
+    const asnRow = statusRow('ASN / 机构', egress.asnText, ['egress-asn'])
+    dl.append(asnRow.dt, asnRow.dd)
   }
 
   if (dns) {
@@ -213,50 +390,84 @@ function renderEnvironment() {
       const suffix = item.country ? `(${item.country})` : ''
       return `${item.host} → ${address ?? item.error ?? '无结果'}${suffix}`
     })
-    const row3 = kvRow('Claude 域名', groups.join('  ·  ') || '—')
-    if (list(dns.deniedHits).length > 0) row3.dd.append(el('span', 'tag danger', '解析到被禁地区'))
-    dl.append(row3.dt, row3.dd)
+    const dnsRow = statusRow('Claude 域名', groups.join('  ·  ') || '—', [
+      'claude-dns-denied',
+      'claude-dns-unresolved',
+      'claude-dns-partial',
+    ], { disabled: !checksEnabled('claudeDns') })
+    if (list(dns.deniedHits).length > 0) dnsRow.dd.append(el('span', 'tag danger', '解析到被禁地区'))
+    dl.append(dnsRow.dt, dnsRow.dd)
   }
 
   if (env.timezone) {
-    const row4 = kvRow('系统时区', `${env.timezone.intl}${env.timezone.windows ? ` / ${env.timezone.windows}` : ''}`)
-    if (env.timezone.domestic) row4.dd.append(el('span', 'tag warn', '国内时区'))
-    dl.append(row4.dt, row4.dd)
+    const tzRow = statusRow(
+      '系统时区',
+      `${env.timezone.intl}${env.timezone.windows ? ` / ${env.timezone.windows}` : ''}`,
+      ['timezone-domestic'],
+      { disabled: !checksEnabled('timezone') },
+    )
+    if (env.timezone.domestic) tzRow.dd.append(el('span', 'tag warn', '国内时区'))
+    dl.append(tzRow.dt, tzRow.dd)
   }
 
   if (env.language) {
-    const row5 = kvRow('界面语言', list(env.language.uiLanguages).join('、') || '未知')
-    if (env.language.chinese) row5.dd.append(el('span', 'tag warn', '含中文'))
-    dl.append(row5.dt, row5.dd)
+    const langRow = statusRow('界面语言', list(env.language.uiLanguages).join('、') || '未知', ['language-chinese'], {
+      disabled: !checksEnabled('language'),
+    })
+    if (env.language.chinese) langRow.dd.append(el('span', 'tag warn', '含中文'))
+    dl.append(langRow.dt, langRow.dd)
   }
 
   if (env.fonts) {
     // 同一字体的多个字重会反复命中同一标签，去重后再展示（文件数用 tag 体现）。
     const strong = list(env.fonts.found).filter((item) => item.strong)
     const labels = [...new Set(strong.map((item) => item.label))]
-    const row6 = kvRow('国内字体', labels.length > 0 ? labels.join('、') : '未命中专有字体')
-    if (labels.length > 0) {
-      row6.dd.append(el('span', 'tag warn', `命中 ${strong.length} 个字体文件`))
-    }
-    dl.append(row6.dt, row6.dd)
+    const fontRow = statusRow(
+      '国内字体',
+      labels.length > 0 ? labels.join('、') : '未命中专有字体',
+      ['fonts-domestic', 'fonts-weak'],
+      { disabled: !checksEnabled('fonts') },
+    )
+    if (labels.length > 0) fontRow.dd.append(el('span', 'tag warn', `命中 ${strong.length} 个字体文件`))
+    dl.append(fontRow.dt, fontRow.dd)
+  }
+
+  if (env.emojiFont?.checked) {
+    const emojiRow = statusRow(
+      'Emoji 国旗渲染',
+      env.emojiFont.present
+        ? `Segoe UI Emoji ${Math.round((env.emojiFont.sizeBytes ?? 0) / 1024 / 1024)} MB`
+        : '未检测到 Segoe UI Emoji',
+      ['emoji-flags-suspect'],
+      { disabled: !checksEnabled('emojiFlags') },
+    )
+    if (env.emojiFont.suspect) emojiRow.dd.append(el('span', 'tag warn', '可能被裁剪'))
+    dl.append(emojiRow.dt, emojiRow.dd)
   }
 
   if (env.dnsServers) {
-    const row7 = kvRow('DNS 服务器', list(env.dnsServers.servers).join('、') || '未读取')
+    const dnsServerRow = statusRow(
+      '本机 DNS 服务器',
+      list(env.dnsServers.servers).join('、') || '未读取',
+      ['dns-servers-domestic'],
+      { disabled: !checksEnabled('dnsServers') },
+    )
     if (list(env.dnsServers.domestic).length > 0) {
-      row7.dd.append(el('span', 'tag warn', `国内 ${list(env.dnsServers.domestic).join('、')}`))
+      dnsServerRow.dd.append(el('span', 'tag warn', `国内 ${list(env.dnsServers.domestic).join('、')}`))
     }
-    dl.append(row7.dt, row7.dd)
+    dl.append(dnsServerRow.dt, dnsServerRow.dd)
   }
 
   if (env.systemProxy) {
     const enabled = env.systemProxy.system?.enabled
     const envKeys = Object.keys(env.systemProxy.envVars ?? {})
-    const row8 = kvRow(
+    const proxyRow = statusRow(
       '系统代理',
       enabled ? `开启（${env.systemProxy.system.server ?? '—'}）` : envKeys.length > 0 ? `未开启，但有 ${envKeys.join('、')}` : '未检测到',
+      ['proxy-leak'],
+      { disabled: !checksEnabled('proxyEnvLeak') },
     )
-    dl.append(row8.dt, row8.dd)
+    dl.append(proxyRow.dt, proxyRow.dd)
   }
 
   body.append(dl)
@@ -349,20 +560,78 @@ function updateActionButtons() {
   if (!status) return
   const host = document.querySelector('#action-buttons')
   const firewallOff = !status.firewallProfile?.anyEnabled
+  const net = status.networkBlock ?? {}
+  const running = Boolean(status.guard.running)
   for (const spec of ACTION_SPECS) {
     const button = host.querySelector(`button[data-action="${spec.id}"]`)
     if (!button) continue
     const busy = pending.has(spec.id)
-    const running = Boolean(status.guard.running)
-    const label = spec.id === 'guard' ? (running ? '停止闸门' : '启动闸门') : spec.label
-    button.querySelector('[data-role="label"]').textContent = busy ? '处理中…' : label
+    const labelNode = button.querySelector('[data-role="label"]')
+
+    // 按钮要能回答"现在是什么状态"，而不只是"点了会发生什么"：
+    // 已经在生效的动作改成"已…"并置为激活态，同时禁用（再点没有意义）。
+    let label = spec.label
+    let active = false
+    let disabled = busy
+
+    if (spec.id === 'guard') {
+      label = running ? '停止闸门' : '启动闸门'
+      active = running
+      button.classList.toggle('ok', !running)
+      button.classList.toggle('danger', running)
+    } else if (spec.id === 'block') {
+      if (net.blocked) {
+        label = `已阻断网络（${net.programs ?? 0} 个程序）`
+        active = true
+        disabled = true
+      }
+    } else if (spec.id === 'unblock') {
+      // 没有阻断时这个按钮点了也不会有任何变化，直接禁用并说明。
+      disabled = busy || !net.blocked
+      active = false
+    } else if (spec.id === 'profiles') {
+      label = '启用系统防火墙'
+      active = false
+    }
+
+    labelNode.textContent = busy ? '处理中…' : label
     button.querySelector('[data-role="spinner"]').style.display = busy ? '' : 'none'
-    button.classList.toggle('ok', spec.id === 'guard' && !running)
-    button.classList.toggle('danger', spec.id === 'guard' && running)
-    button.disabled = busy
+    button.classList.toggle('active', active)
+    button.disabled = disabled
+    button.title = spec.id === 'unblock' && !net.blocked ? '当前没有生效中的阻断' : ''
     // 「启用系统防火墙」只在防火墙关闭时出现。
     if (spec.needsFirewallOff) button.style.display = firewallOff ? '' : 'none'
   }
+}
+
+/**
+ * 操作面板顶部的状态条：把"闸门在不在跑、网络断没断、防火墙开没开"写成一眼能读的三格。
+ * 之前这些只体现在按钮文案上（启动闸门 / 停止闸门），很容易看不出当前状态。
+ */
+function renderStateStrip() {
+  const host = document.querySelector('#action-state')
+  if (!host) return
+  host.replaceChildren()
+  if (!status) return
+  const net = status.networkBlock ?? {}
+  const firewallOn = Boolean(status.firewallProfile?.anyEnabled)
+
+  const cell = (name, value, tone) => {
+    const box = el('div', 'state-cell')
+    box.append(el('span', 'state-name', name))
+    box.append(el('span', `state-value ${tone}`, value))
+    return box
+  }
+
+  const layers = []
+  if (net.wfp) layers.push('WFP 内核过滤器')
+  if (net.firewallRules > 0) layers.push(`防火墙规则 ${net.firewallRules} 条`)
+
+  host.append(
+    cell('闸门', status.guard.running ? '运行中' : '未运行', status.guard.running ? 'on' : 'off'),
+    cell('网络阻断', net.blocked ? `生效中（${layers.join(' + ')}）` : '未生效', net.blocked ? 'on' : 'off'),
+    cell('系统防火墙', firewallOn ? '已开' : '已关', firewallOn ? 'on' : 'warn'),
+  )
 }
 
 function renderActions() {
@@ -370,6 +639,7 @@ function renderActions() {
   const sub = document.querySelector('#actions-sub')
   const notices = document.querySelector('#action-notices')
   notices.replaceChildren()
+  renderStateStrip()
 
   const running = status.guard.running
   sub.textContent =

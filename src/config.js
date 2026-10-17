@@ -11,12 +11,24 @@ export const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..
 export const CONFIG_PATH = process.env.CCGAIT_CONFIG?.trim() || join(PROJECT_ROOT, 'config.json')
 
 /** 检查项的默认严重度：block = 不通过即拦；warn = 只报告。 */
+/**
+ * 默认严重度。
+ *
+ * 硬门槛（block）只有两类，任一不满足就打不开客户端、也上不了网：
+ *   1. 出口白名单：IP / CIDR / 国家 / ASN / 要求住宅出口，以及多源一致性与 failClosed；
+ *   2. Claude 域名解析是否落到被禁地区。
+ *
+ * 中文用户环境相关各项（时区 / 语言 / 字体 / Emoji 国旗渲染 / 本机 DNS / 系统代理）
+ * **只提示、不门控**：它们衡量的是"这台机器的特征"，而改时区、删系统字体属于改系统设置，
+ * 不该由闸门替用户决定能不能用。需要更严时，在界面「检查项严重度」里把某一项改成「阻断」。
+ */
 export const DEFAULT_SEVERITY = {
   egressIp: 'block',
   claudeDns: 'block',
   timezone: 'warn',
   language: 'warn',
   fonts: 'warn',
+  emojiFlags: 'warn',
   dnsServers: 'warn',
   proxyEnvLeak: 'warn',
 }
@@ -37,7 +49,13 @@ export const DEFAULT_CONFIG = {
   ),
   enforcement: {
     killProcesses: true,
+    // 是否阻断其网络。真正的断网由 WFP 完成（不依赖系统防火墙开关）。
     blockNetwork: true,
+    // 第二层：Windows 防火墙按程序阻断。默认打开 = "阻断网络全开"。
+    firewallRules: true,
+    // 防火墙规则只在 profile 启用时才生效；默认允许闸门自己打开三个 profile，
+    // 否则这一层静默失效。不想让闸门碰系统防火墙开关就设为 false。
+    enableFirewallProfiles: true,
     failClosed: true,
     pollIntervalMs: 2000,
     recheckIntervalMs: 30000,
@@ -120,6 +138,11 @@ export function normalizeConfig(input = {}) {
     enforcement: {
       killProcesses: asBoolean(enforcement.killProcesses, true),
       blockNetwork: asBoolean(enforcement.blockNetwork, true),
+      // 第二层：Windows 防火墙按程序阻断。默认打开（"阻断网络全开"）。
+      firewallRules: asBoolean(enforcement.firewallRules, true),
+      // 防火墙规则只在 profile 启用时才生效；默认允许闸门自己把三个 profile 打开，
+      // 否则这一层会静默失效——那正是最坑人的"看着在拦、其实没拦"。
+      enableFirewallProfiles: asBoolean(enforcement.enableFirewallProfiles, true),
       failClosed: asBoolean(enforcement.failClosed, true),
       pollIntervalMs: asPositiveInt(enforcement.pollIntervalMs, 2000, 500),
       recheckIntervalMs: asPositiveInt(enforcement.recheckIntervalMs, 30000, 5000),

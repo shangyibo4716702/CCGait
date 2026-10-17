@@ -145,28 +145,56 @@ export function discoverClaudeTargets(options = {}) {
   return { entries: unique, notes }
 }
 
+// 命令行兜底只对解释器进程生效：CLI 以 Node 脚本形式安装时，真身是 node.exe 跑
+// cli.js，只能靠命令行里的包路径认出来。
+const INTERPRETER_NAMES = new Set(['node.exe', 'bun.exe', 'deno.exe'])
+
+// 这些宿主进程一律不判为 Claude 客户端。原因很实际：只要某个终端/编辑器的命令行里
+// 出现过 claude-code 路径（打开该目录、跑一次 node 调试都算），仅凭命令行就会把它们
+// 认成 CLI，拦截时会把用户自己的终端一起杀掉。
+const HOST_PROCESS_NAMES = new Set([
+  'bash.exe',
+  'sh.exe',
+  'dash.exe',
+  'zsh.exe',
+  'cmd.exe',
+  'powershell.exe',
+  'pwsh.exe',
+  'conhost.exe',
+  'windowsterminal.exe',
+  'wt.exe',
+  'explorer.exe',
+  'code.exe',
+  'wsl.exe',
+  'wslhost.exe',
+])
+
 /**
  * 进程命令行/路径是否属于 Claude 客户端。
  *
- * 除可执行文件与安装目录外，还要覆盖"CLI 以 Node 脚本形式运行"的安装方式：那种
- * 情况下进程是 node.exe，只能靠命令行里的 claude-code 包路径识别 —— 绝不能按
- * node.exe 这个进程名去拦，否则会波及机器上所有 Node 程序。
+ * 判定顺序：安装目录 → 包目录 → 可执行文件名 → 解释器命令行兜底。前三条看的是
+ * 程序自身的落盘位置，不会误伤；只有最后一条依赖命令行文本，所以额外用宿主进程
+ * 名单挡住 shell 与编辑器。
  */
 export function classifyProcess({ name, exePath, commandLine }) {
   const exe = String(exePath ?? '')
   const cmd = String(commandLine ?? '')
   const lowerExe = exe.toLowerCase()
   const lowerCmd = cmd.toLowerCase()
+  const base = String(name ?? '').toLowerCase() || lowerExe.split(/[\\/]/).pop() || ''
 
-  const isClaudeExe = /(^|[\\/])claude[^\\/]*\.exe$/i.test(lowerExe)
-  const inClaudeCodeDir = lowerExe.includes('claude-code')
+  if (HOST_PROCESS_NAMES.has(base)) return null
+
   const inDesktopDir =
     lowerExe.includes('anthropicclaude') || (lowerExe.includes('windowsapps') && lowerExe.includes('claude'))
-  const inClaudeCodePackage = lowerCmd.includes('@anthropic-ai') && lowerCmd.includes('claude-code')
-
   if (inDesktopDir) return 'desktop'
-  if (inClaudeCodeDir) return 'cli'
-  if (isClaudeExe) return 'desktop'
-  if (inClaudeCodePackage) return 'cli'
+  if (lowerExe.includes('claude-code')) return 'cli'
+  if (/^claude[^\\/]*\.exe$/.test(base)) {
+    // 裸 claude.exe：装在 npm / node_modules 下按 CLI 算，其余按桌面版算。
+    return lowerExe.includes('npm') || lowerExe.includes('node_modules') ? 'cli' : 'desktop'
+  }
+  if (INTERPRETER_NAMES.has(base) && lowerCmd.includes('@anthropic-ai') && lowerCmd.includes('claude-code')) {
+    return 'cli'
+  }
   return null
 }

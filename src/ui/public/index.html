@@ -108,6 +108,7 @@
             <span class="panel-sub" id="actions-sub"></span>
           </div>
           <div class="panel-body">
+            <div id="action-state" class="state-strip"></div>
             <div id="action-notices"></div>
             <div class="actions" id="action-buttons"></div>
           </div>
@@ -181,8 +182,8 @@
               </label>
               <label class="switch-row">
                 <div>
-                  <strong>阻断其网络（防火墙）</strong>
-                  <span>需要管理员权限，且系统防火墙处于开启状态。</span>
+                  <strong>阻断其网络（WFP 内核过滤器 + 防火墙规则）</strong>
+                  <span>第一层 WFP 不依赖系统防火墙是否开启；第二层防火墙规则需要管理员权限，闸门会自动开启防火墙配置文件。</span>
                 </div>
                 <input id="blockNetwork" type="checkbox" />
               </label>

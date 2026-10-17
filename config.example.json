@@ -15,25 +15,30 @@
     "$comment": "enabled 控制是否检测；severity 为 block 时该维度不通过也拦截，warn 只报告。",
     "egressIp": { "enabled": true, "severity": "block" },
     "claudeDns": { "enabled": true, "severity": "block", "deniedCountries": ["CN"] },
+    "$comment2": "以下都是中文用户环境特征（判定口径对齐 ippure 的同类检测）：默认只提示、不门控 —— 改时区、删系统字体属于改系统设置，不该由闸门替你决定能不能用。要更严就把 severity 改成 block。",
     "timezone": { "enabled": true, "severity": "warn" },
     "language": { "enabled": true, "severity": "warn" },
     "fonts": { "enabled": true, "severity": "warn" },
+    "emojiFlags": { "enabled": true, "severity": "warn" },
     "dnsServers": { "enabled": true, "severity": "warn" },
     "proxyEnvLeak": { "enabled": true, "severity": "warn" }
   },
 
   "enforcement": {
-    "$comment": "killProcesses：终止正在运行的 Claude 客户端。blockNetwork：防火墙按程序阻断其出站（需要管理员）。",
+    "$comment": "killProcesses：终止正在运行的 Claude 客户端。blockNetwork：判定不通过就断它的网（第一层是 WFP 内核过滤器，不依赖系统防火墙开关）。",
     "killProcesses": true,
     "blockNetwork": true,
-    "$comment2": "failClosed：判定不出结果（查询失败/多源矛盾）也按拦截处理。",
+    "$comment2": "第二层：Windows 防火墙按程序阻断，默认打开（阻断网络全开）。enableFirewallProfiles：防火墙规则只在 profile 启用时才生效，默认允许闸门自己把三个 profile 打开，否则这一层会静默失效。",
+    "firewallRules": true,
+    "enableFirewallProfiles": true,
+    "$comment3": "failClosed：判定不出结果（查询失败/多源矛盾）也按拦截处理。",
     "failClosed": true,
     "pollIntervalMs": 2000,
     "recheckIntervalMs": 30000
   },
 
   "network": {
-    "$comment": "可选分流：给 Claude 进程注入 HTTPS_PROXY，让它固定从该出口出去；检测也走同一条路。",
+    "$comment": "可选分流：给 Claude 进程注入 HTTPS_PROXY，让它固定从该出口出去；检测也走同一条路。required=false 时代理连不上会回退直连并按真实出口判定（会在报告里说明）。",
     "proxy": {
       "enabled": false,
       "url": "http://127.0.0.1:7890",

@@ -14,7 +14,11 @@
     "check": "node src/cli.js check",
     "guard": "node src/cli.js guard",
     "status": "node src/cli.js status",
-    "test": "node --test"
+    "test": "node --test",
+    "test:wfp": "node tests/wfp.integration.mjs",
+    "test:firewall": "node tests/firewall.integration.mjs",
+    "test:e2e": "node tests/e2e-guard.mjs",
+    "test:payload": "node tests/verify-payload.mjs"
   },
   "dependencies": {},
   "devDependencies": {}

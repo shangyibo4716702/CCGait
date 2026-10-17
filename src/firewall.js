@@ -47,6 +47,20 @@ export async function isElevated() {
   }
 }
 
+/**
+ * 把 PowerShell 报回来的 Enabled 归一成布尔。
+ *
+ * 坑：`Get-NetFirewallProfile` 的 Enabled 类型是 `GpoBoolean` 枚举，`ConvertTo-Json`
+ * 会把它序列化成**整数 1/0**（不是 true/false）。因此 `item.Enabled === true` 永远为假 ——
+ * 防火墙关着时"看起来是对的"，一旦打开就变成"明明开着却报关闭"。
+ * 本机实测：Windows 报 True,True,True，这里却报 False,False,False。
+ */
+export function normalizeProfileEnabled(value) {
+  if (value === true || value === 1) return true
+  const text = String(value ?? '').trim().toLowerCase()
+  return text === 'true' || text === '1' || text === 'on' || text === 'enabled'
+}
+
 /** 防火墙各配置文件的启用状态（全部关闭时规则不生效，必须告知用户）。 */
 export async function firewallProfileState() {
   if (!firewallSupported()) return { supported: false, profiles: [], anyEnabled: false }
@@ -57,7 +71,7 @@ export async function firewallProfileState() {
     const parsed = stdout ? JSON.parse(stdout) : []
     const profiles = (Array.isArray(parsed) ? parsed : [parsed]).map((item) => ({
       name: item.Name,
-      enabled: item.Enabled === true,
+      enabled: normalizeProfileEnabled(item.Enabled),
     }))
     return { supported: true, profiles, anyEnabled: profiles.some((item) => item.enabled) }
   } catch (error) {

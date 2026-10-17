@@ -11,6 +11,7 @@ import {
 } from '../firewall.js'
 import { claudeDiscovery, killAllClaudeProcesses, listClaudeProcesses } from '../process-guard.js'
 import { startupStatus } from '../startup.js'
+import { isWfpBlocking, listWfpHosts, readWfpPid } from '../win/wfp.js'
 
 /**
  * UI 会话层：把 CLI 已有的能力包成一组可调用的动作 + 一个事件流，供 Web 前端使用。
@@ -64,6 +65,9 @@ export function createUiSession(options = {}) {
     killAllClaudeProcesses: options.deps?.killAllClaudeProcesses ?? killAllClaudeProcesses,
     claudeDiscovery: options.deps?.claudeDiscovery ?? claudeDiscovery,
     startupStatus: options.deps?.startupStatus ?? startupStatus,
+    isWfpBlocking: options.deps?.isWfpBlocking ?? isWfpBlocking,
+    listWfpHosts: options.deps?.listWfpHosts ?? listWfpHosts,
+    readWfpPid: options.deps?.readWfpPid ?? readWfpPid,
   }
 
   const listeners = new Set()
@@ -131,6 +135,13 @@ export function createUiSession(options = {}) {
       deps.startupStatus(),
     ])
     const discovery = deps.claudeDiscovery(clientDiscoveryOptions())
+
+    // 网络阻断到底有没有生效：这是界面上最容易看不出来、也最该看出来的一个状态。
+    // WFP 是第一层（不依赖防火墙开关），防火墙规则是第二层；任一层在生效就算"阻断中"。
+    const wfpBlocking = deps.isWfpBlocking(stateDir)
+    const wfpPid = deps.readWfpPid(stateDir)
+    const activeRules = rules.filter((rule) => rule.enabled)
+
     return {
       at: nowIso(),
       configPath,
@@ -145,6 +156,13 @@ export function createUiSession(options = {}) {
       targets: discovery.entries,
       targetNotes: discovery.notes,
       startup,
+      networkBlock: {
+        blocked: wfpBlocking || activeRules.length > 0,
+        wfp: wfpBlocking,
+        wfpPid,
+        firewallRules: activeRules.length,
+        programs: discovery.entries.length,
+      },
       guard: {
         running: guard !== null,
         startedAt: guardStartedAt,
@@ -168,6 +186,9 @@ export function createUiSession(options = {}) {
           failedClosed: result.verdict.failedClosed,
           blocked: result.verdict.blockedBy.map((item) => ({ id: item.id, title: item.title, detail: item.detail })),
           warnings: result.verdict.warnings.map((item) => ({ id: item.id, title: item.title, detail: item.detail })),
+          // 白名单原文：界面要拿它把"为什么通过/不通过"显示成可比对的一行，
+          // 而不是只给一个孤零零的 GB 让人猜。
+          whitelist: result.verdict.whitelistSummary,
           egress: result.egress,
           dns: result.dns,
           environment: result.environment,

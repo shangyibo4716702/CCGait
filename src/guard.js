@@ -3,18 +3,20 @@ import { join } from 'node:path'
 import { probeClaudeDns, probeEgress } from './providers.js'
 import {
   probeDnsServers,
+  probeEmojiFont,
   probeFonts,
   probeLanguage,
   probeSystemProxy,
   probeTimezone,
 } from './environment.js'
 import { decide } from './verdict.js'
-import { applyBlockForPaths, firewallProfileState, listManagedRules, removeAllBlocks } from './firewall.js'
+import { applyBlockForPaths, enableProfiles, firewallProfileState, listManagedRules, removeAllBlocks } from './firewall.js'
 import {
   claudeExecutablePaths,
   killAllClaudeProcesses,
   listClaudeProcesses,
 } from './process-guard.js'
+import { requestWfpStop, resolveWfpHelper, startWfpBlock, stopWfpBlock } from './win/wfp.js'
 
 /**
  * 闸门执行器：周期性跑检测 → 判定 → 执行（终止进程 / 阻断网络）。
@@ -92,12 +94,16 @@ export function processAlive(pid) {
 export async function runChecks(config) {
   const proxyUrl =
     config.network.proxy.enabled && config.network.proxy.url ? config.network.proxy.url : undefined
+  const proxyRequired = config.network.proxy.required === true
   const deniedCountries = config.checks.claudeDns.deniedCountries
 
-  const [egressResult, dnsResult, timezone, language, fonts, dnsServers, systemProxy] =
+  const [egressResult, dnsResult, timezone, language, fonts, emojiFont, dnsServers, systemProxy] =
     await Promise.all([
       config.checks.egressIp.enabled
-        ? probeEgress({ proxyUrl }).catch((error) => ({ ip: undefined, failedSources: [String(error?.message ?? error)] }))
+        ? probeEgress({ proxyUrl, proxyRequired }).catch((error) => ({
+            ip: undefined,
+            failedSources: [String(error?.message ?? error)],
+          }))
         : Promise.resolve(undefined),
       config.checks.claudeDns.enabled
         ? probeClaudeDns({ proxyUrl, deniedCountries }).catch(() => undefined)
@@ -105,11 +111,12 @@ export async function runChecks(config) {
       config.checks.timezone.enabled ? probeTimezone().catch(() => undefined) : Promise.resolve(undefined),
       config.checks.language.enabled ? probeLanguage().catch(() => undefined) : Promise.resolve(undefined),
       config.checks.fonts.enabled ? Promise.resolve(probeFonts()) : Promise.resolve(undefined),
+      config.checks.emojiFlags.enabled ? Promise.resolve(probeEmojiFont()) : Promise.resolve(undefined),
       config.checks.dnsServers.enabled ? probeDnsServers().catch(() => undefined) : Promise.resolve(undefined),
       config.checks.proxyEnvLeak.enabled ? probeSystemProxy().catch(() => undefined) : Promise.resolve(undefined),
     ])
 
-  const environment = { timezone, language, fonts, dnsServers, systemProxy }
+  const environment = { timezone, language, fonts, emojiFont, dnsServers, systemProxy }
   const verdict = decide({
     config,
     egress: egressResult,
@@ -224,7 +231,10 @@ export async function enforce(config, verdict, options = {}) {
   })
 
   if (verdict.allow) {
-    // 放行：撤掉自己加的阻断（若有），并汇报当前没有任何 CCGait 规则。
+    // 放行：撤掉 WFP 阻断与防火墙规则（两者都要撤，避免任一残留继续拦用户）。
+    const wfpStopped = await stopWfpBlock({ stateDir })
+    if (wfpStopped.stopped) result.unblocked = true
+
     const existing = await listManagedRules()
     if (existing.length > 0) {
       const removal = await removeAllBlocks()
@@ -240,17 +250,41 @@ export async function enforce(config, verdict, options = {}) {
       const killed = await killAllClaudeProcesses()
       result.killed = killed
       result.killedCount = killed.filter((item) => item.killed).length
+      // "本来就已经退出"要和"我们杀掉的"分开报：否则会出现"已终止 0 个"却列着 PID 的怪话。
+      result.goneCount = killed.filter((item) => item.gone).length
       for (const item of killed) {
         if (item.error) result.errors.push(`终止 PID ${item.pid} 失败：${item.error}`)
       }
       logger?.block(
-        `已终止 ${result.killedCount} 个 Claude 进程`,
-        killed.map((item) => `${item.name}#${item.pid}`).join('、'),
+        `已处理 ${killed.length} 个 Claude 进程`,
+        killed
+          .map((item) => `${item.name}#${item.pid}${item.gone ? '（执行时已自行退出）' : ''}`)
+          .join('、'),
       )
     }
   }
 
   if (config.enforcement.blockNetwork) {
+    // 第一层：WFP 内核过滤器 —— 不依赖 Windows 防火墙是否开启。
+    if (resolveWfpHelper()) {
+      const wfp = await startWfpBlock({ paths: targets, stateDir, timeoutMs: 20_000 })
+      if (wfp.ok) {
+        result.wfp = { pid: wfp.pid, filters: wfp.filters ?? null }
+        logger?.block(
+          '已断网（WFP 内核过滤器）',
+          wfp.alreadyRunning ? '复用已在生效的过滤器' : `${wfp.filters} 条过滤器生效`,
+        )
+      } else {
+        result.errors.push(`WFP 阻断失败：${wfp.error}`)
+      }
+    } else {
+      result.errors.push('未找到 CCGaitWfp.exe，无法使用不依赖防火墙的断网方式')
+    }
+  }
+
+  // 第二层（默认关闭）：Windows 防火墙规则。默认不用它 —— 用户不必为了拦 Claude
+  // 去打开系统防火墙，WFP 已经把这件事做了。需要双保险时把 enforcement.firewallRules 设为 true。
+  if (config.enforcement.firewallRules) {
     if (targets.length === 0) {
       result.errors.push(
         '没有找到 Claude 客户端的可执行文件，无法建立防火墙阻断（客户端未安装时属正常）',
@@ -279,9 +313,23 @@ export async function enforce(config, verdict, options = {}) {
     try {
       const profile = await firewallProfileState()
       if (profile.supported && !profile.anyEnabled) {
-        result.errors.push(
-          'Windows 防火墙三个配置文件都是关闭状态，防火墙规则不会生效：请在「Windows 安全中心 → 防火墙和网络保护」里开启，或改用只终止进程的策略',
-        )
+        // 防火墙规则只在 profile 启用时才生效。既然配置要求"阻断网络全开"，
+        // 就在这里把 profile 打开——否则这一层是静默失效的，用户以为拦住了其实没有。
+        if (config.enforcement.firewallRules && config.enforcement.enableFirewallProfiles) {
+          const enabled = await enableProfiles()
+          if (enabled.ok) {
+            logger?.block(
+              '已开启 Windows 防火墙配置文件',
+              '防火墙规则只在 profile 启用时生效；如不想让闸门改这个开关，把 enforcement.enableFirewallProfiles 设为 false',
+            )
+          } else {
+            result.errors.push(`防火墙规则不会生效：三个 profile 都是关闭状态，且自动开启失败（${enabled.error}）`)
+          }
+        } else {
+          result.errors.push(
+            'Windows 防火墙三个配置文件都是关闭状态，防火墙规则不会生效：请在「Windows 安全中心 → 防火墙和网络保护」里开启，或改用只终止进程的策略',
+          )
+        }
       }
     } catch {
       // 读取失败不影响主流程。
@@ -292,7 +340,7 @@ export async function enforce(config, verdict, options = {}) {
 }
 
 /** 守护循环。 */
-export function createGuard({ config, stateDir, logger, onState }) {
+export function createGuard({ config, stateDir, logger, onState, onStopRequest }) {
   let timer = null
   let processTimer = null
   let stopping = false
@@ -348,7 +396,7 @@ export function createGuard({ config, stateDir, logger, onState }) {
       clearGuardStopRequest(stateDir)
       logger?.info('收到停止请求', '闸门即将收尾退出')
       stopping = true
-      options.onStopRequest?.()
+      onStopRequest?.()
       return
     }
 
@@ -398,6 +446,12 @@ export function createGuard({ config, stateDir, logger, onState }) {
     /** 停止：撤掉阻断，避免留下"莫名其妙上不了网"的残留。 */
     async stop({ keepBlocks = false } = {}) {
       stopping = true
+      // WFP 是会话作用域：让宿主收尾，过滤器随会话消失。
+      try {
+        requestWfpStop(stateDir)
+      } catch {
+        // 收尾失败不阻塞退出：宿主不在时过滤器本来也会随会话消失。
+      }
       if (stateDir) {
         try {
           rmSync(guardPidPath(stateDir), { force: true })

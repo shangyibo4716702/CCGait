@@ -16,6 +16,7 @@ using System.IO;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace Ccgait
@@ -91,14 +92,34 @@ namespace Ccgait
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden,
-                StandardOutputEncoding = Encoding.UTF8,
-                StandardErrorEncoding = Encoding.UTF8,
             };
+
+            // 重定向与编码必须成对出现：设了 StandardOutputEncoding 却没开
+            // RedirectStandardOutput，.NET 会在 Process.Start 直接抛
+            // InvalidOperationException（托盘一启动就崩，且是未捕获异常弹框）。
+            //
+            // 只有需要等结果的调用才重定向：不等待的调用（如拉起本地界面服务）必须让子进程
+            // 独立存活，重定向后我们这边一释放 Process，子进程的管道就断了。
+            if (wait)
+            {
+                info.RedirectStandardOutput = true;
+                info.RedirectStandardError = true;
+                info.StandardOutputEncoding = Encoding.UTF8;
+                info.StandardErrorEncoding = Encoding.UTF8;
+            }
+
             using (Process process = Process.Start(info))
             {
                 if (process == null) return -1;
-                if (wait) process.WaitForExit(timeoutMs);
-                return process.HasExited ? process.ExitCode : -1;
+                if (!wait) return 0;
+
+                // 必须先开始读、再等退出：子进程写满管道缓冲区会阻塞，先 WaitForExit 会死锁。
+                // 这里只取退出码，输出读干即丢，避免子进程卡在写管道上。
+                Task<string> stdout = process.StandardOutput.ReadToEndAsync();
+                Task<string> stderr = process.StandardError.ReadToEndAsync();
+                bool exited = process.WaitForExit(timeoutMs);
+                try { Task.WaitAll(new Task[] { stdout, stderr }, 2000); } catch { }
+                return exited ? process.ExitCode : -1;
             }
         }
 
@@ -384,6 +405,55 @@ namespace Ccgait
         }
     }
 
+    /// <summary>
+    /// "启动托盘时自动开闸门"的开关。
+    ///
+    /// 默认**开启**：用户要的是"打开软件就在执法"，而不是每次手动点一次菜单。
+    /// 只存一个 HKCU 值，缺省即视为开启；只有显式关掉才写 0。
+    /// </summary>
+    internal static class GuardAutoStart
+    {
+        private const string KeyPath = @"Software\CCGait";
+        private const string ValueName = "AutoStartGuard";
+
+        internal static bool IsEnabled()
+        {
+            try
+            {
+                using (Microsoft.Win32.RegistryKey key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(KeyPath, false))
+                {
+                    if (key == null) return true; // 没写过 = 默认开启
+                    object raw = key.GetValue(ValueName);
+                    if (raw == null) return true;
+                    return Convert.ToInt32(raw) != 0;
+                }
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
+        internal static void Set(bool enabled)
+        {
+            try
+            {
+                using (Microsoft.Win32.RegistryKey key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(KeyPath))
+                {
+                    // 这里不能用 ?.（null 条件运算符）：随 .NET Framework 一起的 csc 只支持到 C# 5。
+                    if (key != null)
+                    {
+                        key.SetValue(ValueName, enabled ? 1 : 0, Microsoft.Win32.RegistryValueKind.DWord);
+                    }
+                }
+            }
+            catch
+            {
+                // 写不进去就维持默认行为，不影响其它功能。
+            }
+        }
+    }
+
     /// <summary>托盘：状态图标 + 右键菜单。所有动作转交 CLI，行为和命令行完全一致。</summary>
     internal sealed class TrayContext : ApplicationContext
     {
@@ -516,6 +586,21 @@ namespace Ccgait
             };
             menu.Items.Add(startupItem);
 
+            var autoGuardItem = new ToolStripMenuItem("启动托盘时自动开闸门")
+            {
+                CheckOnClick = true,
+                Checked = GuardAutoStart.IsEnabled(),
+            };
+            autoGuardItem.CheckedChanged += (s, e) =>
+            {
+                GuardAutoStart.Set(autoGuardItem.Checked);
+                ShowBalloon(
+                    autoGuardItem.Checked ? "已开启自动开闸门" : "已关闭自动开闸门",
+                    autoGuardItem.Checked ? "下次启动托盘会自动开始执法" : "启动托盘后需要手动点「启动闸门」",
+                    ToolTipIcon.Info);
+            };
+            menu.Items.Add(autoGuardItem);
+
             menu.Items.Add(new ToolStripSeparator());
 
             var config = new ToolStripMenuItem("打开配置文件");
@@ -545,9 +630,36 @@ namespace Ccgait
             _timer.Start();
 
             Refresh();
+
+            // 默认行为：托盘一起来就开始执法，不用每次手动点「启动闸门」。
+            // 闸门本身仍然是"进程即策略"：托盘退出不影响已经在跑的闸门，闸门退出即恢复网络。
+            if (GuardAutoStart.IsEnabled() && !Program.ReadStatus().GuardRunning)
+            {
+                StartGuardQuietly();
+            }
+
             if (!Program.ReadStatus().HasCheck)
             {
-                ShowBalloon("CCGait 托盘已就绪", "右键图标可检测环境、启停闸门", ToolTipIcon.Info);
+                ShowBalloon("CCGait 托盘已就绪", "已按默认设置启动闸门；右键图标可检测环境、启停闸门", ToolTipIcon.Info);
+            }
+        }
+
+        /// <summary>启动闸门并把结果告诉用户（失败必须说清楚，不能默默不干活）。</summary>
+        private void StartGuardQuietly()
+        {
+            Run("guard", false);
+            System.Threading.Thread.Sleep(1500);
+            Refresh();
+            if (Program.ReadStatus().GuardRunning)
+            {
+                ShowBalloon("闸门已启动", "不满足白名单时将终止 Claude 客户端并阻断其网络", ToolTipIcon.Info);
+            }
+            else
+            {
+                ShowBalloon(
+                    "闸门未能启动",
+                    "可能需要管理员权限：右键托盘图标 →「以管理员身份运行」，或打开界面查看日志",
+                    ToolTipIcon.Warning);
             }
         }
 

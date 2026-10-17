@@ -303,6 +303,67 @@ svg {
   color: var(--danger-text);
 }
 
+/* 判定原文：贴在状态标签左边，解释"为什么这一行是这个结论"。 */
+.tag-detail {
+  margin-left: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* 总体结论横幅 */
+.verdict {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--pill-bg);
+  font-size: 13px;
+}
+
+.verdict.ok {
+  background: var(--ok-bg);
+  border-color: rgba(54, 211, 153, 0.32);
+  color: var(--ok-text);
+}
+
+.verdict.danger {
+  background: var(--danger-bg);
+  border-color: rgba(240, 110, 110, 0.32);
+  color: var(--danger-text);
+}
+
+.verdict strong {
+  font-weight: 600;
+}
+
+/* 白名单逐项比对：命中/未命中一眼可分 */
+.wl-item {
+  display: inline-block;
+  padding: 1px 8px;
+  margin: 2px 6px 2px 0;
+  border-radius: 6px;
+  font-size: 12.5px;
+  background: var(--pill-bg);
+}
+
+.wl-item.hit {
+  color: var(--ok-text);
+  background: var(--ok-bg);
+}
+
+.wl-item.miss {
+  color: var(--danger-text);
+  background: var(--danger-bg);
+}
+
+.wl-value {
+  opacity: 0.75;
+  margin-left: 4px;
+}
+
 /* ------------------------------------------------------------- 面板 */
 
 .panel {
@@ -525,6 +586,70 @@ button.action.ok {
 
 button.action.ok:hover:not(:disabled) {
   background: #f4fbf7;
+}
+
+/* 已在生效的动作：实心绿底 + 前置圆点，和"可点的动作"一眼分开。 */
+button.action.active {
+  background: var(--ok-bg);
+  border-color: #b6e0c8;
+  color: var(--ok-text);
+}
+
+button.action.active::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+button.action.active:disabled {
+  opacity: 1;
+  cursor: default;
+}
+
+button.action:disabled:not(.active) {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 操作面板顶部状态条 */
+.state-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.state-cell {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-inset);
+  font-size: 13px;
+}
+
+.state-name {
+  color: var(--text-muted);
+}
+
+.state-value {
+  font-weight: 600;
+}
+
+.state-value.on {
+  color: var(--ok-text);
+}
+
+.state-value.off {
+  color: var(--text-muted);
+}
+
+.state-value.warn {
+  color: var(--warn-text);
 }
 
 button.action .spinner {

@@ -24,6 +24,7 @@ const CSC_CANDIDATES = [
 ]
 
 export const CLIENT_EXE_NAME = 'CCGaitClient.exe'
+export const WFP_EXE_NAME = 'CCGaitWfp.exe'
 
 export function resolveCsc() {
   for (const candidate of CSC_CANDIDATES) {
@@ -32,7 +33,13 @@ export function resolveCsc() {
   return undefined
 }
 
-/** 需要打进安装包的运行时文件（源码 + 示例配置 + 文档）。 */
+/**
+ * 需要打进安装包的运行时文件（源码 + UI 静态资源 + 示例配置 + 文档）。
+ *
+ * 扩展名白名单必须覆盖 `src/` 下所有**运行时要用**的文件：UI 的 index.html 与
+ * styles.css 曾经不在其中，于是从源码跑一切正常、装完之后界面直接 404（服务端
+ * serveStatic 找不到 public/index.html）。加扩展名时同步看一眼 src/ui/public。
+ */
 export function collectPayloadSources(rootDir = PROJECT_ROOT) {
   const files = []
   const skipDirs = new Set(['node_modules', 'dist', '.ccgait', 'tests', 'native', 'release'])
@@ -46,7 +53,8 @@ export function collectPayloadSources(rootDir = PROJECT_ROOT) {
         walk(full)
         continue
       }
-      if (/\.(js|ps1|cjs|mjs|json|md)$/i.test(entry.name)) files.push(full)
+      // .cs 是构建输入（编译进 exe），不打进载荷；其余是运行时资源。
+      if (/\.(js|ps1|cjs|mjs|json|md|html|css|svg|ico)$/i.test(entry.name)) files.push(full)
     }
   }
   walk(join(rootDir, 'src'))
@@ -74,12 +82,12 @@ function writeSourceWithBom(sourcePath, targetPath) {
   writeFileSync(targetPath, String.fromCharCode(0xfeff) + text, 'utf8')
 }
 
-async function compile({ csc, target, output, sources, resources = [], icon, references = [] }) {
+async function compile({ csc, target, output, sources, resources = [], icon, references = [], platform = 'anycpu' }) {
   const args = [
     '/nologo',
     '/utf8output',
     `/target:${target}`,
-    '/platform:anycpu',
+    `/platform:${platform}`,
     '/optimize+',
     `/out:${output}`,
     ...(icon ? [`/win32icon:${icon}`] : []),
@@ -142,6 +150,26 @@ export async function buildInstaller({ rootDir = PROJECT_ROOT, distDir } = {}) {
   }
   log.push(`客户端：${clientExe}（${Math.round(statSync(clientExe).size / 1024)} KB）`)
 
+  // 1b) WFP 网络阻断助手：让「禁止该程序联网」不再依赖系统防火墙是否开启。
+  const wfpSource = join(rootDir, 'src', 'win', 'native', 'CCGaitWfp.cs')
+  const wfpSourceCopy = join(buildDir, 'CCGaitWfp.cs')
+  writeSourceWithBom(wfpSource, wfpSourceCopy)
+  const wfpExe = join(dist, WFP_EXE_NAME)
+  const wfpResult = await compile({
+    csc,
+    // 用 exe 而非 winexe：它要通过 stdin 与父进程保持会话，输出也要能被读回。
+    target: 'exe',
+    output: wfpExe,
+    sources: [wfpSourceCopy],
+    icon: icons.ico,
+    platform: 'x64',
+    references: ['System.dll'],
+  })
+  if (!wfpResult.ok) {
+    return { ok: false, error: `WFP 助手编译失败：` + wfpResult.output, log }
+  }
+  log.push(`WFP 助手：${wfpExe}（${Math.round(statSync(wfpExe).size / 1024)} KB）`)
+
   // 2) 载荷：运行时源码 + 刚编译的客户端 + 图标。
   const entries = collectPayloadSources(rootDir).map((absolute) => ({
     absolute,
@@ -149,6 +177,7 @@ export async function buildInstaller({ rootDir = PROJECT_ROOT, distDir } = {}) {
   }))
   for (const extra of [
     { absolute: clientExe, relative: CLIENT_EXE_NAME },
+    { absolute: wfpExe, relative: WFP_EXE_NAME },
     { absolute: icons.ico, relative: join('.ccgait', 'ccgait.ico').replace(/\\/g, '/') },
     { absolute: icons.png, relative: join('.ccgait', 'ccgait.png').replace(/\\/g, '/') },
   ]) {
@@ -182,6 +211,7 @@ export async function buildInstaller({ rootDir = PROJECT_ROOT, distDir } = {}) {
     ok: true,
     setupExe,
     clientExe,
+    wfpExe,
     distDir: dist,
     sizeBytes: statSync(setupExe).size,
     log,

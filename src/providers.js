@@ -153,6 +153,32 @@ const SOURCES = [
  * 返回 { confident, ip, country, sources, flags, asnText }。
  */
 export async function probeEgress(options = {}) {
+  const primary = await probeEgressOnce(options)
+
+  // 配了代理但代理连不上时的回退。
+  //
+  // `network.proxy.required = false` 的语义就是"不强制走代理"：既然代理没在跑，
+  // 就该按**真实出口**（直连）来判，而不是把整轮检测判成"出口未知"。
+  // 本机实测过这个坑：代理进程关了，网站（浏览器直连）显示出口正常，闸门却因为
+  // 探针走死代理而一律拦截，看起来像"策略判错了"。
+  //
+  // required = true 时不回退：用户明确要求必须走代理，拿不到就按拦截处理（failClosed）。
+  const proxyUrl = options.proxyUrl
+  const proxyFailed = primary.ip === undefined && primary.failedSources.length > 0
+  const looksLikeProxyError = /ECONNREFUSED|ETIMEDOUT|ECONNRESET|socket hang up|ENOTFOUND|EPROTO/i.test(
+    primary.failedSources.join(' '),
+  )
+  if (!proxyUrl || options.proxyRequired || !proxyFailed || !looksLikeProxyError) {
+    return primary
+  }
+
+  const fallback = await probeEgressOnce({ ...options, proxyUrl: undefined })
+  if (fallback.ip === undefined) return primary
+  return { ...fallback, proxyFallback: true, proxyUrl, proxyErrors: primary.failedSources }
+}
+
+/** 单次探测：按给定出口（可带代理）问一遍所有数据源。 */
+async function probeEgressOnce(options = {}) {
   const results = await Promise.all(SOURCES.map((source) => querySource(source, options)))
   const usable = results.filter((item) => item.ip && !item.error)
   const failed = results.filter((item) => item.error)

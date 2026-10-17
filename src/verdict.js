@@ -32,6 +32,17 @@ export function evaluateEgress(config, egress) {
     return reasons
   }
 
+  if (egress.proxyFallback) {
+    reasons.push(
+      reason(
+        'egress-proxy-fallback',
+        'warn',
+        '配置的代理连不上，已按直连出口判定',
+        `代理 ${egress.proxyUrl ?? '（未记录地址）'} 不可用（${(egress.proxyErrors ?? []).join('；') || '连接失败'}）。因为 network.proxy.required = false，本次按真实直连出口判定：${egress.ip}。如果你本来期望客户端走代理，请先启动代理再检测；若希望拿不到代理就一律拦截，把 network.proxy.required 设为 true。`,
+      ),
+    )
+  }
+
   if (!egress.confident) {
     reasons.push(
       reason(
@@ -219,6 +230,18 @@ export function evaluateEnvironment(config, env) {
     )
   }
 
+  // Emoji 国旗渲染：对齐 ippure 的同类检测（那边用 Canvas 逐像素，这里看系统字体资产）。
+  if (env.emojiFont?.checked && env.emojiFont.suspect) {
+    reasons.push(
+      reason(
+        'emoji-flags-suspect',
+        'warn',
+        'Emoji 国旗渲染可能被裁剪',
+        `${env.emojiFont.reason ?? '系统 emoji 字体不是完整的彩色版本'}。公开分析把它列为"中国区系统特征"之一。注意本项是基于系统字体资产的近似判定（浏览器端 Canvas 逐像素探测更准），因此默认只提示。`,
+      ),
+    )
+  }
+
   if (env.systemProxy?.hasAny) {
     const parts = []
     if (env.systemProxy.system?.enabled) {
@@ -260,9 +283,9 @@ export function decide({ config, egress, dns, environment, deniedCountries = ['C
   reasons.push(...evaluateEnvironment(config, environment ?? {}))
 
   // 按配置的严重度折算：warn 类检查若被提升为 block，就在此处生效。
-  // 注意：egress-* 里有两条例外 —— 关闭检查的提示、机房出口提示，它们本身是 warn，
-  // 不能因为前缀是 egress 就被当成拦截项。
-  const WARN_ONLY_IDS = new Set(['egress-disabled', 'egress-hosting-note'])
+  // 注意：egress-* 里有几条例外 —— 关闭检查的提示、机房出口提示、代理回退提示，
+  // 它们本身是 warn，不能因为前缀是 egress 就被当成拦截项。
+  const WARN_ONLY_IDS = new Set(['egress-disabled', 'egress-hosting-note', 'egress-proxy-fallback'])
   const severityOf = (id) => {
     if (WARN_ONLY_IDS.has(id)) return 'warn'
     if (id.startsWith('egress')) return 'block'
@@ -270,6 +293,7 @@ export function decide({ config, egress, dns, environment, deniedCountries = ['C
     if (id === 'timezone-domestic') return checks.timezone.severity
     if (id.startsWith('language')) return checks.language.severity
     if (id.startsWith('fonts')) return checks.fonts.severity
+    if (id.startsWith('emoji-flags')) return checks.emojiFlags.severity
     if (id.startsWith('dns-servers')) return checks.dnsServers.severity
     if (id === 'proxy-leak') return checks.proxyEnvLeak.severity
     return 'warn'
@@ -281,6 +305,7 @@ export function decide({ config, egress, dns, environment, deniedCountries = ['C
     if (id === 'timezone-domestic') return checks.timezone.enabled
     if (id.startsWith('language')) return checks.language.enabled
     if (id.startsWith('fonts')) return checks.fonts.enabled
+    if (id.startsWith('emoji-flags')) return checks.emojiFlags.enabled
     if (id.startsWith('dns-servers')) return checks.dnsServers.enabled
     if (id === 'proxy-leak') return checks.proxyEnvLeak.enabled
     return true

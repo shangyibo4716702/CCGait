@@ -13,6 +13,7 @@ import {
 } from '../src/config.js'
 import { decide, evaluateEgress } from '../src/verdict.js'
 import { classifyProcess } from '../src/claude-targets.js'
+import { normalizeProfileEnabled } from '../src/firewall.js'
 import { parseKeyValueText } from '../src/http.js'
 
 const tempDirs = []
@@ -269,10 +270,59 @@ describe('process classification', () => {
     assert.equal(classifyProcess({ name: 'moa-studio.exe', exePath: 'D:\\MoAStudio\\moa-studio.exe', commandLine: '' }), null)
     assert.equal(classifyProcess({ name: 'cloudflared.exe', exePath: 'C:\\cloudflared.exe', commandLine: '' }), null)
   })
+
+  it('never matches a shell or editor that merely mentions the claude-code path', () => {
+    // 实测踩过：终端里 cd 进 claude-code 目录后，仅凭命令行就会被判成 CLI，
+    // 拦截时会把用户自己的终端一起杀掉。
+    const cliPath = 'C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code'
+    assert.equal(
+      classifyProcess({ name: 'bash.exe', exePath: 'C:\\Program Files\\Git\\bin\\bash.exe', commandLine: `bash -c cd ${cliPath}` }),
+      null,
+    )
+    assert.equal(
+      classifyProcess({ name: 'powershell.exe', exePath: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', commandLine: `Get-ChildItem ${cliPath}` }),
+      null,
+    )
+    assert.equal(
+      classifyProcess({ name: 'Code.exe', exePath: 'C:\\Program Files\\Microsoft VS Code\\Code.exe', commandLine: `code ${cliPath}\\cli.js` }),
+      null,
+    )
+    assert.equal(
+      classifyProcess({ name: 'cmd.exe', exePath: 'C:\\Windows\\System32\\cmd.exe', commandLine: `cmd /c start ${cliPath}` }),
+      null,
+    )
+  })
+
+  it('classifies a bare claude.exe by where it lives', () => {
+    assert.equal(
+      classifyProcess({ name: 'claude.exe', exePath: 'C:\\Users\\me\\AppData\\Roaming\\npm\\claude.exe', commandLine: '' }),
+      'cli',
+    )
+    assert.equal(
+      classifyProcess({ name: 'claude.exe', exePath: 'D:\\Tools\\claude\\claude.exe', commandLine: '' }),
+      'desktop',
+    )
+  })
 })
 
-describe('http helpers', () => {
-  it('parses Cloudflare trace text', () => {
+describe('firewall profile state', () => {
+  it('treats PowerShell GpoBoolean serialization as enabled', () => {
+    // 实测：Get-NetFirewallProfile 的 Enabled 是 GpoBoolean 枚举，
+    // ConvertTo-Json 序列化成整数 1/0，不是 true/false。
+    // 只认 === true 会导致"防火墙明明开着却报关闭"，且关着时看起来正常，很难发现。
+    assert.equal(normalizeProfileEnabled(1), true)
+    assert.equal(normalizeProfileEnabled(true), true)
+    assert.equal(normalizeProfileEnabled('True'), true)
+    assert.equal(normalizeProfileEnabled('1'), true)
+    assert.equal(normalizeProfileEnabled('ON'), true)
+    assert.equal(normalizeProfileEnabled(0), false)
+    assert.equal(normalizeProfileEnabled(false), false)
+    assert.equal(normalizeProfileEnabled('False'), false)
+    assert.equal(normalizeProfileEnabled(undefined), false)
+  })
+})
+
+describe('http helpers', () => {  it('parses Cloudflare trace text', () => {
     const parsed = parseKeyValueText('fl=1a2b\nip=203.0.113.7\nloc=US\nwarp=off\n')
     assert.deepEqual(parsed, { fl: '1a2b', ip: '203.0.113.7', loc: 'US', warp: 'off' })
   })

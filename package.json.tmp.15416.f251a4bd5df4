@@ -1,0 +1,23 @@
+{
+  "name": "ccgait",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Claude 客户端环境闸门：出口 IP/国家白名单校验，不满足时阻止 Claude Code CLI 与 Claude Desktop 启动并阻断其网络。",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "ccgait": "./src/cli.js"
+  },
+  "scripts": {
+    "check": "node src/cli.js check",
+    "guard": "node src/cli.js guard",
+    "status": "node src/cli.js status",
+    "test": "node --test",
+    "test:wfp": "node tests/wfp.integration.mjs",
+    "test:firewall": "node tests/firewall.integration.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
