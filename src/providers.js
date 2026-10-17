@@ -1,5 +1,9 @@
 import { lookup } from 'node:dns/promises'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { fetchJson, fetchText, parseKeyValueText } from './http.js'
+
+const execFileAsync = promisify(execFile)
 
 /**
  * 出口身份检测：出口 IP / 国家 / ASN / 是否机房或代理，以及 Claude 域名的解析落地。
@@ -260,13 +264,22 @@ export async function probeClaudeDns({ proxyUrl, deniedCountries = ['CN'] } = {}
   if (addresses.length > 0) {
     try {
       // 批量查询（一次最多 100 个），避免逐条触发限流。
-      const body = JSON.stringify(addresses.map((ip) => ({ query: ip, fields: 'status,query,countryCode,isp,as' })))
+      const body = JSON.stringify(
+        addresses.map((ip) => ({ query: ip, fields: 'status,query,countryCode,country,regionName,city,isp,as' })),
+      )
       const { status, text } = await fetchText('http://ip-api.com/batch', { proxyUrl, body })
       if (status === 200) {
         const rows = JSON.parse(text)
         for (const row of rows) {
           if (row?.status === 'success') {
-            geo.set(row.query, { country: String(row.countryCode ?? '').toUpperCase(), isp: row.isp, asn: row.as })
+            geo.set(row.query, {
+              country: String(row.countryCode ?? '').toUpperCase(),
+              countryName: row.country,
+              regionName: row.regionName,
+              city: row.city,
+              isp: row.isp,
+              asn: row.as,
+            })
           }
         }
       }
@@ -296,4 +309,88 @@ export async function probeClaudeDns({ proxyUrl, deniedCountries = ['CN'] } = {}
     resolved: hosts.some((item) => item.addresses.length > 0),
     hasResolutionError: hosts.some((item) => item.error !== undefined),
   }
+}
+
+/**
+ * 解析出口（实测口径）：看**实际是谁在回答我们的 DNS 查询**，而不是网卡上配了谁。
+ *
+ * 这是与 ippure「DNS 区域泄露隐患」对齐的那一项：用系统解析器去查 Google / Akamai 的
+ * "whoami" 权威域名 —— 它们的权威服务器会把**发起这次查询的递归解析器出口 IP**写进应答，
+ * 所以拿到的就是真实解析出口（若查询是直连发出的，拿到的就是本机出口 IP，同样是泄漏信号）。
+ *
+ * 两个必须注意的坑：
+ * 1. **必须走操作系统的解析路径**（这里用 PowerShell 的 `Resolve-DnsName`），不能用
+ *    `node:dns` 的 `resolve*`：后者走 c-ares，只读注册表里**配置的**那几台服务器。
+ *    本机实测正是这样：配的腾讯 DNS 用 c-ares 查是 `ECONNREFUSED`（根本连不通），
+ *    而系统解析路径正常走 IPv6 侧的路由器 → 拿到的解析出口是英国 BT/EE。
+ *    用错路径就会得出"解析出口在国内"的假结论。
+ * 2. 应答里可能是 IPv4 也可能是 IPv6（`Strings` 里可能带引号），所以按地址形态过滤，
+ *    不按位置取第几个字段。
+ */
+const RESOLVER_ECHO_QUERIES = [
+  { host: 'o-o.myaddr.l.google.com', type: 'TXT', field: 'Strings' },
+  { host: 'whoami.akamai.net', type: 'A', field: 'IPAddress' },
+]
+
+export async function probeResolverEgress({ deniedCountries = ['CN'] } = {}) {
+  const script = [
+    '$values = @()',
+    ...RESOLVER_ECHO_QUERIES.map(
+      ({ host, type, field }) =>
+        `$values += @((Resolve-DnsName -Type ${type} ${host} -ErrorAction SilentlyContinue).${field})`,
+    ),
+    '$values | Where-Object { $_ } | Sort-Object -Unique',
+  ].join('\n')
+
+  let addresses = []
+  let error
+  try {
+    const { stdout } = await execFileAsync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      { windowsHide: true, timeout: 20_000, maxBuffer: 1024 * 1024 },
+    )
+    addresses = [
+      ...new Set(
+        stdout
+          .split(/\r?\n/)
+          .map((line) => line.trim().replace(/^"|"$/g, ''))
+          .filter((line) => /^\d{1,3}(\.\d{1,3}){3}$/.test(line) || (/^[0-9a-f:]+$/i.test(line) && line.includes(':'))),
+      ),
+    ]
+  } catch (cause) {
+    error = cause instanceof Error ? cause.message : String(cause)
+  }
+
+  if (addresses.length === 0) {
+    return { resolvers: [], deniedHits: [], checked: false, error }
+  }
+
+  const geo = new Map()
+  try {
+    const body = JSON.stringify(
+      addresses.map((ip) => ({ query: ip, fields: 'status,query,countryCode,country,regionName,city,isp,as' })),
+    )
+    const { status, text } = await fetchText('http://ip-api.com/batch', { body })
+    if (status === 200) {
+      for (const row of JSON.parse(text)) {
+        if (row?.status === 'success') {
+          geo.set(row.query, {
+            country: String(row.countryCode ?? '').toUpperCase(),
+            countryName: row.country,
+            regionName: row.regionName,
+            city: row.city,
+            isp: row.isp,
+            asn: row.as,
+          })
+        }
+      }
+    }
+  } catch {
+    // 反查失败只降低置信度，不影响"解析出口是谁"这个事实。
+  }
+
+  const resolvers = addresses.map((ip) => ({ ip, ...(geo.get(ip) ?? {}) }))
+  const deniedHits = resolvers.filter((item) => item.country && deniedCountries.includes(item.country))
+  return { resolvers, deniedHits, checked: true, error }
 }

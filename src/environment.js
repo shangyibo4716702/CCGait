@@ -26,20 +26,55 @@ export const DOMESTIC_TIMEZONES = [
   'China Standard Time',
 ]
 
-/** 国内公共 DNS（解析服务器落地在国内 = 解析可能被本地化处理）。 */
+/**
+ * 国内公共 DNS（解析服务器落地在国内 = 解析可能被本地化处理）。
+ *
+ * 只覆盖**公开**的解析服务：运营商自带的 DNS 往往是路由器地址（192.168.x.1、fe80::…），
+ * 判不了归属，这类场景本项放行 —— 这是这个清单的已知边界，不是漏检。
+ */
 export const DOMESTIC_DNS_SERVERS = [
+  // IPv4
   '114.114.114.114',
   '114.114.115.115',
   '223.5.5.5',
   '223.6.6.6',
   '180.76.76.76',
   '119.29.29.29',
+  '182.254.116.116',
+  '1.12.12.12',
+  '120.53.53.53',
   '1.2.4.8',
   '210.2.4.8',
   '101.226.4.6',
   '123.125.81.6',
   '39.156.66.10',
+  // IPv6
+  '2400:3200::1',
+  '2400:3200:baba::1',
+  '2400:da00::6666',
+  '240c::6666',
+  '240c::6644',
 ]
+
+/**
+ * 这个地址值不值得当作"配置的解析服务器"来判定。
+ *
+ * 只排除**不可能是公共解析器**的值：链路本地 fe80::/10、站点本地 fec0::/10
+ * （Windows 会在没有 IPv6 DNS 的网卡上填 fec0:0:0:ffff::1~3 这种占位）、环回、组播。
+ * 它们要么是路由器自己的地址、要么是占位符，判不了归属；留着只会让报告变噪音。
+ */
+export function isPublicDnsAddress(address) {
+  const value = String(address ?? '').trim()
+  if (!value) return false
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(value)) return true
+  if (!value.includes(':') || !/^[0-9a-f:]+$/i.test(value)) return false
+  const lower = value.toLowerCase()
+  if (lower === '::' || lower === '::1') return false
+  if (/^fe[89ab]/.test(lower)) return false // fe80::/10 链路本地
+  if (/^fe[c-f]/.test(lower)) return false // fec0::/10 站点本地
+  if (/^ff/.test(lower)) return false // ff00::/8 组播
+  return true
+}
 
 /**
  * 中文字体指纹。strong = 国内厂商/发行版专有字体（出现即说明装了中文环境）；
@@ -188,20 +223,42 @@ export function probeEmojiFont() {
   }
 }
 
-/** 系统配置的 DNS 服务器（落地在国内 = 解析可能被本地化）。 */
+/**
+ * 系统**配置**的解析服务器（只是配置，不代表实际走了哪条解析路径）。
+ *
+ * 两个刻意的口径（都是踩过"和 ippure 结论打架"才定下来的）：
+ * 1. 只读**已连接（Up）**网卡。断开/残留网卡上的陈旧静态配置不该算数 —— 那种地址
+ *    今天根本不会被问到。
+ * 2. IPv4 与 IPv6 **都读**。只读 IPv4 会完全看不到实际在用的那条路径：本机实测
+ *    WLAN 的 IPv4 静态配着腾讯 DNS，而 IPv6 解析器是路由器（fe80::…），
+ *    Windows 上真正回答查询的是后者 —— 只读 IPv4 就会得出和实测相反的结论。
+ *    链路本地/站点本地地址（路由器自己的地址、Windows 的占位符）在这里被丢掉。
+ */
 export async function probeDnsServers() {
-  if (process.platform !== 'win32') return { servers: [], domestic: [] }
+  if (process.platform !== 'win32') return { servers: [], domestic: [], filtered: 0 }
   try {
     const stdout = await runPowerShell(
-      "Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.ServerAddresses } | ForEach-Object { $_.ServerAddresses } | Sort-Object -Unique",    )
-    const servers = stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => /^\d+\.\d+\.\d+\.\d+$/.test(line))
-    const domestic = servers.filter((server) => DOMESTIC_DNS_SERVERS.includes(server))
-    return { servers, domestic }
+      "$up = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | Select-Object -ExpandProperty ifIndex); " +
+        'Get-DnsClientServerAddress -ErrorAction SilentlyContinue | ' +
+        'Where-Object { $_.ServerAddresses -and ($up -contains $_.InterfaceIndex) } | ' +
+        'ForEach-Object { $_.ServerAddresses } | Sort-Object -Unique',
+    )
+    const unique = [
+      ...new Set(
+        stdout
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean),
+      ),
+    ]
+    const servers = unique.filter(isPublicDnsAddress)
+    const domestic = servers.filter((server) =>
+      DOMESTIC_DNS_SERVERS.includes(server.toLowerCase()),
+    )
+    // 被丢掉的（路由器地址 / Windows 的 fec0::… 占位）：只用于界面说明"为什么列表是空的"。
+    return { servers, domestic, filtered: unique.length - servers.length }
   } catch (error) {
-    return { servers: [], domestic: [], error: error instanceof Error ? error.message : String(error) }
+    return { servers: [], domestic: [], filtered: 0, error: error instanceof Error ? error.message : String(error) }
   }
 }
 

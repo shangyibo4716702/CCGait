@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { probeClaudeDns, probeEgress } from './providers.js'
+import { probeClaudeDns, probeEgress, probeResolverEgress } from './providers.js'
 import {
   probeDnsServers,
   probeEmojiFont,
@@ -129,8 +129,17 @@ export async function runChecks(config) {
   const proxyRequired = config.network.proxy.required === true
   const deniedCountries = config.checks.claudeDns.deniedCountries
 
-  const [egressResult, dnsResult, timezone, language, fonts, emojiFont, dnsServers, systemProxy] =
-    await Promise.all([
+  const [
+    egressResult,
+    dnsResult,
+    timezone,
+    language,
+    fonts,
+    emojiFont,
+    dnsServers,
+    resolverEgress,
+    systemProxy,
+  ] = await Promise.all([
       config.checks.egressIp.enabled
         ? probeEgress({ proxyUrl, proxyRequired }).catch((error) => ({
             ip: undefined,
@@ -145,10 +154,13 @@ export async function runChecks(config) {
       config.checks.fonts.enabled ? Promise.resolve(probeFonts()) : Promise.resolve(undefined),
       config.checks.emojiFlags.enabled ? Promise.resolve(probeEmojiFont()) : Promise.resolve(undefined),
       config.checks.dnsServers.enabled ? probeDnsServers().catch(() => undefined) : Promise.resolve(undefined),
+      config.checks.resolverEgress.enabled
+        ? probeResolverEgress({ deniedCountries }).catch(() => undefined)
+        : Promise.resolve(undefined),
       config.checks.proxyEnvLeak.enabled ? probeSystemProxy().catch(() => undefined) : Promise.resolve(undefined),
     ])
 
-  const environment = { timezone, language, fonts, emojiFont, dnsServers, systemProxy }
+  const environment = { timezone, language, fonts, emojiFont, dnsServers, resolverEgress, systemProxy }
   const verdict = decide({
     config,
     egress: egressResult,
@@ -218,7 +230,16 @@ export function formatCheckReport({ egress, dns, environment, verdict }, logger)
   if (environment?.dnsServers) {
     log.info(
       'DNS 服务器',
-      `${(environment.dnsServers.servers ?? []).join('、') || '未读取'}${environment.dnsServers.domestic?.length ? ` ← 国内 ${environment.dnsServers.domestic.join('、')}` : ''}`,
+      `${(environment.dnsServers.servers ?? []).join('、') || (Number(environment.dnsServers.filtered) > 0 ? '只有路由器/链路本地地址' : '未读取')}${environment.dnsServers.domestic?.length ? ` ← 国内 ${environment.dnsServers.domestic.join('、')}` : ''}`,
+    )
+  }
+  if (environment?.resolverEgress) {
+    const resolvers = environment.resolverEgress.resolvers ?? []
+    log.info(
+      '解析出口（实测）',
+      resolvers.length > 0
+        ? resolvers.map((item) => `${item.ip}${item.country ? ` ${item.country}` : ''}`).join('、')
+        : `无法确认（${environment.resolverEgress.error ?? '查询没拿到应答'}）`,
     )
   }
   if (environment?.systemProxy?.hasAny) {

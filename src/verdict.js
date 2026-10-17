@@ -219,13 +219,38 @@ export function evaluateEnvironment(config, env) {
     )
   }
 
+  // 实测解析出口：谁在真正回答我们的查询、它从哪个国家出去（对齐 ippure 的 DNS LEAK）。
+  if (env.resolverEgress?.checked && env.resolverEgress.deniedHits?.length > 0) {
+    reasons.push(
+      reason(
+        'resolver-egress-denied',
+        'block',
+        '解析出口落在被禁地区',
+        `实测回答我们 DNS 查询的递归解析器是：${env.resolverEgress.deniedHits
+          .map((item) => `${item.ip}（${item.country}${item.isp ? ` ${item.isp}` : ''}）`)
+          .join('、')}。这是"实际解析路径"，与出口白名单是同一档：解析在国内落地会被就近调度到国内节点，也更容易解析到被墙地址。想让解析从境外出去，就把系统 DNS 换掉或让代理接管 DNS。`,
+      ),
+    )
+  } else if (env.resolverEgress && env.resolverEgress.checked === false) {
+    // 拿不到应答（对方权威域名被墙/网络没有解析器）：只提示，不拦 ——
+    // 否则在国内网络会被自己拦住，而这个项目本身要拦的是"环境不对"，不是"测不出来"。
+    reasons.push(
+      reason(
+        'resolver-egress-unknown',
+        'warn',
+        '无法确认解析出口',
+        `查询谁在回答我们的 DNS 时没有拿到应答（${env.resolverEgress.error ?? '无应答'}）。这一项只提示、不拦截 —— 判不出结果不等于环境有问题。`,
+      ),
+    )
+  }
+
   if (env.dnsServers?.domestic?.length > 0) {
     reasons.push(
       reason(
         'dns-servers-domestic',
         'warn',
-        '解析服务器在国内',
-        `当前 DNS：${env.dnsServers.domestic.join('、')}。解析走国内服务器会让 CDN 就近调度到国内节点，也更容易解析到被墙地址。`,
+        '配置的解析服务器在国内',
+        `已连接网卡上配置了：${env.dnsServers.domestic.join('、')}。注意这一项读的是"系统里配置了哪台解析服务器"，不是"实际解析走了哪条路径" —— 网卡同时配了 IPv6 解析器时，真正回答查询的可能是路由器转发的 ISP 解析器（那台是运营商自带、判不了归属，本项测不到）。配在国内意味着哪天这条路径被用上，CDN 会就近调度到国内节点、也更容易解析到被墙地址。`,
       ),
     )
   }
@@ -285,7 +310,13 @@ export function decide({ config, egress, dns, environment, deniedCountries = ['C
   // 按配置的严重度折算：warn 类检查若被提升为 block，就在此处生效。
   // 注意：egress-* 里有几条例外 —— 关闭检查的提示、机房出口提示、代理回退提示，
   // 它们本身是 warn，不能因为前缀是 egress 就被当成拦截项。
-  const WARN_ONLY_IDS = new Set(['egress-disabled', 'egress-hosting-note', 'egress-proxy-fallback'])
+  const WARN_ONLY_IDS = new Set([
+    'egress-disabled',
+    'egress-hosting-note',
+    'egress-proxy-fallback',
+    // 判不出结果 ≠ 环境不对：这一条不该被提升成拦截。
+    'resolver-egress-unknown',
+  ])
   const severityOf = (id) => {
     if (WARN_ONLY_IDS.has(id)) return 'warn'
     if (id.startsWith('egress')) return 'block'
@@ -294,6 +325,7 @@ export function decide({ config, egress, dns, environment, deniedCountries = ['C
     if (id.startsWith('language')) return checks.language.severity
     if (id.startsWith('fonts')) return checks.fonts.severity
     if (id.startsWith('emoji-flags')) return checks.emojiFlags.severity
+    if (id.startsWith('resolver-egress')) return checks.resolverEgress.severity
     if (id.startsWith('dns-servers')) return checks.dnsServers.severity
     if (id === 'proxy-leak') return checks.proxyEnvLeak.severity
     return 'warn'
@@ -306,6 +338,7 @@ export function decide({ config, egress, dns, environment, deniedCountries = ['C
     if (id.startsWith('language')) return checks.language.enabled
     if (id.startsWith('fonts')) return checks.fonts.enabled
     if (id.startsWith('emoji-flags')) return checks.emojiFlags.enabled
+    if (id.startsWith('resolver-egress')) return checks.resolverEgress.enabled
     if (id.startsWith('dns-servers')) return checks.dnsServers.enabled
     if (id === 'proxy-leak') return checks.proxyEnvLeak.enabled
     return true

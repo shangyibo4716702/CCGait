@@ -16,11 +16,13 @@
     "$comment": "enabled 控制是否检测；severity=block 时该维度不通过也拦截，warn 只报告。",
     "egressIp": { "enabled": true, "severity": "block" },
     "claudeDns": { "enabled": true, "severity": "block", "deniedCountries": ["CN"] },
+    "$comment5": "解析出口（实测）默认阻断：查 Google/Akamai 的 whoami 域名，看实际是谁在回答我们的 DNS 查询、它的出口在哪个国家 —— 与参考网站的「DNS 区域泄露隐患」同一件事，是实际解析路径，所以拦。拿不到应答只提示。",
+    "resolverEgress": { "enabled": true, "severity": "block" },
     "timezone": { "enabled": true, "severity": "warn" },
     "language": { "enabled": true, "severity": "warn" },
     "fonts": { "enabled": true, "severity": "warn" },
-    "$comment4": "DNS 与系统代理按默认值改为阻断：解析走国内服务器、CLI 直连暴露国内 IP 都属于出口路径，与白名单同一档。",
-    "dnsServers": { "enabled": true, "severity": "block" },
+    "$comment4": "本机 DNS 只提示、不拦截：这项读的是「网卡上配置了哪台解析器」，不是「实测解析路径」—— 本机实测就是配了腾讯 DNS 而实际走路由器转发的 ISP 解析器（ippure 判通过），口径对不齐。想当硬门槛就改成 block。",
+    "dnsServers": { "enabled": true, "severity": "warn" },
     "proxyEnvLeak": { "enabled": true, "severity": "block" }
   },
 

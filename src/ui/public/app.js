@@ -15,9 +15,23 @@ const CHECK_LABELS = {
   language: { name: '界面语言', scope: '列表含 zh-CN' },
   fonts: { name: '中文字体指纹', scope: '等线 / 鸿蒙 / 阿里普惠体' },
   emojiFlags: { name: 'Emoji 国旗渲染', scope: '系统 emoji 字体被裁剪' },
-  dnsServers: { name: 'DNS 服务器位置', scope: '国内公共 DNS' },
+  resolverEgress: { name: '解析出口（实测）', scope: '谁在实际回答 DNS 查询' },
+  dnsServers: { name: 'DNS 服务器位置', scope: '已连接网卡配置的公共解析器' },
   proxyEnvLeak: { name: '系统代理 / 分流覆盖', scope: 'CLI 是否直连' },
 }
+
+/** 出口相关的判定 id：出口卡片的结论标签与分区徽章都从这一组里取。 */
+const EGRESS_IDS = [
+  'egress-unknown',
+  'egress-inconsistent',
+  'egress-country',
+  'egress-ip',
+  'egress-cidr',
+  'egress-asn',
+  'egress-hosting',
+  'egress-hosting-note',
+  'egress-proxy-fallback',
+]
 
 const list = (value) => (Array.isArray(value) ? value : [])
 
@@ -154,43 +168,97 @@ function badge(kind, text, pulse = false) {
   return node
 }
 
-function kvRow(term, value, extra) {
-  const dt = el('dt', undefined, term)
-  const dd = el('dd')
-  if (typeof value === 'string') {
-    dd.append(document.createTextNode(value))
-  } else if (value instanceof Node) {
-    dd.append(value)
-  }
-  if (extra) dd.append(extra)
-  return { dt, dd }
+/** 国家代码 → 旗帜 emoji；Windows 上通常渲染成两位字母，不影响可读。 */
+function flagEmoji(code) {
+  const cc = String(code ?? '').toUpperCase()
+  if (!/^[A-Z]{2}$/.test(cc)) return ''
+  return String.fromCodePoint(...[...cc].map((char) => 0x1f1e6 + char.charCodeAt(0) - 65))
 }
 
 /**
- * 每行的状态标签。
+ * 归属地一行：旗帜 + 国家名 + 城市/地区，例如 `🇬🇧 United Kingdom, Hatfield`。
+ * 数据来自反查（ip-api），缺哪项就少哪项，不编造。
+ */
+function geoLine(info, prefix) {
+  const place = [info.countryName ?? info.country, info.city ?? info.regionName].filter(Boolean).join(', ')
+  if (!place) return undefined
+  const span = el('span', 'geo')
+  if (prefix) span.append(document.createTextNode(prefix))
+  const flag = flagEmoji(info.country)
+  if (flag) span.append(el('span', 'geo-flag', flag))
+  span.append(document.createTextNode(place))
+  return span
+}
+
+function tagNode(kind, text) {
+  return el('span', `tag ${kind}`, text)
+}
+
+/**
+ * 明细卡片：一条数据一张卡 —— 主值（IP 之类用等宽）+ 副行（归属地 / 机构所在）
+ * + 右侧结论徽章。对齐参考站的分区卡片：把每项摊开成可核对的读数，
+ * 而不是把所有东西压成一行"某某有提示"的笼统结论。
+ */
+function detailCard({ label, value, sub, tag, tone = 'neutral', mono = false }) {
+  const card = el('div', `detail-card ${tone}`)
+  const body = el('div', 'card-body')
+  if (label) body.append(el('div', 'card-label', label))
+  const valueHost = el('div', `card-value${mono ? ' mono' : ''}`)
+  if (value instanceof Node) valueHost.append(value)
+  else valueHost.textContent = String(value ?? '—')
+  body.append(valueHost)
+  if (sub instanceof Node) {
+    const subHost = el('div', 'card-sub')
+    subHost.append(sub)
+    body.append(subHost)
+  } else if (sub) {
+    body.append(el('div', 'card-sub', String(sub)))
+  }
+  card.append(body)
+  if (tag) card.append(tag)
+  return card
+}
+
+/** 分区：标题 + 右侧结论徽章 + 卡片列表。 */
+function envSection(title, badgeNode, cards, { wide = false } = {}) {
+  const section = el('div', 'env-section')
+  const head = el('div', 'env-section-head')
+  head.append(el('div', 'env-section-title', title))
+  if (badgeNode) head.append(badgeNode)
+  section.append(head)
+  const grid = el('div', `env-cards${wide ? ' wide' : ''}`)
+  for (const card of cards) grid.append(card)
+  section.append(grid)
+  return section
+}
+
+/** 分区右上角的结论徽章，与卡片上的 tag 共用同一套配色。 */
+function sectionBadge(kind, text) {
+  return el('span', `section-badge ${kind}`, text)
+}
+
+/** 把判定原文（"为什么这一格是这个结论"）附到副行上。 */
+function appendReason(sub, tagResult) {
+  const host = sub instanceof Node ? sub : el('span')
+  if (tagResult?.reason) host.append(el('span', 'tag-detail', tagResult.reason.title))
+  return host
+}
+
+/**
+ * 每格的结论标签。
  *
  * 结论直接取自判定结果里的 reason id（check.blocked / check.warnings），
  * 不在界面里另写一套判断 —— 否则"界面显示通过、闸门却在拦"这种事迟早会发生。
+ * kind 同时用作卡片左描边颜色，所以在这里一并算出来。
  */
 function statusTag(ids, { disabled = false } = {}) {
   const check = status.lastCheck ?? {}
   const blockedHit = list(check.blocked).find((item) => ids.includes(item.id))
   const warnHit = list(check.warnings).find((item) => ids.includes(item.id))
-  if (blockedHit) return { node: el('span', 'tag danger', '未通过'), reason: blockedHit }
-  if (warnHit) return { node: el('span', 'tag warn', '提示'), reason: warnHit }
-  if (disabled) return { node: el('span', 'tag', '未启用'), reason: undefined }
-  return { node: el('span', 'tag ok', '通过'), reason: undefined }
-}
-
-/** 带状态标签的一行：标签统一贴在值后面，鼠标悬停可看判定原文。 */
-function statusRow(term, value, ids, options) {
-  const row = kvRow(term, value)
-  const { node, reason } = statusTag(ids, options)
-  if (reason) {
-    row.dd.append(el('span', 'tag-detail', reason.title))
-  }
-  row.dd.append(node)
-  return row
+  if (blockedHit) return { node: el('span', 'tag danger', '未通过'), reason: blockedHit, kind: 'danger' }
+  if (warnHit) return { node: el('span', 'tag warn', '提示'), reason: warnHit, kind: 'warn' }
+  if (disabled) return { node: el('span', 'tag', '未启用'), reason: undefined, kind: 'neutral' }
+  return { node: el('span', 'tag ok', '通过'), reason: undefined, kind: 'ok' }
 }
 
 /** 该检查项在配置里是否启用；关了就不该显示"通过"，那会让人以为它在把关。 */
@@ -357,7 +425,7 @@ function renderEnvironment() {
   const dns = check.dns
   const env = check.environment ?? {}
   const wl = check.whitelist ?? {}
-  const dl = el('dl', 'kv')
+  const sections = []
 
   // 总体结论放在最上面：一眼看到"通过 / 未通过"，再往下看是哪一项。
   const verdictBanner = el('div', 'verdict ' + (check.allow ? 'ok' : 'danger'))
@@ -377,26 +445,58 @@ function renderEnvironment() {
   )
   body.append(verdictBanner)
 
-  // 出口：把"为什么通过/不通过"逐项摊开，而不是只给一个 GB 让人猜。
-  const ipText = egress.ip ?? '未知'
-  const parts = [ipText, egress.country ? `${egress.country}${egress.countryName ? `（${egress.countryName}）` : ''}` : undefined]
-    .filter(Boolean)
-    .join(' · ')
-  const ipNode = el('span', 'mono', parts)
-  if (egress.hosting) ipNode.append(el('span', 'tag warn', '机房/代理'))
-  if (egress.mobile) ipNode.append(el('span', 'tag', '移动网络'))
-  const egressRow = statusRow('出口', ipNode, [
-    'egress-unknown',
-    'egress-inconsistent',
-    'egress-country',
-    'egress-ip',
-    'egress-cidr',
-    'egress-asn',
-    'egress-hosting',
-    'egress-hosting-note',
-    'egress-proxy-fallback',
-  ])
-  dl.append(egressRow.dt, egressRow.dd)
+  // —— 分区一：网络出口。逐条摊开成可核对的读数（IP、归属地、机构、一致性），
+  // 而不是只给一个 GB 让人猜。
+  const egressTag = statusTag(EGRESS_IDS)
+  const egressSub = el('span')
+  const egressGeo = geoLine(egress)
+  if (egressGeo) egressSub.append(egressGeo)
+  // 机构名与 ASN 单独占一张卡（下面那张），这里只留归属地与网络特征标记，
+  // 免得一张卡里塞两种信息、副行绕成四行。
+  if (egress.hosting) egressSub.append(el('span', 'tag warn', '机房/代理'))
+  if (egress.mobile) egressSub.append(el('span', 'tag', '移动网络'))
+
+  const consistent = egress.confident
+    ? '一致（可信）'
+    : `不一致 → IP ${JSON.stringify(egress.ipVotes ?? {})} / 国家 ${JSON.stringify(egress.countryVotes ?? {})}`
+  const consistentTag = statusTag(['egress-inconsistent', 'egress-unknown'])
+  const consistentNotes = []
+  if (!egress.confident) consistentNotes.push('多源读数互相矛盾，按拦截处理')
+  if (check.failedClosed && !list(check.blocked).some((item) => item.id.startsWith('egress'))) {
+    consistentNotes.push('failClosed 生效：出口身份确认不了就拦')
+  }
+
+  const egressCards = [
+    detailCard({
+      label: '出口 IP',
+      value: egress.ip ?? '未知',
+      mono: true,
+      sub: egressSub.childNodes.length > 0 ? egressSub : undefined,
+      tag: egressTag.node,
+      tone: egressTag.kind,
+    }),
+    detailCard({
+      label: '多源一致性',
+      value: consistent,
+      sub: consistentNotes.length > 0 ? el('span', 'dim', consistentNotes.join('；')) : undefined,
+      tag: consistentTag.node,
+      tone: consistentTag.kind,
+    }),
+  ]
+
+  // ASN / 机构：出口身份的另一半，单独一张卡，免得一格里塞太多。
+  if (egress.asnText) {
+    const asnTag = statusTag(['egress-asn', 'egress-hosting'])
+    egressCards.push(
+      detailCard({
+        label: 'ASN / 机构',
+        value: egress.asnText,
+        sub: appendReason(el('span', 'dim', egress.isp ?? '出口运营商'), asnTag),
+        tag: asnTag.node,
+        tone: asnTag.kind,
+      }),
+    )
+  }
 
   // 代理连不上时回退直连：必须说清楚"这次判的是直连出口"，
   // 否则用户会以为代理在生效、看到的却是物理线路的出口。
@@ -480,114 +580,234 @@ function renderEnvironment() {
       span.append(el('span', 'wl-value', `（当前 ${item.value}）`))
       wlNode.append(span)
     })
-    const wlRow = kvRow('白名单比对', wlNode)
     const anyMiss = wlItems.some((item) => !item.hit)
-    wlRow.dd.append(el('span', `tag ${anyMiss ? 'danger' : 'ok'}`, anyMiss ? '有不命中项' : '全部命中'))
-    dl.append(wlRow.dt, wlRow.dd)
-  }
-
-  const consistent = egress.confident
-    ? '一致（可信）'
-    : `不一致 → IP ${JSON.stringify(egress.ipVotes ?? {})} / 国家 ${JSON.stringify(egress.countryVotes ?? {})}`
-  const consistentRow = statusRow('多源一致性', consistent, ['egress-inconsistent', 'egress-unknown'])
-  if (!egress.confident) consistentRow.dd.append(el('span', 'tag danger', '按拦截处理'))
-  if (check.failedClosed && !list(check.blocked).some((item) => item.id.startsWith('egress'))) {
-    consistentRow.dd.append(el('span', 'tag danger', 'failClosed 拦截'))
-  }
-  dl.append(consistentRow.dt, consistentRow.dd)
-
-  if (egress.asnText) {
-    const asnRow = statusRow('ASN / 机构', egress.asnText, ['egress-asn'])
-    dl.append(asnRow.dt, asnRow.dd)
-  }
-
-  if (dns) {
-    const groups = list(dns.hosts).map((item) => {
-      const address = item.addresses?.[0]
-      const suffix = item.country ? `(${item.country})` : ''
-      return `${item.host} → ${address ?? item.error ?? '无结果'}${suffix}`
-    })
-    const dnsRow = statusRow('Claude 域名', groups.join('  ·  ') || '—', [
-      'claude-dns-denied',
-      'claude-dns-unresolved',
-      'claude-dns-partial',
-    ], { disabled: !checksEnabled('claudeDns') })
-    if (list(dns.deniedHits).length > 0) dnsRow.dd.append(el('span', 'tag danger', '解析到被禁地区'))
-    dl.append(dnsRow.dt, dnsRow.dd)
-  }
-
-  if (env.timezone) {
-    const tzRow = statusRow(
-      '系统时区',
-      `${env.timezone.intl}${env.timezone.windows ? ` / ${env.timezone.windows}` : ''}`,
-      ['timezone-domestic'],
-      { disabled: !checksEnabled('timezone') },
+    egressCards.push(
+      detailCard({
+        label: '白名单比对',
+        value: wlNode,
+        sub: el('span', 'dim', anyMiss ? '有不命中项，整体判定为拦截' : '逐项都命中'),
+        tag: tagNode(anyMiss ? 'danger' : 'ok', anyMiss ? '有不命中项' : '全部命中'),
+        tone: anyMiss ? 'danger' : 'ok',
+      }),
     )
-    if (env.timezone.domestic) tzRow.dd.append(el('span', 'tag warn', '国内时区'))
-    dl.append(tzRow.dt, tzRow.dd)
   }
 
-  if (env.language) {
-    const langRow = statusRow('界面语言', list(env.language.uiLanguages).join('、') || '未知', ['language-chinese'], {
-      disabled: !checksEnabled('language'),
-    })
-    if (env.language.chinese) langRow.dd.append(el('span', 'tag warn', '含中文'))
-    dl.append(langRow.dt, langRow.dd)
-  }
-
-  if (env.fonts) {
-    // 同一字体的多个字重会反复命中同一标签，去重后再展示（文件数用 tag 体现）。
-    const strong = list(env.fonts.found).filter((item) => item.strong)
-    const labels = [...new Set(strong.map((item) => item.label))]
-    const fontRow = statusRow(
-      '国内字体',
-      labels.length > 0 ? labels.join('、') : '未命中专有字体',
-      ['fonts-domestic', 'fonts-weak'],
-      { disabled: !checksEnabled('fonts') },
-    )
-    if (labels.length > 0) fontRow.dd.append(el('span', 'tag warn', `命中 ${strong.length} 个字体文件`))
-    dl.append(fontRow.dt, fontRow.dd)
-  }
-
-  if (env.emojiFont?.checked) {
-    const emojiRow = statusRow(
-      'Emoji 国旗渲染',
-      env.emojiFont.present
-        ? `Segoe UI Emoji ${Math.round((env.emojiFont.sizeBytes ?? 0) / 1024 / 1024)} MB`
-        : '未检测到 Segoe UI Emoji',
-      ['emoji-flags-suspect'],
-      { disabled: !checksEnabled('emojiFlags') },
-    )
-    if (env.emojiFont.suspect) emojiRow.dd.append(el('span', 'tag warn', '可能被裁剪'))
-    dl.append(emojiRow.dt, emojiRow.dd)
-  }
-
-  if (env.dnsServers) {
-    const dnsServerRow = statusRow(
-      '本机 DNS 服务器',
-      list(env.dnsServers.servers).join('、') || '未读取',
-      ['dns-servers-domestic'],
-      { disabled: !checksEnabled('dnsServers') },
-    )
-    if (list(env.dnsServers.domestic).length > 0) {
-      dnsServerRow.dd.append(el('span', 'tag warn', `国内 ${list(env.dnsServers.domestic).join('、')}`))
-    }
-    dl.append(dnsServerRow.dt, dnsServerRow.dd)
-  }
-
+  // 系统代理：它不是设备特征，而是出口路径本身，所以跟出口放同一区。
   if (env.systemProxy) {
     const enabled = env.systemProxy.system?.enabled
     const envKeys = Object.keys(env.systemProxy.envVars ?? {})
-    const proxyRow = statusRow(
-      '系统代理',
-      enabled ? `开启（${env.systemProxy.system.server ?? '—'}）` : envKeys.length > 0 ? `未开启，但有 ${envKeys.join('、')}` : '未检测到',
-      ['proxy-leak'],
-      { disabled: !checksEnabled('proxyEnvLeak') },
+    const proxyTag = statusTag(['proxy-leak'], { disabled: !checksEnabled('proxyEnvLeak') })
+    egressCards.push(
+      detailCard({
+        label: '系统代理 / 分流覆盖',
+        value: enabled
+          ? `开启（${env.systemProxy.system.server ?? '—'}）`
+          : envKeys.length > 0
+            ? `未开启，但有 ${envKeys.join('、')}`
+            : '未检测到',
+        sub: appendReason(el('span', 'dim', 'CLI 是否直连，最终由出口白名单说了算'), proxyTag),
+        tag: proxyTag.node,
+        tone: proxyTag.kind,
+      }),
     )
-    dl.append(proxyRow.dt, proxyRow.dd)
   }
 
-  body.append(dl)
+  sections.push(
+    envSection(
+      'Claude 连通性及网络出口（实时数据）',
+      sectionBadge(egressTag.kind, egressTag.node.textContent),
+      egressCards,
+    ),
+  )
+
+  // —— 分区二：Claude 域名解析落地。每个域名一张卡：解析到哪个 IP、归属哪里。
+  if (dns) {
+    const dnsTag = statusTag(['claude-dns-denied', 'claude-dns-unresolved', 'claude-dns-partial'], {
+      disabled: !checksEnabled('claudeDns'),
+    })
+    const dnsCards = list(dns.hosts).map((item) => {
+      const address = item.addresses?.[0]
+      const denied = list(dns.deniedHits).some((hit) => hit.host === item.host)
+      const sub = address
+        ? geoLine(item, '解析落地：') ?? el('span', 'dim', item.isp ?? '归属地未知')
+        : el('span', 'dim', item.error ?? '没有解析结果')
+      return detailCard({
+        label: item.host,
+        value: address ?? '无结果',
+        mono: true,
+        sub,
+        tag: tagNode(
+          denied ? 'danger' : address ? 'ok' : 'warn',
+          denied ? '解析到被禁地区' : address ? '落地正常' : '未解析',
+        ),
+        tone: denied ? 'danger' : address ? 'ok' : 'warn',
+      })
+    })
+    if (dnsCards.length > 0) {
+      sections.push(
+        envSection('Claude 域名解析落地', sectionBadge(dnsTag.kind, dnsTag.node.textContent), dnsCards, {
+          wide: true,
+        }),
+      )
+    }
+  }
+
+  // —— 分区三：DNS 区域泄露隐患（对齐参考站的 "DNS LEAK" 分组）。
+  // 每个实测解析出口一张卡：IP + 解析服务器归属地 + 结论徽章。
+  const leakCards = []
+  const resolverEgress = env.resolverEgress
+  if (resolverEgress) {
+    const resolvers = list(resolverEgress.resolvers)
+    const deniedHits = list(resolverEgress.deniedHits)
+    for (const item of resolvers) {
+      const denied = deniedHits.some((hit) => hit.ip === item.ip)
+      leakCards.push(
+        detailCard({
+          value: item.ip,
+          mono: true,
+          sub: geoLine(item, '解析服务器归属地：') ?? el('span', 'dim', item.isp ?? '归属地未知（反查没有结果）'),
+          tag: tagNode(
+            denied ? 'danger' : item.country ? 'ok' : 'warn',
+            denied ? '被禁地区' : item.country ? '国外安全DNS' : '归属地未知',
+          ),
+          tone: denied ? 'danger' : item.country ? 'ok' : 'warn',
+        }),
+      )
+    }
+    if (resolvers.length === 0) {
+      leakCards.push(
+        detailCard({
+          value: '未取得应答',
+          sub: el('span', 'dim', `无法确认谁在回答 DNS 查询：${resolverEgress.error ?? '查询没拿到结果'}`),
+          tag: tagNode('warn', '无法确认'),
+          tone: 'warn',
+        }),
+      )
+    }
+  }
+
+  if (env.dnsServers) {
+    const servers = list(env.dnsServers.servers)
+    const domestic = list(env.dnsServers.domestic)
+    const dnsServerTag = statusTag(['dns-servers-domestic'], { disabled: !checksEnabled('dnsServers') })
+    // 列表为空有两种情况，说清楚是哪一种：只配了路由器地址，还是根本没读到。
+    const value =
+      servers.join('、') || (Number(env.dnsServers.filtered) > 0 ? '只有路由器/链路本地地址' : '未读取')
+    leakCards.push(
+      detailCard({
+        label: '本机 DNS 服务器（配置）',
+        value,
+        mono: true,
+        sub: appendReason(
+          el(
+            'span',
+            'dim',
+            domestic.length > 0
+              ? `已连接网卡上配置了国内解析器：${domestic.join('、')}（读的是配置，不是实测解析路径）`
+              : '已连接网卡上配置的公共解析器',
+          ),
+          dnsServerTag,
+        ),
+        tag: dnsServerTag.node,
+        tone: dnsServerTag.kind,
+      }),
+    )
+  }
+
+  if (leakCards.length > 0) {
+    const deniedCount = list(resolverEgress?.deniedHits).length
+    const leakBadge = !resolverEgress || !checksEnabled('resolverEgress')
+      ? sectionBadge('neutral', '未启用')
+      : resolverEgress.checked === false
+        ? sectionBadge('warn', '⚠ 无法确认解析出口')
+        : deniedCount > 0
+          ? sectionBadge('danger', `⚠ 解析出口落在被禁地区（${deniedCount} 个）`)
+          : sectionBadge('ok', '⚠ DNS 伪装正常')
+    sections.push(envSection('DNS 区域泄露隐患（DNS LEAK）', leakBadge, leakCards, { wide: true }))
+  }
+
+  // —— 分区四：设备特征（中文用户环境）。
+  const deviceCards = []
+  const deviceKinds = []
+
+  if (env.timezone) {
+    const tzTag = statusTag(['timezone-domestic'], { disabled: !checksEnabled('timezone') })
+    deviceKinds.push(tzTag.kind)
+    deviceCards.push(
+      detailCard({
+        label: '系统时区',
+        value: `${env.timezone.intl}${env.timezone.windows ? ` / ${env.timezone.windows}` : ''}`,
+        mono: true,
+        sub: appendReason(el('span', 'dim', env.timezone.domestic ? '国内时区' : '非国内时区'), tzTag),
+        tag: tzTag.node,
+        tone: tzTag.kind,
+      }),
+    )
+  }
+
+  if (env.language) {
+    const langTag = statusTag(['language-chinese'], { disabled: !checksEnabled('language') })
+    deviceKinds.push(langTag.kind)
+    deviceCards.push(
+      detailCard({
+        label: '界面语言',
+        value: list(env.language.uiLanguages).join('、') || '未知',
+        sub: appendReason(el('span', 'dim', env.language.chinese ? '含中文' : '不含中文'), langTag),
+        tag: langTag.node,
+        tone: langTag.kind,
+      }),
+    )
+  }
+
+  if (env.fonts) {
+    // 同一字体的多个字重会反复命中同一标签，去重后再展示（文件数用副行体现）。
+    const strong = list(env.fonts.found).filter((item) => item.strong)
+    const labels = [...new Set(strong.map((item) => item.label))]
+    const fontTag = statusTag(['fonts-domestic', 'fonts-weak'], { disabled: !checksEnabled('fonts') })
+    deviceKinds.push(fontTag.kind)
+    deviceCards.push(
+      detailCard({
+        label: '中文字体指纹',
+        value: labels.length > 0 ? labels.join('、') : '未命中专有字体',
+        sub: appendReason(
+          el('span', 'dim', labels.length > 0 ? `命中 ${strong.length} 个字体文件` : '只装了常见中文字体'),
+          fontTag,
+        ),
+        tag: fontTag.node,
+        tone: fontTag.kind,
+      }),
+    )
+  }
+
+  if (env.emojiFont?.checked) {
+    const emojiTag = statusTag(['emoji-flags-suspect'], { disabled: !checksEnabled('emojiFlags') })
+    deviceKinds.push(emojiTag.kind)
+    deviceCards.push(
+      detailCard({
+        label: 'Emoji 国旗渲染',
+        value: env.emojiFont.present
+          ? `Segoe UI Emoji ${Math.round((env.emojiFont.sizeBytes ?? 0) / 1024 / 1024)} MB`
+          : '未检测到 Segoe UI Emoji',
+        sub: appendReason(el('span', 'dim', env.emojiFont.suspect ? '可能被裁剪' : '字体完整'), emojiTag),
+        tag: emojiTag.node,
+        tone: emojiTag.kind,
+      }),
+    )
+  }
+
+  if (deviceCards.length > 0) {
+    const deviceWarn = deviceKinds.filter((kind) => kind === 'warn' || kind === 'danger').length
+    const deviceBadge = deviceKinds.includes('danger')
+      ? sectionBadge('danger', `${deviceWarn} 项未通过`)
+      : deviceWarn > 0
+        ? sectionBadge('warn', `${deviceWarn} 项提示`)
+        : deviceKinds.every((kind) => kind === 'neutral')
+          ? sectionBadge('neutral', '未启用')
+          : sectionBadge('ok', '均在阈值内')
+    sections.push(envSection('设备特征（中文用户环境）', deviceBadge, deviceCards))
+  }
+
+  body.append(...sections)
 
   const findings = [
     ...list(check.blocked).map((item) => ({ kind: 'block', ...item })),

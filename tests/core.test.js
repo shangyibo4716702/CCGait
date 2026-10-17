@@ -23,6 +23,7 @@ import {
 import { buildClaudeAccess, readGuardCheck } from '../src/ui/session.js'
 import { classifyProcess } from '../src/claude-targets.js'
 import { normalizeProfileEnabled } from '../src/firewall.js'
+import { isPublicDnsAddress } from '../src/environment.js'
 import { parseKeyValueText } from '../src/http.js'
 
 const tempDirs = []
@@ -45,9 +46,11 @@ describe('config', () => {
     assert.equal(config.enforcement.blockFirst, true)
     assert.equal(config.checks.egressIp.severity, 'block')
     assert.equal(config.checks.timezone.severity, 'warn')
-    // DNS 与系统代理属于"出口路径本身"，默认即阻断。
-    assert.equal(config.checks.dnsServers.severity, 'block')
+    // 系统代理属于"出口路径本身"，默认即阻断。
     assert.equal(config.checks.proxyEnvLeak.severity, 'block')
+    // 实测解析出口（谁在回答查询）是硬门槛；配置口径的本机 DNS 只提示。
+    assert.equal(config.checks.resolverEgress.severity, 'block')
+    assert.equal(config.checks.dnsServers.severity, 'warn')
     assert.deepEqual(config.checks.claudeDns.deniedCountries, ['CN'])
   })
 
@@ -220,7 +223,32 @@ describe('verdict', () => {
     )
   })
 
-  it('blocks DNS and system proxy leaks by default', () => {
+  it('blocks a domestic resolver egress but only warns when it cannot be measured', () => {
+    const denied = decide({
+      config: baseConfig,
+      egress: goodEgress,
+      environment: {
+        resolverEgress: {
+          checked: true,
+          resolvers: [{ ip: '119.29.29.29', country: 'CN', isp: 'Tencent' }],
+          deniedHits: [{ ip: '119.29.29.29', country: 'CN', isp: 'Tencent' }],
+        },
+      },
+    })
+    assert.equal(denied.allow, false, '实测解析出口落在被禁地区 = 实际解析路径不对，必须拦')
+    assert.ok(denied.blockedBy.some((item) => item.id === 'resolver-egress-denied'))
+
+    // 拿不到应答（对方权威域名可能被墙）只提示：判不出来不等于环境不对。
+    const unknown = decide({
+      config: baseConfig,
+      egress: goodEgress,
+      environment: { resolverEgress: { checked: false, resolvers: [], deniedHits: [], error: '无应答' } },
+    })
+    assert.equal(unknown.allow, true)
+    assert.ok(unknown.warnings.some((item) => item.id === 'resolver-egress-unknown'))
+  })
+
+  it('warns on configured domestic DNS but blocks system proxy leaks', () => {
     const verdict = decide({
       config: baseConfig,
       egress: goodEgress,
@@ -229,9 +257,11 @@ describe('verdict', () => {
         systemProxy: { hasAny: true, system: { enabled: true, server: '127.0.0.1:7890' }, envVars: {} },
       },
     })
-    assert.equal(verdict.allow, false, 'DNS/代理属于出口路径本身，默认即门控')
-    assert.ok(verdict.blockedBy.some((item) => item.id === 'dns-servers-domestic'))
+    assert.equal(verdict.allow, false, '代理没覆盖到 CLI 属于出口路径本身，默认即门控')
     assert.ok(verdict.blockedBy.some((item) => item.id === 'proxy-leak'))
+    // 本机 DNS 是"配置口径"、与实测口径的参考网站对不齐：只报告，不参与拦截。
+    assert.ok(verdict.warnings.some((item) => item.id === 'dns-servers-domestic'))
+    assert.equal(verdict.blockedBy.some((item) => item.id === 'dns-servers-domestic'), false)
   })
 
   it('escalates an environment check to blocking when configured', () => {
@@ -345,6 +375,23 @@ describe('firewall profile state', () => {
     assert.equal(normalizeProfileEnabled(false), false)
     assert.equal(normalizeProfileEnabled('False'), false)
     assert.equal(normalizeProfileEnabled(undefined), false)
+  })
+})
+
+describe('configured DNS server filter', () => {
+  it('keeps public resolvers and drops router/local placeholders', () => {
+    // 本机实测：WLAN 的 IPv6 解析器是路由器（fe80::…），断开的蓝牙网卡上是
+    // Windows 填的 fec0:0:0:ffff::1~3 占位。它们都判不了归属，留着只会让报告变噪音。
+    assert.equal(isPublicDnsAddress('119.29.29.29'), true)
+    assert.equal(isPublicDnsAddress('182.254.116.116'), true)
+    assert.equal(isPublicDnsAddress('2400:3200::1'), true)
+    assert.equal(isPublicDnsAddress('2a00:23ee::10'), true)
+    assert.equal(isPublicDnsAddress('fe80::5c87:30ff:fe02:d964'), false)
+    assert.equal(isPublicDnsAddress('FE80::1'), false)
+    assert.equal(isPublicDnsAddress('fec0:0:0:ffff::1'), false)
+    assert.equal(isPublicDnsAddress('::1'), false)
+    assert.equal(isPublicDnsAddress(''), false)
+    assert.equal(isPublicDnsAddress('not-an-address'), false)
   })
 })
 

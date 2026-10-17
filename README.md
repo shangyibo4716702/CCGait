@@ -15,7 +15,7 @@
 | 进程执法 | 每 2 秒巡检，发现 Claude 客户端且判定不通过 → 立即终止（含子进程） |
 | 网络阻断（第一层） | WFP 内核过滤器按可执行文件阻断出站，**不依赖系统防火墙是否开启** |
 | 网络阻断（第二层） | Windows 防火墙「出站阻断」规则；需要管理员权限，闸门会自动开启防火墙配置文件（否则规则不生效） |
-| 环境特征检测 | 系统时区、界面语言、中文字体、Emoji 国旗渲染、DNS 服务器、系统代理 —— 判定口径对齐 [ippure 的 Claude 检测](https://ippure.com/claude.html) |
+| 环境特征检测 | 系统时区、界面语言、中文字体、Emoji 国旗渲染、解析出口（实测）、本机 DNS（配置）、系统代理 —— 判定口径对齐 [ippure 的 Claude 检测](https://ippure.com/claude.html) |
 | Claude 域名解析 | 解析 claude.ai / claude.com / api.anthropic.com 并反查落地归属地，识别解析被污染 |
 | 分流支持 | 可让检测与客户端都走指定代理，避免 CLI 直连暴露物理网卡出口 |
 
@@ -23,12 +23,16 @@
 
 | 类别 | 项目 | 不满足的后果 |
 | --- | --- | --- |
-| 硬门槛（block） | 出口白名单：IP / CIDR / 国家 / ASN / 要求住宅出口；多源一致性与 failClosed；Claude 域名解析落地；本机 DNS 服务器；系统代理/分流覆盖 | **打不开客户端，且上不了网** |
-| 只提示（warn） | 系统时区、界面语言、国内字体、Emoji 国旗渲染 | 只在报告里列出，**不拦截、不门控** |
+| 硬门槛（block） | 出口白名单：IP / CIDR / 国家 / ASN / 要求住宅出口；多源一致性与 failClosed；Claude 域名解析落地；**解析出口（实测）**；系统代理/分流覆盖 | **打不开客户端，且上不了网** |
+| 只提示（warn） | 系统时区、界面语言、国内字体、Emoji 国旗渲染、**本机 DNS 服务器（配置）** | 只在报告里列出，**不拦截、不门控** |
 
-**DNS 与系统代理为什么算硬门槛**：它们不是"这台机器的特征"，而是**出口路径本身** —— 解析走国内 DNS 会被就近调度到国内节点、也可能解析到被墙地址；系统代理开着但 CLI 不走它（Windows 的 WinINET 代理只覆盖浏览器那类程序，Claude Code CLI 不在其列），等于这次请求直连物理网卡出口。这两件事与出口白名单是同一档性质，所以默认就拦。
+**系统代理为什么算硬门槛**：它不是"这台机器的特征"，而是**出口路径本身** —— 系统代理开着但 CLI 不走它（Windows 的 WinINET 代理只覆盖浏览器那类程序，Claude Code CLI 不在其列），等于这次请求直连物理网卡出口，与出口白名单是同一档性质，所以默认就拦。
 
-时区 / 语言 / 字体 / Emoji 之所以只提示：它们衡量的是"这台机器的特征"，而改时区、删系统字体属于改系统设置 —— 不该由闸门替你决定能不能用。要更严就把 `checks.<项>.severity` 改成 `block`，反过来嫌 DNS / 代理太严（例如公司内网 DNS）就把它改回 `warn`（界面上「检查项严重度」面板可以逐项切换）。
+**解析出口（实测）为什么算硬门槛**：它跟 [ippure](https://ippure.com/claude.html) 的「DNS 区域泄露隐患」是同一件事 —— 查 Google / Akamai 的 whoami 权威域名（`o-o.myaddr.l.google.com`、`whoami.akamai.net`），对方会把**发起这次查询的递归解析器出口 IP**写进应答，所以拿到的是"实际是谁在回答我们的查询、它从哪个国家出去"，是**行为**而不是配置，与出口白名单同一档，默认就拦（`checks.resolverEgress.severity`）。唯一例外是**拿不到应答**（例如对方域名在你的网络里不可达）：那一条只提示、不拦 —— 判不出结果不等于环境不对，否则在国内网络会被自己拦住。注意必须走操作系统的解析路径（`Resolve-DnsName`），不能用 `node:dns` 的 `resolve*`：后者走 c-ares，只读注册表里**配置的**那几台服务器，本机实测会直接 `ECONNREFUSED` 并得出"解析出口在国内"的假结论。
+
+**本机 DNS（配置）这一项为什么只提示**：它读的是"**配置**"，不是"**实测路径**"（实测路径由上面那一项负责）——只统计**已连接（Up）网卡**上配置的公共解析器（IPv4 与 IPv6 都读，链路本地 `fe80::`/站点本地 `fec0::` 这类路由器地址和占位符会被排除），回答的是"系统里配置了哪台解析服务器"。这两者会不一致：本机实测就是 WLAN 的 IPv4 静态配着腾讯 DNS，而 IPv6 解析器是路由器 —— 真正回答查询的是路由器转发的运营商解析器。口径对不齐就有假阳性的余地，所以按"多余的额外风险只提示"处理：如实报出配置里的国内 DNS，但不据此拦截。运营商自带的 DNS 往往是路由器地址，判不了归属，这类场景本项放行 —— 这是这个清单的已知边界，不是漏检。确实想把它当硬门槛，就把 `checks.dnsServers.severity` 改成 `block`。
+
+时区 / 语言 / 字体 / Emoji 之所以只提示：它们衡量的是"这台机器的特征"，而改时区、删系统字体属于改系统设置 —— 不该由闸门替你决定能不能用。要更严就把 `checks.<项>.severity` 改成 `block`（界面上「检查项严重度」面板可以逐项切换）。
 
 | 不做的事 | 原因 |
 | --- | --- |
@@ -204,10 +208,11 @@ node src/cli.js uninstall-startup
     // enabled 控制是否检测；severity = "block" 不通过即拦截，"warn" 只报告
     "egressIp":     { "enabled": true, "severity": "block" },
     "claudeDns":    { "enabled": true, "severity": "block", "deniedCountries": ["CN"] },
+    "resolverEgress": { "enabled": true, "severity": "block" }, // 实测解析出口（谁在回答查询）
     "timezone":     { "enabled": true, "severity": "warn" },
     "language":     { "enabled": true, "severity": "warn" },
     "fonts":        { "enabled": true, "severity": "warn" },
-    "dnsServers":   { "enabled": true, "severity": "block" },
+    "dnsServers":   { "enabled": true, "severity": "warn" },  // 读的是"配置"、不是"实测解析路径"，只提示
     "proxyEnvLeak": { "enabled": true, "severity": "block" }
   },
   "enforcement": {
@@ -249,7 +254,8 @@ node src/cli.js uninstall-startup
 | 系统时区 | Europe/London | 已经是非国内时区 |
 | 界面语言 | en-US、zh-Hans-SG | 列表里仍有中文 |
 | 中文字体 | 等线 DengXian ×3、MiSans | 命中"国内专有字体" |
-| DNS 服务器 | 119.29.29.29（腾讯）等 | 解析走国内服务器 |
+| 解析出口（实测） | 46.68.66.16 / 46.68.66.47（BT/EE，GB） | 实际回答查询的递归解析器落在境外，通过 |
+| DNS 服务器（配置） | 119.29.29.29（腾讯）等 | 已连接网卡上配置了国内公共解析器 —— **只提示**（口径是配置、不是实测路径，见上文） |
 | 系统代理 | 127.0.0.1:7890 已开启 | 系统代理只覆盖走 WinINET 的程序，**CLI 不在其列** |
 | Windows 防火墙 | Domain/Private/Public **全部关闭** | 防火墙规则不会生效 —— 所以第一层走 WFP，不依赖这个开关；第二层打开时闸门会自动把 profile 打开 |
 
@@ -281,7 +287,7 @@ node src/cli.js uninstall-startup
 
 1. **让 CLI 也走代理**：在代理客户端里打开 TUN 模式（或始终用 `ccgait run cli`）。否则 CLI 会暴露国内物理 IP。
 2. **锁定单一节点**，把该 IP 填进 `whitelist.ips`，把 `requireResidential` 设为 `true`（治机房出口）。
-3. **系统 DNS 换成非国内**（如 1.1.1.1 / 8.8.8.8）：`checks.dnsServers.severity` 默认已是 `"block"`，换掉 DNS 即可；公司内网 DNS 这种必须用国内解析的场景，再把它调回 `"warn"`。
+3. **让解析从境外出去**：硬门槛是「**实测**解析出口」——回显域名（`o-o.myaddr.l.google.com`、`whoami.akamai.net`）实测发现回答你查询的解析器在国内就会被拦。要改的是**实际路径**：让代理接管 DNS（TUN 模式），或把系统 DNS 换成境外解析器（在国内网络直连时可能被污染或明显变慢，注意取舍）。另外，网卡上那台用不上的国内解析器（「本机 DNS（配置）」那一项）默认只**提示**、不拦你，想让报告干净些就恢复为自动获取：`Set-DnsClientServerAddress -InterfaceAlias <网卡名> -ResetServerAddresses`（需要管理员）。
 4. **时区/语言/字体**：时区已经是欧洲，保持；语言列表里的 `zh-Hans-SG` 与中文字体属"环境特征"，如要一并拦截，把对应 `severity` 提为 `"block"`（CCGait 不会替你改系统设置）。
 5. **恢复浏览器级别的一致性**：系统时区、浏览器语言、出口地区三者一致最稳。
 
