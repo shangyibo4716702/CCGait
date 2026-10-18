@@ -4,6 +4,9 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="ccgait-token" content="__CCGAIT_TOKEN__" />
+    <!-- 前端自身的构建标识：与服务端返回的 serverBuild 比对。升级后如果旧服务进程还开着，
+         会出现"新前端 + 旧后端"，字段对不上会显示错误结论，这里用来提示重载。 -->
+    <meta name="ccgait-frontend-build" content="__CCGAIT_FRONTEND_BUILD__" />
     <title>CCGait · Claude 客户端环境闸门</title>
     <link rel="icon" type="image/x-icon" href="/favicon.ico" />
     <link rel="stylesheet" href="/styles.css" />

@@ -7,6 +7,31 @@
  */
 
 const TOKEN = document.querySelector('meta[name="ccgait-token"]').content
+// 本页面（前端）的构建标识，由服务端投递 HTML 时注入；与服务端返回的 serverBuild 比对。
+const FRONTEND_BUILD = document.querySelector('meta[name="ccgait-frontend-build"]')?.content
+let buildMismatchReported = false
+
+/**
+ * 前后端版本是否错配。
+ *
+ * 为什么必须检查：升级后如果**旧的服务进程**还开着，它会用旧代码响应 API，
+ * 而浏览器加载的是磁盘上的新前端。两边字段对不上时页面会给出错误结论
+ * （实测：旧后端没有 launchState 字段，前端把 undefined 渲染成"未被拦截"，
+ * 而真实判定是"通过"）。这比"没更新"更危险 —— 它显示的是反的结论。
+ */
+function checkBuildMatch() {
+  if (buildMismatchReported) return
+  const server = status?.serverBuild
+  if (!server || !FRONTEND_BUILD || server === 'unknown' || FRONTEND_BUILD === 'unknown') return
+  if (server === FRONTEND_BUILD) return
+  buildMismatchReported = true
+  const host = document.querySelector('#side-status')
+  if (host) {
+    host.textContent = '界面与后台版本不一致：请完全关闭页面后重新打开（旧的服务进程还在跑）'
+    host.style.color = 'var(--danger-text)'
+  }
+  toast('error', '界面与后台版本不一致', '旧的服务进程还在运行，显示的状态可能不正确。请关闭本页并重新打开。')
+}
 
 const CHECK_LABELS = {
   egressIp: { name: '出口 IP / 国家 / ASN', scope: '白名单主体' },
@@ -96,6 +121,7 @@ async function run(action, fn, successMessage) {
 async function refresh() {
   try {
     status = await api('/api/status')
+    checkBuildMatch()
     render()
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)

@@ -1,5 +1,5 @@
 import { createServer } from 'node:http'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { extname, join, normalize, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -19,6 +19,22 @@ import { buildIco } from '../win/icon.js'
  */
 
 const PUBLIC_DIR = resolve(fileURLToPath(new URL('./public', import.meta.url)))
+
+/**
+ * 服务端代码版本（本文件内容的哈希）。
+ *
+ * 为什么需要：升级后如果旧的服务进程还开着，它会继续用**旧代码**响应请求，
+ * 而浏览器拿到的是磁盘上的**新前端**。两边字段对不上时页面会显示错误结论
+ * （实测：旧后端没有 launchState 字段，前端把 undefined 渲染成"未被拦截"，
+ * 而真实判定是"通过"）。把版本写进状态，前端一比对就知道该提示重载。
+ */
+const SERVER_BUILD = (() => {
+  try {
+    return createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex').slice(0, 12)
+  } catch {
+    return 'unknown'
+  }
+})()
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -95,7 +111,13 @@ function serveStatic(response, urlPath, token) {
   const type = MIME[extname(target).toLowerCase()] ?? 'application/octet-stream'
   // 令牌只注入页面本身；跨站页面读不到 HTML 内容（无 CORS），因此拿不到令牌。
   if (type.startsWith('text/html')) {
-    body = Buffer.from(body.toString('utf8').replaceAll('__CCGAIT_TOKEN__', token), 'utf8')
+    body = Buffer.from(
+      body
+        .toString('utf8')
+        .replaceAll('__CCGAIT_TOKEN__', token)
+        .replaceAll('__CCGAIT_FRONTEND_BUILD__', SERVER_BUILD),
+      'utf8',
+    )
   }
   response.writeHead(200, {
     'content-type': type,
@@ -180,7 +202,8 @@ export function createUiServer({ session, logger, token = randomBytes(24).toStri
       }
 
       if (path === '/api/status' && request.method === 'GET') {
-        sendJson(response, 200, await session.getStatus())
+        const status = await session.getStatus()
+        sendJson(response, 200, { ...status, serverBuild: SERVER_BUILD })
         return
       }
 
