@@ -50,9 +50,26 @@ export function spawnUiServer({ port, stateDir, nodePath = process.execPath }) {
   return { pid: child.pid, logPath }
 }
 
+/** 已安装形态下的原生客户端：它自己带单实例判重（已有窗口就聚焦，没有才新建）。 */
+export function resolveNativeClient({ rootDir = PROJECT_ROOT, exists = existsSync, platform = process.platform } = {}) {
+  if (platform !== 'win32') return undefined
+  const path = join(rootDir, 'CCGaitClient.exe')
+  return exists(path) ? path : undefined
+}
+
+/** 把"打开界面"整体交给原生客户端（含服务拉起、窗口聚焦/创建）。 */
+export function spawnNativeClient(path) {
+  const child = spawn(path, [], { detached: true, stdio: 'ignore' })
+  child.unref()
+  return { pid: child.pid }
+}
+
 /**
  * 启动桌面客户端：服务不在就拉起来，然后开窗口。
  * 返回 { serverStarted, windowOpened, url } 供调用方汇报。
+ *
+ * nativeClientPath 存在时（已安装形态）整体委托给它：原生客户端带跨进程单实例
+ * 判重，连点托盘/快捷方式也只会有一个窗口。源码运行形态走这里的 Node 实现。
  */
 export async function openDesktopClient({
   port = DEFAULT_UI_PORT,
@@ -61,9 +78,17 @@ export async function openDesktopClient({
   fetchImpl = fetch,
   spawnServer = spawnUiServer,
   openWindow = openAppWindow,
+  spawnNative = spawnNativeClient,
+  nativeClientPath,
   exists = existsSync,
   timeoutMs,
 } = {}) {
+  const url = `http://127.0.0.1:${port}/`
+  if (nativeClientPath) {
+    spawnNative(nativeClientPath)
+    return { serverStarted: false, windowOpened: true, url, native: true }
+  }
+
   let serverStarted = false
   if (!(await isUiServerUp(port, { fetchImpl }))) {
     spawnServer({ port, stateDir })
@@ -78,7 +103,6 @@ export async function openDesktopClient({
     }
   }
 
-  const url = `http://127.0.0.1:${port}/`
   const icons = writeIconFiles(stateDir)
   const result = openWindow({
     url,

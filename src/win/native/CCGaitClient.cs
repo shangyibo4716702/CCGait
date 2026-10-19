@@ -55,7 +55,7 @@ namespace Ccgait
                     return;
                 case "desktop":
                 default:
-                    OpenDesktop();
+                    Environment.ExitCode = OpenDesktop(true) ? 0 : 1;
                     return;
             }
         }
@@ -183,34 +183,160 @@ namespace Ccgait
             return false;
         }
 
-        private static void OpenDesktop()
+        // ---------------------------------------------------- 单实例窗口
+
+        private const string WindowTitle = "CCGait · Claude 客户端环境闸门";
+
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern int GetWindowTextLength(IntPtr hWnd);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int maxCount);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool IsIconic(IntPtr hWnd);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int command);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        /// <summary>
+        /// 找到已经打开的应用窗口并置前。找不到返回 IntPtr.Zero。
+        ///
+        /// 为什么需要：应用窗口是 Edge 的 APP 模式，标题取自页面 title；同一个
+        /// --user-data-dir 收到第二个 --app= 参数时**不会**复用已有窗口，而是再开一个。
+        /// 托盘双击/菜单点几次就叠几个窗口，还会各自轮询状态。
+        /// </summary>
+        private static IntPtr FindAppWindow()
         {
-            // 打开软件就该在执法。执法者现在由**常驻界面服务进程**自己承担（进程内闸门、
-            // 界面服务自己的线程），所以这里只需要把服务拉起来 —— 不再另起一个独立的
-            // `cli.js guard` 进程：那会变成"别的实例"，界面上写"运行中（别的实例）"且停不掉，
-            // 而且两个闸门各守一套 WFP 过滤器，停掉其中一个也解不掉另一个的阻断。
-            // 已经有闸门在跑时（另一个界面服务起的、或上一次留下的），服务自己也不会再起第二个。
-            bool serverReady = EnsureServer();
-            if (serverReady && GuardAutoStart.IsEnabled())
-            {
-                // 等闸门登记进 guard.pid（服务一启动就建自己的闸门），
-                // 这样窗口第一次渲染时状态条就能如实写"运行中"。
-                for (int attempt = 0; attempt < 12 && !Program.ReadStatus().GuardRunning; attempt++)
+            IntPtr found = IntPtr.Zero;
+            EnumWindows(
+                delegate(IntPtr hWnd, IntPtr lParam)
                 {
-                    System.Threading.Thread.Sleep(250);
-                }
+                    if (!IsWindowVisible(hWnd)) return true;
+                    int length = GetWindowTextLength(hWnd);
+                    if (length <= 0) return true;
+                    var buffer = new System.Text.StringBuilder(length + 1);
+                    GetWindowText(hWnd, buffer, buffer.Capacity);
+                    string title = buffer.ToString();
+                    if (title == WindowTitle || title.StartsWith("CCGait · Claude 客户端", StringComparison.Ordinal))
+                    {
+                        found = hWnd;
+                        return false; // 命中即停止枚举
+                    }
+                    return true;
+                },
+                IntPtr.Zero);
+            return found;
+        }
+
+        private static void FocusWindow(IntPtr window)
+        {
+            const int SwRestore = 9;
+            if (IsIconic(window)) ShowWindow(window, SwRestore);
+            SetForegroundWindow(window);
+        }
+
+        private static void ShowOpenError(string message)
+        {
+            MessageBox.Show(message, "CCGait", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        /// <summary>最近一次打开界面失败的原因（供托盘用气泡显示）。</summary>
+        internal static string LastOpenError = "";
+        /// <summary>
+        /// 打开应用窗口（单实例）：已经有窗口就只把它置前，没有才新建。
+        ///
+        /// 为什么必须判重：应用窗口是 Edge 的 APP 模式，同一个 --user-data-dir 收到
+        /// 第二个 --app= 参数时**不会**复用旧窗口，而是再开一个。托盘双击、菜单、
+        /// 快捷方式连点几次就会叠出几个窗口，各自轮询状态。
+        /// </summary>
+        internal static bool OpenDesktop(bool showError)
+        {
+            IntPtr existing = FindAppWindow();
+            if (existing != IntPtr.Zero)
+            {
+                FocusWindow(existing);
+                return true;
             }
 
-            bool windowOpened = serverReady && OpenWindow();
-            if (!windowOpened)
+            // 跨进程串行化"检查窗口 → 创建窗口"：两个入口同时点（比如连点两下托盘）
+            // 会起两个客户端进程，只有一个能进这段临界区，另一个等它建完再直接聚焦。
+            using (var mutex = new System.Threading.Mutex(false, "Local\\CCGait-OpenWindow"))
             {
-                MessageBox.Show(
-                    serverReady
-                        ? "未找到 Microsoft Edge 或 Google Chrome，无法打开应用窗口。"
-                        : "本地服务未能启动。请确认已安装 Node.js 20 以上版本，然后重试。",
-                    "CCGait",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
+                bool acquired = false;
+                try
+                {
+                    acquired = mutex.WaitOne(30000);
+                }
+                catch (System.Threading.AbandonedMutexException)
+                {
+                    acquired = true; // 上一个持有者被强杀，锁已归我们
+                }
+
+                try
+                {
+                    existing = FindAppWindow();
+                    if (existing != IntPtr.Zero)
+                    {
+                        FocusWindow(existing);
+                        return true;
+                    }
+
+                    // 打开软件就该在执法。执法者现在由**常驻界面服务进程**自己承担（进程内闸门、
+                    // 界面服务自己的线程），所以这里只需要把服务拉起来 —— 不再另起一个独立的
+                    // `cli.js guard` 进程：那会变成"别的实例"，界面上写"运行中（别的实例）"且停不掉，
+                    // 而且两个闸门各守一套 WFP 过滤器，停掉其中一个也解不掉另一个的阻断。
+                    // 已经有闸门在跑时（另一个界面服务起的、或上一次留下的），服务自己也不会再起第二个。
+                    bool serverReady = EnsureServer();
+                    if (serverReady && GuardAutoStart.IsEnabled())
+                    {
+                        // 等闸门登记进 guard.pid（服务一启动就建自己的闸门），
+                        // 这样窗口第一次渲染时状态条就能如实写"运行中"。
+                        for (int attempt = 0; attempt < 12 && !Program.ReadStatus().GuardRunning; attempt++)
+                        {
+                            System.Threading.Thread.Sleep(250);
+                        }
+                    }
+
+                    if (!serverReady)
+                    {
+                        LastOpenError = "本地服务未能启动。请确认已安装 Node.js 20 以上版本，然后重试。";
+                        if (showError) ShowOpenError(LastOpenError);
+                        return false;
+                    }
+
+                    if (!OpenWindow())
+                    {
+                        LastOpenError = "未找到 Microsoft Edge 或 Google Chrome，无法打开应用窗口。";
+                        if (showError) ShowOpenError(LastOpenError);
+                        return false;
+                    }
+
+                    // 等窗口真正出现再放锁：紧接着的第二次点击才能命中它而不是再开一个。
+                    // 15s 是冷启动余量（首次会新建 user-data-dir，实测比复用慢很多）；
+                    // 互斥体等待要给的比它长，否则后来者会在等待超时后自己再开一个。
+                    for (int attempt = 0; attempt < 60; attempt++)
+                    {
+                        System.Threading.Thread.Sleep(250);
+                        if (FindAppWindow() != IntPtr.Zero) break;
+                    }
+                    return true;
+                }
+                finally
+                {
+                    if (acquired) mutex.ReleaseMutex();
+                }
             }
         }
 
@@ -490,7 +616,10 @@ namespace Ccgait
             var menu = new ContextMenuStrip { ShowImageMargin = false };
 
             var open = new ToolStripMenuItem("打开界面");
-            open.Click += (s, e) => Run("desktop", true);
+            // 直接在本进程里走单实例逻辑：已经有窗口就聚焦，没有才新建。
+            // （旧实现是 Run("desktop") 起一个 node 子进程再无条件 spawn Edge，
+            //   点几次就叠几个窗口。）
+            open.Click += (s, e) => OpenDesktopAsync();
             menu.Items.Add(open);
 
             menu.Items.Add(new ToolStripSeparator());
@@ -643,7 +772,7 @@ namespace Ccgait
             menu.Items.Add(quit);
 
             _icon.ContextMenuStrip = menu;
-            _icon.DoubleClick += (s, e) => Run("desktop", true);
+            _icon.DoubleClick += (s, e) => OpenDesktopAsync();
 
             _timer = new System.Windows.Forms.Timer { Interval = 10000 };
             _timer.Tick += (s, e) => Refresh();
@@ -662,6 +791,29 @@ namespace Ccgait
             {
                 ShowBalloon("CCGait 托盘已就绪", "已按默认设置开始执法；右键图标可检测环境、启停闸门", ToolTipIcon.Info);
             }
+        }
+
+        /// <summary>
+        /// 后台线程打开界面：单实例逻辑里要等服务就绪、等窗口出现，最长十几秒，
+        /// 放在 UI 线程会把托盘（含右键菜单）卡死。
+        /// </summary>
+        private static void OpenDesktopAsync()
+        {
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    Program.OpenDesktop(true);
+                }
+                catch (Exception error)
+                {
+                    MessageBox.Show(
+                        "打开界面失败：" + error.Message,
+                        "CCGait",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+            });
         }
 
         /// <summary>启动闸门并把结果告诉用户（失败必须说清楚，不能默默不干活）。</summary>

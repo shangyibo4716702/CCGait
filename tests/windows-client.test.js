@@ -14,7 +14,7 @@ import {
 } from '../src/win/status.js'
 import { appWindowArgs, browserCandidates, resolveBrowser } from '../src/win/browser-window.js'
 import { buildIco, buildIconPng, renderIconRgba, writeIconFiles } from '../src/win/icon.js'
-import { isUiServerUp, openDesktopClient, waitForUiServer } from '../src/win/desktop.js'
+import { isUiServerUp, openDesktopClient, resolveNativeClient, waitForUiServer } from '../src/win/desktop.js'
 
 const tempDirs = []
 after(() => {
@@ -253,5 +253,30 @@ describe('desktop client launcher', () => {
     })
     assert.equal(result.windowOpened, false)
     assert.match(result.reason, /Edge/)
+  })
+
+  it('delegates to the native client when it is installed', async () => {
+    // 已安装形态必须整体交给原生客户端：它带跨进程单实例判重。
+    // 如果这里退回 Node 的 openAppWindow，连点就会重新叠窗口。
+    const calls = []
+    const result = await openDesktopClient({
+      port: 17890,
+      stateDir: tempDir(),
+      fetchImpl: deadFetch,
+      spawnServer: () => calls.push('spawn-server'),
+      openWindow: () => calls.push('open-window'),
+      spawnNative: (path) => calls.push(`native:${path}`),
+      nativeClientPath: 'C:\\CCGait\\CCGaitClient.exe',
+    })
+    assert.equal(result.native, true)
+    assert.equal(result.windowOpened, true)
+    assert.deepEqual(calls, ['native:C:\\CCGait\\CCGaitClient.exe'], '不应再自己拉起服务或窗口')
+  })
+
+  it('only resolves the native client when the exe is present on Windows', () => {
+    const path = 'C:\\CCGait\\CCGaitClient.exe'
+    assert.equal(resolveNativeClient({ rootDir: 'C:\\CCGait', exists: (p) => p === path, platform: 'win32' }), path)
+    assert.equal(resolveNativeClient({ rootDir: 'C:\\CCGait', exists: () => false, platform: 'win32' }), undefined)
+    assert.equal(resolveNativeClient({ rootDir: '/opt/ccgait', exists: () => true, platform: 'linux' }), undefined)
   })
 })

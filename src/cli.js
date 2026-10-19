@@ -41,7 +41,7 @@ import { writeLastCheck } from './win/status.js'
 import { installStartup, startupStatus, uninstallStartup } from './startup.js'
 import { createUiSession } from './ui/session.js'
 import { createUiServer } from './ui/server.js'
-import { DEFAULT_UI_PORT, openDesktopClient } from './win/desktop.js'
+import { DEFAULT_UI_PORT, openDesktopClient, resolveNativeClient } from './win/desktop.js'
 import { writeIconFiles } from './win/icon.js'
 import { installShortcuts, uninstallShortcuts } from './win/shortcuts.js'
 import { isWfpBlocking, purgeWfpFilters, resolveWfpHelper, startWfpBlock, stopWfpBlock } from './win/wfp.js'
@@ -591,7 +591,13 @@ async function commandDesktop(argv) {
   }
   const { config } = await loadOrExit()
   const stateDir = resolveStateDir(config)
-  const result = await openDesktopClient({ port, stateDir })
+  // 已安装形态下整个"打开界面"交给原生客户端：它带跨进程单实例判重，
+  // 无论从托盘、快捷方式还是命令行连点，都只会有一个窗口。
+  const result = await openDesktopClient({
+    port,
+    stateDir,
+    nativeClientPath: resolveNativeClient(),
+  })
   if (!result.windowOpened) {
     console.error(`打开窗口失败：${result.reason ?? '未找到 Microsoft Edge 或 Google Chrome'}`)
     return 1
