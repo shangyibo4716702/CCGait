@@ -239,7 +239,16 @@ async function commandGuard(argv) {
   if (once) {
     const result = await runChecks(config)
     formatCheckReport(result, logger)
+    // 单轮不做终止：终止进程要求"同一个违规原因连续确认"若干轮（见 guard.js），
+    // 单轮判定可能只是网络抖动，据此杀进程就是误杀。这里照旧建立网络阻断，
+    // 只是不动进程；要真正执法请跑常驻守护（不带 --once）。
     const enforcement = await enforce(config, result.verdict, { logger, stateDir })
+    if (!result.verdict.allow && config.enforcement.killProcesses) {
+      logger.warn(
+        '单轮模式不终止进程',
+        '终止进程需要同一违规原因连续确认多轮；--once 只有一轮，按"只断网不杀进程"处理。',
+      )
+    }
     if (enforcement.errors.length > 0) {
       for (const item of enforcement.errors) logger.warn('执行提示', item)
     }

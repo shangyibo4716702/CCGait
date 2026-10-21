@@ -296,17 +296,83 @@ export function describeEgress(egress) {
 }
 
 /**
+ * 这些拦截原因表示"**没测出来**"，不是"确认违规"。
+ *
+ * 它们的共同点是：网络抖动、数据源超时、DNS 偶发失败都会产生，跟用户是否违规无关。
+ * 例如 `egress-inconsistent` 只是几个 IP 库一时对不上，`egress-unknown` 是全都查不到 ——
+ * 此时出口可能完全正常，只是这一轮没测准。
+ */
+export const UNVERIFIABLE_REASON_IDS = new Set([
+  'egress-unknown',
+  'egress-inconsistent',
+  'resolver-egress-unknown',
+  'claude-dns-unresolved',
+  'claude-dns-partial',
+])
+
+/**
+ * 这一轮是不是「确认违规」。
+ *
+ * 关键区分：只有具体违约事实（出口国家/IP/ASN 不符、解析落到被禁地区、代理泄露…）
+ * 才算确认；只要原因里混着任何一条"没测出来"，就整体按未确认处理 —— 因为那时候
+ * 连国家/归属地本身都不可信，拿它去杀进程就是误杀。
+ */
+export function isDefiniteViolation(verdict) {
+  const blocked = verdict?.blockedBy ?? []
+  if (blocked.length === 0) return false
+  return blocked.every((item) => !UNVERIFIABLE_REASON_IDS.has(item.id))
+}
+
+/** 终止进程要求「同一个确认违规结论」连续出现的轮数。 */
+export const KILL_CONFIRM_ROUNDS = 3
+
+/**
+ * 一轮判定的"违规签名"：把拦截原因 id 排序拼起来。
+ *
+ * 用它来判断"还是不是同一个问题"。只数「确认违规」的轮数是不够的 ——
+ * 这一轮出口国家不符、下一轮变成 DNS 解析到禁区的国家，两轮都可能各自成立，
+ * 却说明不了问题在持续；而同一个签名连续出现，才是稳定可复现的违规。
+ * 返回空串表示这一轮没有确认违规（没测出来或放行）。
+ */
+export function violationSignature(verdict) {
+  if (!isDefiniteViolation(verdict)) return ''
+  return (verdict.blockedBy ?? [])
+    .map((item) => item.id)
+    .sort()
+    .join('+')
+}
+
+/**
+ * 推进「同一违规连续出现」的计数。
+ *
+ * 抽出来是因为这条规则要能被单测直接跑：一轮抖动必须把计数清零，
+ * 否则"连续确认"就退化成"断断续续也算"，误杀又会回来。
+ */
+export function nextKillStreak(previous, verdict) {
+  const signature = violationSignature(verdict)
+  if (!signature) return { signature: '', streak: 0 }
+  if (previous?.signature === signature) {
+    return { signature, streak: (previous.streak ?? 0) + 1 }
+  }
+  return { signature, streak: 1 }
+}
+
+/**
  * 这一轮该不该终止进程。
  *
- * 关键区分：`blockedBy` 非空 = 我们**确认**它违规；只有 failClosed（出口查不到、
- * 多源矛盾）= 我们**没测出来**。后者绝不该杀进程 —— 网络抖动一次就把用户的编辑器
- * 全关掉，是实测发生过的误杀（一轮 18 个 Claude 进程）。
+ * 两重保护，缺一不可：
+ *  1. 只有**确认违规**才终止（`isDefiniteViolation`）；
+ *  2. 还要求这个结论**连续出现**（由调用方传入 killConfirmed）——
+ *     一次偶发的探测异常不应该把用户正在写的代码全关掉。
  *
- * 抽成纯函数是为了能被单测钉住：这类判断一旦写错，代价是用户正在干活的进程没了。
+ * `confirmed` 默认 false：调用方忘了传的时候，宁可漏杀也不能误杀。
+ *
+ * 抽成纯函数是为了能被单测钉住：这里判断写错的代价是用户的进程没了。
  */
-export function shouldKillProcesses(config, verdict) {
+export function shouldKillProcesses(config, verdict, { confirmed = false } = {}) {
   if (!config?.enforcement?.killProcesses) return false
-  return (verdict?.blockedBy ?? []).length > 0
+  if (!isDefiniteViolation(verdict)) return false
+  return confirmed === true
 }
 
 /** 执行一轮：按判定结果终止进程 / 建立或撤掉网络阻断。 */
@@ -346,14 +412,14 @@ export async function enforce(config, verdict, options = {}) {
     return result
   }
 
-  // 终止进程只在「确实违规」时执行。
+  // 终止进程只在「确实违规」且「连续确认」时执行。
   //
-  // 为什么要把 failClosed 排除在外：出口探测是走网络的，一次抖动、一个数据源超时，
-  // 就会让 confident 变成 false，进而 failClosed=true。那种情况下我们**并不知道**
-  // 用户在违规，只知道"这一轮没测出来"。据此杀进程就是误杀 —— 实测发生过：
-  // 网络抖动一轮，18 个 Claude 进程全被终止。
-  // 正确做法是"证据不足时只断网"：网络先封死（不露馅），但不动用户的进程。
-  if (shouldKillProcesses(config, verdict)) {
+  // 为什么不是"测到违规就杀"：出口探测是走网络的，一次抖动、一个数据源超时，
+  // 都会让判定看起来像违规（多源不一致、解析偶发失败……）。据此杀进程就是误杀 ——
+  // 实测发生过：网络抖动一轮，18 个 Claude 进程全被终止。
+  // 所以这里要求**同一个违规结论连续出现**才动手；中间只要有一轮恢复正常就清零。
+  // 断网是即时的（不露馅），杀进程是滞后的（保护正在干活的人）。
+  if (shouldKillProcesses(config, verdict, { confirmed: options.killConfirmed === true })) {
     const running = await listClaudeProcesses()
     if (running.length > 0) {
       const killed = await killAllClaudeProcesses()
@@ -373,12 +439,19 @@ export async function enforce(config, verdict, options = {}) {
           .join('、')}`,
       )
     }
-  } else if (config.enforcement.killProcesses && verdict.failedClosed) {
-    // 证据不足：只断网、不杀进程，并把这一点写清楚，免得用户以为闸门没在干活。
-    logger?.warn(
-      '证据不足，只断网不终止进程',
-      '出口身份无法确认（查询失败或多源矛盾）。已封死网络防止外泄，但不动正在运行的 Claude 进程。',
-    )
+  } else if (config.enforcement.killProcesses) {
+    // 没杀进程也要写清原因，否则日志里只有"判定拦截"没有任何动作，看起来像闸门漏了。
+    if (isDefiniteViolation(verdict)) {
+      logger?.warn(
+        `已确认违规，连续 ${KILL_CONFIRM_ROUNDS} 轮才终止进程`,
+        `本轮为第 ${options.killStreak ?? 1} 轮同因确认。网络已封死不会外泄；同一个原因再确认到第 ${KILL_CONFIRM_ROUNDS} 轮才动 Claude 进程，避免把网络抖动当成违规。`,
+      )
+    } else {
+      logger?.warn(
+        '证据不足，只断网不终止进程',
+        '出口身份无法确认（查询失败或多源矛盾）。已封死网络防止外泄，但不动正在运行的 Claude 进程。',
+      )
+    }
   }
   if (config.enforcement.blockNetwork) {
     // 第一层：WFP 内核过滤器 —— 不依赖 Windows 防火墙是否开启。
@@ -487,6 +560,15 @@ export function createGuard({ config, stateDir, logger, onState, onStopRequest }
   let checking = false
   let lastFullCheckAt = 0
   let lastState = null
+
+  // 「同一个确认违规」连续出现了几轮。
+  //
+  // 网络抖动只会产生"没测出来"那类原因（出口查不到、多源矛盾），它们在
+  // isDefiniteViolation 里就已经被排除，不会让这个计数增长；这里再要求同一个
+  // 原因连续出现若干轮，是为了让偶发的单轮异常也没机会动用户的进程。
+  // 中间只要有一轮放行、或换成别的原因，就清零重新数。
+  let killStreak = 0
+  let killStreakSignature = ''
 
   // 默认浏览器只解析一次：它不会在运行期间变来变去，每轮都去读注册表纯属浪费
   // （一次 PowerShell 要几百毫秒）。解析失败的结论也缓存，避免每轮都卡一下。
@@ -607,10 +689,17 @@ export function createGuard({ config, stateDir, logger, onState, onStopRequest }
           .join('；')
         logger?.block(`判定拦截：${describeBlockReason(result.verdict)}`, detail)
       }
+      // 同一违规原因连续出现才累计，换原因或恢复正常都清零。
+      const streak = nextKillStreak({ signature: killStreakSignature, streak: killStreak }, result.verdict)
+      killStreakSignature = streak.signature
+      killStreak = streak.streak
+
       const enforcement = await enforce(config, result.verdict, {
         logger,
         stateDir,
         browserPaths: await resolveBrowserTargets(),
+        killConfirmed: killStreak >= KILL_CONFIRM_ROUNDS,
+        killStreak,
       })
       const state = {
         guardPid: process.pid,
@@ -618,6 +707,10 @@ export function createGuard({ config, stateDir, logger, onState, onStopRequest }
         reason,
         allow: result.verdict.allow,
         failedClosed: result.verdict.failedClosed,
+        // 连续确认的进度也写进状态文件：事后复盘"为什么这次没杀进程"时，
+        // 一眼能看出当时数到第几轮。
+        killStreak,
+        killStreakSignature: killStreakSignature || undefined,
         // 原因写全（title + detail）：状态文件是事后复盘的主要证据，只留 title
         // 会丢掉"白名单只允许什么、当前是什么"这类关键比对信息。
         blocked: result.verdict.blockedBy.map((item) => ({

@@ -240,6 +240,21 @@ node src/cli.js uninstall-startup
 - `ips` / `cidrs` 一旦非空 → 出口必须落在其中，否则拦截。**这才是「固定 IP」的真正开关**。
 - `failClosed: true` 时，查询失败或 4 个数据源互相矛盾都按拦截处理。
 
+**「断网」和「终止进程」不是同一件事**
+
+拦截之后做两件事，但两者的触发条件故意不同：
+
+| 动作 | 触发条件 | 生效速度 |
+| --- | --- | --- |
+| 阻断网络（WFP 过滤器） | 任何拦截，**包括"没测出来"** | 当轮立即 |
+| 终止 Claude 进程 | 只有**确认违规**，且**同一原因连续 3 轮** | 滞后 |
+
+原因：出口探测本身走网络，一次抖动、一个数据源超时就会让判定看起来像违规。按"测到拦截就杀"处理，代价是用户正在写的代码没了 —— 实测发生过：出口探测失败一轮，23 个 Claude 进程被终止，日志里写着「无法确定出口 IP」，其实当时根本没违规。
+
+判为"没测出来"（只断网、不杀进程）的原因：`egress-unknown`、`egress-inconsistent`、`resolver-egress-unknown`、`claude-dns-unresolved`、`claude-dns-partial`。
+
+连续确认的进度写在 `.ccgait/state.json` 的 `killStreak` / `killStreakSignature` 里，事后能看出"当时数到第几轮"。`ccgait guard --once` 只有一轮，所以**单轮模式不终止进程**，只断网。
+
 ---
 
 ## 本机实测结论（重要）

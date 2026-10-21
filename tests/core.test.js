@@ -17,6 +17,11 @@ import {
   clearGuardStopRequest,
   describeBlockReason,
   describeEgress,
+  isDefiniteViolation,
+  KILL_CONFIRM_ROUNDS,
+  nextKillStreak,
+  UNVERIFIABLE_REASON_IDS,
+  violationSignature,
   shouldKillProcesses,
   guardStartRequestPath,
   guardStopRequestPath,
@@ -565,24 +570,99 @@ describe('guard block reasons are recorded', () => {
     // 网络抖动导致的一轮"没测出来"不能杀进程：实测曾因此误杀 18 个正在干活的实例。
     const config = { enforcement: { killProcesses: true } }
     assert.equal(
-      shouldKillProcesses(config, { allow: false, failedClosed: true, blockedBy: [] }),
+      shouldKillProcesses(config, { allow: false, failedClosed: true, blockedBy: [] }, { confirmed: true }),
       false,
       'failClosed 只表示证据不足，不等于确认违规',
     )
     assert.equal(
-      shouldKillProcesses(config, {
-        allow: false,
-        failedClosed: false,
-        blockedBy: [{ id: 'egress-country', title: '出口国家不在白名单：CN' }],
-      }),
+      shouldKillProcesses(
+        config,
+        {
+          allow: false,
+          failedClosed: false,
+          blockedBy: [{ id: 'egress-country', title: '出口国家不在白名单：CN' }],
+        },
+        { confirmed: true },
+      ),
       true,
-      '确认违规才终止进程',
+      '确认违规且连续确认后才终止进程',
     )
     assert.equal(shouldKillProcesses({ enforcement: { killProcesses: false } }, {
       allow: false,
       blockedBy: [{ id: 'egress-country', title: 'x' }],
-    }), false, '关掉 killProcesses 时一律不杀')
-    assert.equal(shouldKillProcesses(config, { allow: true, blockedBy: [] }), false)
+    }, { confirmed: true }), false, '关掉 killProcesses 时一律不杀')
+    assert.equal(shouldKillProcesses(config, { allow: true, blockedBy: [] }, { confirmed: true }), false)
+  })
+
+  it('网络抖动只断网、绝不杀进程', () => {
+    const config = { enforcement: { killProcesses: true } }
+    // 这几条都是"没测出来"：出口查不到、多源对不上、DNS 偶发失败。
+    // 用户明确要求：抖动最多阻断网络，不要动进程，宁可漏杀也不能误杀。
+    for (const id of UNVERIFIABLE_REASON_IDS) {
+      const verdict = { allow: false, failedClosed: true, blockedBy: [{ id, title: id }] }
+      assert.equal(isDefiniteViolation(verdict), false, `${id} 不该算确认违规`)
+      assert.equal(shouldKillProcesses(config, verdict, { confirmed: true }), false, `${id} 不该杀进程`)
+      assert.equal(violationSignature(verdict), '', `${id} 不该产生违规签名`)
+    }
+  })
+
+  it('只有确认违规才有签名，且同一原因才累计', () => {
+    const definite = (id) => ({ allow: false, failedClosed: false, blockedBy: [{ id, title: id }] })
+    assert.equal(violationSignature(definite('egress-country')), 'egress-country')
+    // 原因换了就是另一个问题，不能接着上一轮的数继续算"连续确认"。
+    assert.notEqual(
+      violationSignature(definite('egress-country')),
+      violationSignature(definite('claude-dns-denied')),
+    )
+    // 多原因时与顺序无关：否则同一状态会算出两个签名，连续确认永远凑不齐。
+    const a = {
+      allow: false,
+      failedClosed: false,
+      blockedBy: [{ id: 'claude-dns-denied', title: 'x' }, { id: 'egress-country', title: 'y' }],
+    }
+    const b = {
+      allow: false,
+      failedClosed: false,
+      blockedBy: [{ id: 'egress-country', title: 'y' }, { id: 'claude-dns-denied', title: 'x' }],
+    }
+    assert.equal(violationSignature(a), violationSignature(b))
+    assert.equal(violationSignature({ allow: true, blockedBy: [] }), '')
+    assert.equal(KILL_CONFIRM_ROUNDS >= 2, true, '至少要求两轮确认')
+  })
+
+  it('抖动插在中间会把连续确认清零', () => {
+    const config = { enforcement: { killProcesses: true } }
+    const violation = {
+      allow: false,
+      failedClosed: false,
+      blockedBy: [{ id: 'egress-country', title: '出口国家不在白名单：CN' }],
+    }
+    const jitter = {
+      allow: false,
+      failedClosed: true,
+      blockedBy: [{ id: 'egress-inconsistent', title: '多源不一致' }],
+    }
+
+    // 连续三轮同一原因 → 到第 3 轮才够格杀。
+    let state = { signature: '', streak: 0 }
+    const rounds = []
+    for (let i = 0; i < KILL_CONFIRM_ROUNDS; i += 1) {
+      state = nextKillStreak(state, violation)
+      rounds.push(shouldKillProcesses(config, violation, { confirmed: state.streak >= KILL_CONFIRM_ROUNDS }))
+    }
+    assert.deepEqual(rounds, [...Array(KILL_CONFIRM_ROUNDS - 1).fill(false), true])
+
+    // 违规 → 抖动 → 违规：计数必须回到 1，不能接着算。
+    state = nextKillStreak({ signature: '', streak: 0 }, violation)
+    assert.equal(state.streak, 1)
+    state = nextKillStreak(state, jitter)
+    assert.equal(state.streak, 0, '抖动轮必须清零')
+    state = nextKillStreak(state, violation)
+    assert.equal(state.streak, 1, '抖动之后重新数，不能继承')
+    assert.equal(
+      shouldKillProcesses(config, violation, { confirmed: state.streak >= KILL_CONFIRM_ROUNDS }),
+      false,
+    )
   })
 })
 
