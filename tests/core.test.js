@@ -15,6 +15,9 @@ import { decide, evaluateEgress } from '../src/verdict.js'
 import {
   clearGuardStartRequest,
   clearGuardStopRequest,
+  describeBlockReason,
+  describeEgress,
+  shouldKillProcesses,
   guardStartRequestPath,
   guardStopRequestPath,
   requestGuardStart,
@@ -519,6 +522,67 @@ describe('guard verdict read from another process', () => {
     const wrongShape = tempDir()
     writeFileSync(join(wrongShape, 'state.json'), JSON.stringify({ updatedAt: '2026-10-17T00:00:00Z' }), 'utf8')
     assert.equal(readGuardCheck(wrongShape), null, '没有 allow 字段的不算判定')
+  })
+})
+
+describe('guard block reasons are recorded', () => {
+  // 用户反馈过"Claude Code 被终止很多次，但查不出原因"：当时日志里只有
+  // "已处理 N 个进程""已断网"这类执行动作，没有判定原因。这三条测试把
+  // "原因必须可读且带上出口"钉死。
+  it('states every failed dimension, not just the first', () => {
+    const text = describeBlockReason({
+      allow: false,
+      failedClosed: false,
+      blockedBy: [
+        { id: 'egress-country', title: '出口国家不在白名单：CN' },
+        { id: 'claude-dns-denied', title: '解析出口落在被禁地区' },
+      ],
+    })
+    assert.match(text, /出口国家不在白名单：CN/)
+    assert.match(text, /解析出口落在被禁地区/)
+  })
+
+  it('marks failClosed when the egress identity could not be verified', () => {
+    const onlyFailedClosed = describeBlockReason({ allow: false, failedClosed: true, blockedBy: [] })
+    assert.match(onlyFailedClosed, /failClosed/)
+
+    const withCause = describeBlockReason({
+      allow: false,
+      failedClosed: true,
+      blockedBy: [{ id: 'egress-country', title: '出口国家不在白名单：CN' }],
+    })
+    assert.match(withCause, /出口国家不在白名单：CN/, '有具体原因时不能只写 failClosed')
+    assert.match(withCause, /failClosed/)
+  })
+
+  it('records the egress actually observed at block time', () => {
+    assert.equal(describeEgress({ ip: '36.161.21.75', country: 'CN' }), '出口 36.161.21.75 · CN')
+    assert.match(describeEgress({ ip: '1.2.3.4', country: 'HK', hosting: true }), /机房\/代理/)
+    assert.match(describeEgress(undefined), /查询失败/)
+  })
+
+  it('never kills processes when the check merely failed to complete', () => {
+    // 网络抖动导致的一轮"没测出来"不能杀进程：实测曾因此误杀 18 个正在干活的实例。
+    const config = { enforcement: { killProcesses: true } }
+    assert.equal(
+      shouldKillProcesses(config, { allow: false, failedClosed: true, blockedBy: [] }),
+      false,
+      'failClosed 只表示证据不足，不等于确认违规',
+    )
+    assert.equal(
+      shouldKillProcesses(config, {
+        allow: false,
+        failedClosed: false,
+        blockedBy: [{ id: 'egress-country', title: '出口国家不在白名单：CN' }],
+      }),
+      true,
+      '确认违规才终止进程',
+    )
+    assert.equal(shouldKillProcesses({ enforcement: { killProcesses: false } }, {
+      allow: false,
+      blockedBy: [{ id: 'egress-country', title: 'x' }],
+    }), false, '关掉 killProcesses 时一律不杀')
+    assert.equal(shouldKillProcesses(config, { allow: true, blockedBy: [] }), false)
   })
 })
 

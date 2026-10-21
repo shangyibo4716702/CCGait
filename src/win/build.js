@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { join, relative, sep } from 'node:path'
+import { basename, join, relative, sep } from 'node:path'
 import { promisify } from 'node:util'
 import { PROJECT_ROOT } from '../config.js'
 import { writeIconFiles } from './icon.js'
@@ -186,6 +186,8 @@ export async function buildInstaller({ rootDir = PROJECT_ROOT, distDir } = {}) {
     { absolute: clientExe, relative: CLIENT_EXE_NAME },
     { absolute: wfpExe, relative: WFP_EXE_NAME },
     { absolute: icons.ico, relative: join('.ccgait', 'ccgait.ico').replace(/\\/g, '/') },
+    // 带内容哈希的副本：快捷方式指向它，图标一改路径就变，绕开 Windows 图标缓存。
+    { absolute: icons.versionedIco, relative: join('.ccgait', basename(icons.versionedIco)).replace(/\\/g, '/') },
     { absolute: icons.png, relative: join('.ccgait', 'ccgait.png').replace(/\\/g, '/') },
   ]) {
     entries.push({ absolute: extra.absolute, relative: extra.relative.split(sep).join('/') })

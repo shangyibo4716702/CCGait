@@ -13,7 +13,7 @@ import {
   writeLastCheck,
 } from '../src/win/status.js'
 import { appWindowArgs, browserCandidates, resolveBrowser } from '../src/win/browser-window.js'
-import { buildIco, buildIconPng, renderIconRgba, writeIconFiles } from '../src/win/icon.js'
+import { buildIco, buildIconPng, buildIconSvg, ICON_SIZES, renderIconRgba, writeIconFiles } from '../src/win/icon.js'
 import { isUiServerUp, openDesktopClient, resolveNativeClient, waitForUiServer } from '../src/win/desktop.js'
 
 const tempDirs = []
@@ -134,11 +134,14 @@ describe('icon encoder', () => {
     assert.equal(png.readUInt32BE(20), 64)
   })
 
-  it('produces an ICO containing six PNG images', () => {
+  it('produces an ICO covering every size Windows actually asks for', () => {
     const ico = buildIco()
     assert.equal(ico.readUInt16LE(0), 0)
     assert.equal(ico.readUInt16LE(2), 1, 'ICO 类型应为图标')
-    assert.equal(ico.readUInt16LE(4), 6, '应包含 6 个尺寸')
+    // 缺了中间尺寸，外壳就会拿相邻尺寸缩放，任务栏那格就会发虚。
+    // 100% 缩放下任务栏要 24px —— 早先只做 16/32，正好踩中这个坑。
+    assert.deepEqual(ICON_SIZES, [16, 20, 24, 32, 40, 48, 64, 96, 128, 256])
+    assert.equal(ico.readUInt16LE(4), ICON_SIZES.length, '应包含全部尺寸')
     // 第一张图偏移应指向 PNG 签名
     const firstOffset = ico.readUInt32LE(6 + 12)
     assert.deepEqual([...ico.subarray(firstOffset + 1, firstOffset + 4)], [0x50, 0x4e, 0x47])
@@ -147,12 +150,21 @@ describe('icon encoder', () => {
   it('records the real pixel size of every ICO entry', () => {
     // 目录里写错尺寸会让外壳按错误的尺寸挑图，任务栏/通知区就会拿到被放大的糊图。
     const ico = buildIco()
-    ;[16, 32, 48, 64, 128, 256].forEach((size, index) => {
+    ICON_SIZES.forEach((size, index) => {
       const offset = 6 + 16 * index
       const encoded = size >= 256 ? 0 : size
       assert.equal(ico[offset], encoded, `${size}px 项的宽度字节`)
       assert.equal(ico[offset + 1], encoded, `${size}px 项的高度字节`)
     })
+  })
+
+  it('ships an SVG variant so the app window icon stays crisp at any DPI', () => {
+    // 任务栏图标取自页面 favicon。位图挑不到合适尺寸时会缩放，SVG 则由内核按需渲染。
+    const svg = buildIconSvg(256)
+    assert.match(svg, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/)
+    assert.match(svg, /viewBox="0 0 256 256"/)
+    assert.match(svg, /stroke="rgb\(255,255,255\)"/, '线稿必须是白色（深色底上才看得清）')
+    assert.match(svg, /M12 3l7 3v6/, '盾牌路径应与位图版一致')
   })
 
   it('draws an opaque rounded square with transparent corners', () => {

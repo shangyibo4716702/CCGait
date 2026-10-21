@@ -8,7 +8,8 @@
          会出现"新前端 + 旧后端"，字段对不上会显示错误结论，这里用来提示重载。 -->
     <meta name="ccgait-frontend-build" content="__CCGAIT_FRONTEND_BUILD__" />
     <title>CCGait · Claude 客户端环境闸门</title>
-    <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg?v=__CCGAIT_ICON_VERSION__" />
+    <link rel="icon" type="image/x-icon" href="/favicon.ico?v=__CCGAIT_ICON_VERSION__" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -16,9 +17,9 @@
       <aside class="sidebar">
         <div class="brand">
           <span class="logo" aria-hidden="true">
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-              <path d="m9 12 2 2 4-4" />
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3l7 3v6c0 4.4-2.9 7.9-7 9-4.1-1.1-7-4.6-7-9V6z" />
+              <path d="M9 12l2 2 4-4" />
             </svg>
           </span>
           <div>
@@ -100,7 +101,12 @@
               <h3>Claude 客户端现状</h3>
               <p>此刻能不能打开、能不能联网；下面同时列出最近的拦截记录。</p>
             </div>
-            <span class="panel-sub" id="access-sub"></span>
+            <div class="panel-tools">
+              <span class="panel-sub" id="access-sub"></span>
+              <button class="action primary" id="launch-desktop" type="button" title="先检测，判定通过才启动">
+                启动 Claude Desktop
+              </button>
+            </div>
           </div>
           <div class="panel-body">
             <div class="access-grid" id="access-state"></div>

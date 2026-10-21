@@ -3,7 +3,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { extname, join, normalize, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { buildIco } from '../win/icon.js'
+import { buildFaviconIco, buildIconSvg } from '../win/icon.js'
 
 /**
  * 本地 Web 客户端服务。
@@ -33,6 +33,21 @@ const SERVER_BUILD = (() => {
     return createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex').slice(0, 12)
   } catch {
     return 'unknown'
+  }
+})()
+
+/**
+ * 图标内容版本：用 ICO 字节的哈希。
+ *
+ * 为什么需要：浏览器的 favicon 缓存按 URL 存，图标换了但 URL 不变，它就继续用旧图 ——
+ * 实测出现过"换了图标、任务栏还是老样子"。把哈希写进 URL 查询串，内容一变 URL 就变，
+ * 缓存自然失效；内容没变时 URL 稳定，也不会白白多一次请求。
+ */
+const ICON_VERSION = (() => {
+  try {
+    return createHash('sha256').update(buildFaviconIco()).digest('hex').slice(0, 10)
+  } catch {
+    return '0'
   }
 })()
 
@@ -88,15 +103,32 @@ async function readJsonBody(request, limitBytes = 512 * 1024) {
 
 /** 图标只生成一次（每次请求重新编码 6 张 PNG 没必要）。 */
 let cachedIco = null
+let cachedSvg = null
 
 function sendFavicon(response) {
-  if (!cachedIco) cachedIco = buildIco()
+  if (!cachedIco) cachedIco = buildFaviconIco()
   response.writeHead(200, {
     'content-type': 'image/x-icon',
     'content-length': cachedIco.length,
     'cache-control': 'no-store',
   })
   response.end(cachedIco)
+}
+
+/**
+ * SVG 版图标：应用窗口的任务栏图标优先用它。
+ *
+ * 位图 favicon 只有固定尺寸，Edge 在 100% 缩放下要 24px、而位图里挑不到时会缩放，
+ * 结果是任务栏那格发虚。SVG 由内核按目标分辨率现渲染，任何 DPI 都清晰。
+ */
+function sendIconSvg(response) {
+  if (!cachedSvg) cachedSvg = Buffer.from(buildIconSvg(256), 'utf8')
+  response.writeHead(200, {
+    'content-type': 'image/svg+xml; charset=utf-8',
+    'content-length': cachedSvg.length,
+    'cache-control': 'no-store',
+  })
+  response.end(cachedSvg)
 }
 
 function serveStatic(response, urlPath, token) {
@@ -115,7 +147,8 @@ function serveStatic(response, urlPath, token) {
       body
         .toString('utf8')
         .replaceAll('__CCGAIT_TOKEN__', token)
-        .replaceAll('__CCGAIT_FRONTEND_BUILD__', SERVER_BUILD),
+        .replaceAll('__CCGAIT_FRONTEND_BUILD__', SERVER_BUILD)
+        .replaceAll('__CCGAIT_ICON_VERSION__', ICON_VERSION),
       'utf8',
     )
   }
@@ -164,8 +197,14 @@ export function createUiServer({ session, logger, token = randomBytes(24).toStri
         }
         // 应用窗口是 Edge/Chrome 的 APP 模式承载的：任务栏那一格的图标取自**页面图标**。
         // 不提供 favicon 的话，任务栏按钮就落回一个空的默认图标（实测就是"没有图标"）。
+        // 支持带查询串（/favicon.ico?v=…）：图标换了之后必须让浏览器当成新资源，
+        // 否则它会一直用 profile 里缓存的旧图（实测：换了图标、任务栏还是老样子）。
         if (path === '/favicon.ico') {
           sendFavicon(response)
+          return
+        }
+        if (path === '/icon.svg') {
+          sendIconSvg(response)
           return
         }
         serveStatic(response, path, token)
@@ -241,6 +280,11 @@ export function createUiServer({ session, logger, token = randomBytes(24).toStri
           case '/api/kill':
             sendJson(response, 200, await session.killProcesses())
             return
+          case '/api/launch': {
+            // 门控启动：内部会先跑一轮检测，判定通过才真的拉起 Claude Desktop。
+            sendJson(response, 200, await session.launchClaudeDesktop())
+            return
+          }
           case '/api/config': {
             const body = await readJsonBody(request)
             sendJson(response, 200, { config: await session.saveConfig(body.patch ?? body) })

@@ -163,7 +163,7 @@ export async function purgeWfpFilters() {
  * 启动阻断并等它就绪（解析 "READY n"）。detached=true 时用于 CLI 的长期阻断。
  * 返回 { ok, pid, blocked, output }。
  */
-export async function startWfpBlock({ paths, stateDir, detached = false, timeoutMs = 20_000 }) {
+export async function startWfpBlock({ paths, browserPaths = [], stateDir, detached = false, timeoutMs = 20_000 }) {
   const helper = resolveWfpHelper()
   if (!helper) {
     return { ok: false, error: '未找到 CCGaitWfp.exe（请先执行 ccgait build-installer 或从安装版运行）' }
@@ -186,7 +186,15 @@ export async function startWfpBlock({ paths, stateDir, detached = false, timeout
     // 忽略
   }
 
-  const child = spawn(helper, ['hold', '--stop-file', stopFile, ...paths], {
+  // --loopback-exempt 之后列出的程序：阻断外部出站但放行 127.0.0.1。
+  // 浏览器必须这样处理：CCGait 自己的界面窗口就是 Edge APP 模式，
+  // 一刀切会把界面一起打死（实测阻断后连 127.0.0.1 都返回 000）。
+  const holdArgs = ['hold', '--stop-file', stopFile, ...paths]
+  if (browserPaths.length > 0) {
+    holdArgs.push('--loopback-exempt', ...browserPaths)
+  }
+
+  const child = spawn(helper, holdArgs, {
     detached,
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],

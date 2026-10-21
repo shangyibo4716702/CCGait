@@ -24,6 +24,7 @@ import {
   listClaudeProcesses,
 } from './process-guard.js'
 import { isWfpBlocking, requestWfpStop, resolveWfpHelper, startWfpBlock, stopWfpBlock } from './win/wfp.js'
+import { browserBlockTargets, discoverDefaultBrowser } from './browser-targets.js'
 
 /**
  * 闸门执行器：周期性跑检测 → 判定 → 执行（终止进程 / 阻断网络）。
@@ -265,6 +266,49 @@ export function formatCheckReport({ egress, dns, environment, verdict }, logger)
   }
 }
 
+/**
+ * 把"为什么判拦截"压成一行可读原因。
+ *
+ * 单独抽出来有两个理由：日志、状态文件、界面都要用同一套口径（三处各写一遍必然
+ * 漂移）；而且它是纯函数，能被单元测试钉住 —— 早先这里完全没有记录，
+ * 事后只能看到"已处理 N 个进程"，查不出到底哪一项没通过。
+ */
+export function describeBlockReason(verdict, egress) {
+  const causes = (verdict?.blockedBy ?? []).map((item) => item.title).filter(Boolean)
+  if (verdict?.failedClosed && causes.length === 0) {
+    return 'failClosed：出口身份不可信（查询失败或多源矛盾），按拦截处理'
+  }
+  const head = causes.length > 0 ? causes.join('；') : '白名单未命中'
+  if (!verdict?.failedClosed) return head
+  return `${head}；failClosed：出口身份不可信`
+}
+
+/** 出口摘要：日志里必须带上当时的 IP/国家，否则无法复盘。 */
+export function describeEgress(egress) {
+  if (!egress || egress.ip === undefined) {
+    const failed = (egress?.failedSources ?? []).join('；')
+    return failed ? `出口：查询失败（${failed}）` : '出口：查询失败'
+  }
+  const bits = [`${egress.ip}`, egress.country ?? '??']
+  if (egress.hosting) bits.push('机房/代理')
+  if (egress.confident === false) bits.push('多源不一致')
+  return `出口 ${bits.join(' · ')}`
+}
+
+/**
+ * 这一轮该不该终止进程。
+ *
+ * 关键区分：`blockedBy` 非空 = 我们**确认**它违规；只有 failClosed（出口查不到、
+ * 多源矛盾）= 我们**没测出来**。后者绝不该杀进程 —— 网络抖动一次就把用户的编辑器
+ * 全关掉，是实测发生过的误杀（一轮 18 个 Claude 进程）。
+ *
+ * 抽成纯函数是为了能被单测钉住：这类判断一旦写错，代价是用户正在干活的进程没了。
+ */
+export function shouldKillProcesses(config, verdict) {
+  if (!config?.enforcement?.killProcesses) return false
+  return (verdict?.blockedBy ?? []).length > 0
+}
+
 /** 执行一轮：按判定结果终止进程 / 建立或撤掉网络阻断。 */
 export async function enforce(config, verdict, options = {}) {
   const logger = options.logger
@@ -283,6 +327,11 @@ export async function enforce(config, verdict, options = {}) {
     home: process.env.USERPROFILE,
   })
 
+  // 登录链路会打开系统默认浏览器做 OAuth：只掐 Claude 自己的进程不够，
+  // 浏览器照样上外网、那条流量同样会出去。所以浏览器纳入**网络**管控，
+  // 但永不终止它的进程（用户可能正开着几十个标签页）。
+  const browserPaths = options.browserPaths ?? []
+
   if (verdict.allow) {
     // 放行：撤掉 WFP 阻断与防火墙规则（两者都要撤，避免任一残留继续拦用户）。
     const wfpStopped = await stopWfpBlock({ stateDir })
@@ -297,7 +346,14 @@ export async function enforce(config, verdict, options = {}) {
     return result
   }
 
-  if (config.enforcement.killProcesses) {
+  // 终止进程只在「确实违规」时执行。
+  //
+  // 为什么要把 failClosed 排除在外：出口探测是走网络的，一次抖动、一个数据源超时，
+  // 就会让 confident 变成 false，进而 failClosed=true。那种情况下我们**并不知道**
+  // 用户在违规，只知道"这一轮没测出来"。据此杀进程就是误杀 —— 实测发生过：
+  // 网络抖动一轮，18 个 Claude 进程全被终止。
+  // 正确做法是"证据不足时只断网"：网络先封死（不露馅），但不动用户的进程。
+  if (shouldKillProcesses(config, verdict)) {
     const running = await listClaudeProcesses()
     if (running.length > 0) {
       const killed = await killAllClaudeProcesses()
@@ -308,25 +364,46 @@ export async function enforce(config, verdict, options = {}) {
       for (const item of killed) {
         if (item.error) result.errors.push(`终止 PID ${item.pid} 失败：${item.error}`)
       }
+      // 每条终止记录都带上"为什么被终止"：只写"已处理 N 个进程"的话，事后完全
+      // 无法区分是白名单不通过、出口查不到（failClosed），还是别的维度触发的。
       logger?.block(
         `已处理 ${killed.length} 个 Claude 进程`,
-        killed
+        `原因：${describeBlockReason(verdict)}｜${killed
           .map((item) => `${item.name}#${item.pid}${item.gone ? '（执行时已自行退出）' : ''}`)
-          .join('、'),
+          .join('、')}`,
       )
     }
+  } else if (config.enforcement.killProcesses && verdict.failedClosed) {
+    // 证据不足：只断网、不杀进程，并把这一点写清楚，免得用户以为闸门没在干活。
+    logger?.warn(
+      '证据不足，只断网不终止进程',
+      '出口身份无法确认（查询失败或多源矛盾）。已封死网络防止外泄，但不动正在运行的 Claude 进程。',
+    )
   }
-
   if (config.enforcement.blockNetwork) {
     // 第一层：WFP 内核过滤器 —— 不依赖 Windows 防火墙是否开启。
     if (resolveWfpHelper()) {
-      const wfp = await startWfpBlock({ paths: targets, stateDir, timeoutMs: 20_000 })
+      const wfp = await startWfpBlock({
+        paths: targets,
+        browserPaths,
+        stateDir,
+        timeoutMs: 20_000,
+      })
       if (wfp.ok) {
         result.wfp = { pid: wfp.pid, filters: wfp.filters ?? null }
         logger?.block(
           '已断网（WFP 内核过滤器）',
-          wfp.alreadyRunning ? '复用已在生效的过滤器' : `${wfp.filters} 条过滤器生效`,
+          wfp.alreadyRunning
+            ? '复用已在生效的过滤器'
+            : `${wfp.filters} 条过滤器生效${browserPaths.length > 0 ? `（含默认浏览器 ${browserPaths.length} 个程序，仅断外网、保留本地界面）` : ''}`,
         )
+        if (browserPaths.length > 0) {
+          result.browserBlocked = browserPaths
+          logger?.block(
+            '已管控默认浏览器网络',
+            `${browserPaths.join('、')}（只断外网，不终止浏览器进程）`,
+          )
+        }
       } else {
         result.errors.push(`WFP 阻断失败：${wfp.error}`)
       }
@@ -411,6 +488,33 @@ export function createGuard({ config, stateDir, logger, onState, onStopRequest }
   let lastFullCheckAt = 0
   let lastState = null
 
+  // 默认浏览器只解析一次：它不会在运行期间变来变去，每轮都去读注册表纯属浪费
+  // （一次 PowerShell 要几百毫秒）。解析失败的结论也缓存，避免每轮都卡一下。
+  let browserCache
+
+  const resolveBrowserTargets = async () => {
+    if (browserCache !== undefined) return browserCache
+    try {
+      const browser = await discoverDefaultBrowser()
+      if (!browser.path) {
+        logger?.warn(
+          '未找到默认浏览器，无法管控登录链路',
+          'Claude 登录会打开默认浏览器；找不到它的可执行文件时，那条流量不受本闸门管控。',
+        )
+        browserCache = []
+      } else {
+        browserCache = browserBlockTargets(browser)
+        logger?.info(
+          '默认浏览器已纳入网络管控',
+          `${browser.label ?? browser.name ?? browser.path}${browser.inferred ? '（按安装位置推断）' : ''}`,
+        )
+      }
+    } catch {
+      browserCache = []
+    }
+    return browserCache
+  }
+
   const persist = (state) => {
     lastState = state
     if (!stateDir) return
@@ -443,7 +547,14 @@ export function createGuard({ config, stateDir, logger, onState, onStopRequest }
     })
     if (targets.length === 0) return undefined
     if (!resolveWfpHelper()) return undefined
-    return startWfpBlock({ paths: targets, stateDir, timeoutMs: 20_000 })
+    // block-first 也要连浏览器一起挂上：登录窗口弹出时正好是"判定还没出结果"的
+    // 那几秒，浏览器若不在名单里，OAuth 请求就直接出去了。
+    return startWfpBlock({
+      paths: targets,
+      browserPaths: await resolveBrowserTargets(),
+      stateDir,
+      timeoutMs: 20_000,
+    })
   }
 
   /**
@@ -463,24 +574,62 @@ export function createGuard({ config, stateDir, logger, onState, onStopRequest }
     lastFullCheckAt = started
     try {
       if (config.enforcement.blockFirst && config.enforcement.blockNetwork) {
-        try {
-          const pre = await preBlock()
-          if (pre && !pre.ok) logger?.warn('先行阻断未建立', pre.error)
-        } catch (error) {
-          // 先行阻断失败不能拖住判定：判定本身还是照跑，该拦的由 enforce() 兜住。
-          logger?.warn('先行阻断失败', error instanceof Error ? error.message : String(error))
+        // 只在「当前不是已放行状态」时才先行封网。
+        //
+        // 为什么不能每轮都封：判定通过后网络是开着的，下一轮一进来又封上、检测完再撤，
+        // 等于每 10 秒给用户断一次网（实测一次约 3 秒）。表现就是"网络明明没变，
+        // 却一会儿可访问一会儿不可访问"——下载、流式输出都会被打断。
+        // 真正需要 block-first 的是「第一轮」和「上一轮判拦截」这两种情况：
+        // 那时网络本来就该是关的，先封再判不会伤害任何正在进行的连接。
+        const previouslyAllowed = lastState?.allow === true
+        if (!previouslyAllowed) {
+          try {
+            const pre = await preBlock()
+            if (pre && !pre.ok) logger?.warn('先行阻断未建立', pre.error)
+          } catch (error) {
+            // 先行阻断失败不能拖住判定：判定本身还是照跑，该拦的由 enforce() 兜住。
+            logger?.warn('先行阻断失败', error instanceof Error ? error.message : String(error))
+          }
         }
       }
       const result = await runChecks(config)
-      const enforcement = await enforce(config, result.verdict, { logger, stateDir })
+      // 每次判拦截都必须把「为什么」写进日志和状态文件，而且要写在执行动作之前：
+      // 早先只记录执行动作（已断网/已处理 N 个进程），事后翻日志根本看不出是哪一项
+      // 不通过、出口当时是多少 —— 用户看到"Claude Code 被终止很多次"却查不出原因。
+      // 顺序上先原因后动作，读日志时一眼就是"为什么 → 做了什么"。
+      if (!result.verdict.allow) {
+        const detail = [
+          describeEgress(result.egress),
+          result.verdict.failedClosed ? 'failClosed：出口身份不可信，按拦截处理' : undefined,
+          `触发：${reason}`,
+        ]
+          .filter(Boolean)
+          .join('；')
+        logger?.block(`判定拦截：${describeBlockReason(result.verdict)}`, detail)
+      }
+      const enforcement = await enforce(config, result.verdict, {
+        logger,
+        stateDir,
+        browserPaths: await resolveBrowserTargets(),
+      })
       const state = {
         guardPid: process.pid,
         updatedAt: new Date().toISOString(),
         reason,
         allow: result.verdict.allow,
         failedClosed: result.verdict.failedClosed,
-        blocked: result.verdict.blockedBy.map((item) => ({ id: item.id, title: item.title })),
-        warnings: result.verdict.warnings.map((item) => ({ id: item.id, title: item.title })),
+        // 原因写全（title + detail）：状态文件是事后复盘的主要证据，只留 title
+        // 会丢掉"白名单只允许什么、当前是什么"这类关键比对信息。
+        blocked: result.verdict.blockedBy.map((item) => ({
+          id: item.id,
+          title: item.title,
+          detail: item.detail,
+        })),
+        warnings: result.verdict.warnings.map((item) => ({
+          id: item.id,
+          title: item.title,
+          detail: item.detail,
+        })),
         egress: result.egress
           ? {
               ip: result.egress.ip,

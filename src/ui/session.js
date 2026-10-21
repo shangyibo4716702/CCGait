@@ -1,5 +1,7 @@
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { execFile, execFileSync, spawn } from 'node:child_process'
+import { promisify } from 'node:util'
 import { CONFIG_PATH, loadConfig, normalizeConfig, resolveStateDir, validateConfig } from '../config.js'
 import {
   clearGuardStartRequest,
@@ -20,6 +22,8 @@ import {
 import { claudeDiscovery, killAllClaudeProcesses, listClaudeProcesses } from '../process-guard.js'
 import { startupStatus } from '../startup.js'
 import { isWfpBlocking, listWfpHosts, readWfpPid, startWfpBlock, stopWfpBlock } from '../win/wfp.js'
+
+const promisifiedExecFile = promisify(execFile)
 
 /**
  * UI 会话层：把 CLI 已有的能力包成一组可调用的动作 + 一个事件流，供 Web 前端使用。
@@ -241,6 +245,182 @@ async function detectExternalGuard(stateDir) {
 export function createUiSession(options = {}) {
   const configPath = options.configPath ?? CONFIG_PATH
   const logger = options.logger
+/**
+ * 等待 Claude Desktop 真正出现（进程集合里出现新 PID）。
+ *
+ * 为什么不看退出码：MSIX 别名走的是外壳激活，`start` 几乎立刻返回 0，
+ * 与实际是否拉起应用无关。只有"多了新进程"才是可观测的证据。
+ */
+async function waitForNewClaudeProcess(beforeIds, { timeoutMs = 12_000, intervalMs = 500 } = {}) {
+  const deadline = Date.now() + timeoutMs
+  const { listClaudeProcesses } = await import('../process-guard.js')
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs))
+    let running = []
+    try {
+      running = await listClaudeProcesses()
+    } catch {
+      continue
+    }
+    if (running.some((item) => !beforeIds.has(item.pid))) return true
+  }
+  return false
+}
+
+/**
+ * 把 Claude Desktop 的窗口带到前台。
+ *
+ * 实测 Claude 启动后会以最小化状态缩在托盘，用户点完"启动"看不到任何变化，
+ * 会以为没启动。这里用 WScript.Shell.AppActivate 激活它的主窗口 ——
+ * 不依赖 Win32 P/Invoke，也不改应用本身任何设置。
+ */
+async function focusDesktopWindow() {
+  const script = [
+    "$p = Get-Process Claude -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1",
+    'if ($p) { $sh = New-Object -ComObject WScript.Shell; $null = $sh.AppActivate($p.Id); "FOCUSED" }',
+  ].join('; ')
+  try {
+    const { stdout } = await runPowerShellQuiet(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+    )
+    return stdout.includes('FOCUSED')
+  } catch {
+    return false
+  }
+}
+
+/** 静默跑一次 PowerShell 并取 stdout（超时 8s，输出上限 1MB）。 */
+function runPowerShellQuiet(file, args) {
+  return promisifiedExecFile(file, args, { windowsHide: true, timeout: 8000, maxBuffer: 1024 * 1024 })
+}
+
+/**
+ * 找出 Claude Desktop 的启动入口。
+ *
+ * 为什么优先用 MSIX 别名而不是包目录里的 claude.exe：MSIX 应用的 exe 直接双击会被
+ * 系统权限挡住，正常启动入口是 `%LOCALAPPDATA%\Microsoft\WindowsApps\claude-desktop.exe`
+ * 这个别名（由 AppX 安装时注册，走的是正常激活路径）。
+ *
+ * 注意别用 existsSync 判断别名：它会**跟随符号链接**去访问 WindowsApps 里受保护的
+ * 目标，结果是 false —— 别名明明存在却被判成"没装"。这里用 lstatSync，只看别名本身。
+ *
+ * 找不到别名时退回已发现的桌面版可执行文件：能启动就行，不追求"最漂亮"的入口。
+ */
+function resolveDesktopTarget() {
+  const localAppData = process.env.LOCALAPPDATA ?? ''
+  const aliasDir = join(localAppData, 'Microsoft', 'WindowsApps')
+  const candidateNames = ['claude-desktop.exe', 'claude.exe', 'Claude.exe']
+  for (const name of candidateNames) {
+    const alias = join(aliasDir, name)
+    try {
+      // lstat：只验证这个再解析点存在，不去读受保护的目标。
+      if (lstatSync(alias)) return { path: alias, label: 'MSIX 别名' }
+    } catch {
+      // 不存在或不可读：继续看下一个候选。
+    }
+  }
+
+  const discovery = claudeDiscovery({
+    localAppData,
+    appData: process.env.APPDATA,
+    home: process.env.USERPROFILE,
+  })
+  const desktop = discovery.entries.filter((entry) => entry.kind === 'desktop')
+  // 优先纯 claude.exe（主程序），而不是 cowork-svc / ssh-proxy 这类辅助进程。
+  const main =
+    desktop.find((entry) => /\\claude\.exe$/i.test(entry.path)) ??
+    desktop.find((entry) => /claude-desktop\.exe$/i.test(entry.path)) ??
+    desktop[0]
+  if (!main) return undefined
+  return { path: main.path, label: main.label }
+}
+
+/** 给子进程注入分流代理（仅当配置开启）。与 CLI 的 run 命令保持一致。 */
+function proxyEnvFor(config) {
+  if (!config?.network?.proxy?.enabled || !config.network.proxy.url) return {}
+  const url = config.network.proxy.url
+  return {
+    HTTPS_PROXY: url,
+    HTTP_PROXY: url,
+    ALL_PROXY: url,
+    https_proxy: url,
+    http_proxy: url,
+    all_proxy: url,
+    NO_PROXY: '',
+  }
+}
+
+/**
+ * 真正把 Claude Desktop 拉起来。
+ *
+ * MSIX 版不能直接 CreateProcess：`WindowsApps\claude-desktop.exe` 是应用执行别名
+ * （一个再解析点），直接 spawn 会得到 `EPERM`。
+ *
+ * 也不能用 `cmd /c start "" "<别名>"`：实测它**立即返回成功但什么也没启动**，
+ * 于是按钮显示"已启动"而 Claude 根本没运行（用户实测报过这一点）。
+ *
+ * 正确做法是走 UWP 的标准激活路径 `shell:AppsFolder\<包族名>!<应用ID>`，
+ * 交给 explorer 执行 —— 实测能稳定拉起 11 个进程。找不到 AUMID 时退回
+ * PowerShell 的 Start-Process（同样经过 ShellExecute）。
+ */
+function launchDesktopProcess(target, env) {
+  const isAlias = /[\\/]Microsoft[\\/]WindowsApps[\\/]/i.test(target.path)
+  if (isAlias) {
+    const aumid = resolveAppUserModelId()
+    if (aumid) {
+      const child = spawn('explorer.exe', [`shell:AppsFolder\\${aumid}`], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+        env,
+      })
+      child.unref()
+      return child.pid
+    }
+    const escaped = target.path.replace(/'/g, "''")
+    const child = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', `Start-Process -FilePath '${escaped}'`],
+      { detached: true, stdio: 'ignore', windowsHide: true, env },
+    )
+    child.unref()
+    return child.pid
+  }
+  const child = spawn(target.path, [], {
+    env,
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: false,
+  })
+  child.unref()
+  return child.pid
+}
+
+let cachedAumid
+
+/**
+ * 解析 Claude Desktop 的 AppUserModelId（形如 Claude_xxx!Claude）。
+ *
+ * 从开始菜单条目里读，而不是拼一个写死的值 —— 包族名会随安装来源/版本变化。
+ * 读一次就缓存：它不会在运行期间改变。
+ */
+function resolveAppUserModelId() {
+  if (cachedAumid !== undefined) return cachedAumid
+  try {
+    const out = execFileSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command',
+        "(Get-StartApps | Where-Object { $_.Name -eq 'Claude' } | Select-Object -First 1).AppID"],
+      { encoding: 'utf8', timeout: 15000, windowsHide: true },
+    ).trim()
+    cachedAumid = /^[^\s!]+![^\s]+$/.test(out) ? out : undefined
+  } catch {
+    cachedAumid = undefined
+  }
+  return cachedAumid
+}
+
   const deps = {
     runChecks: options.deps?.runChecks ?? runChecks,
     createGuard: options.deps?.createGuard ?? createGuard,
@@ -259,6 +439,14 @@ export function createUiSession(options = {}) {
     readWfpPid: options.deps?.readWfpPid ?? readWfpPid,
     startWfpBlock: options.deps?.startWfpBlock ?? startWfpBlock,
     stopWfpBlock: options.deps?.stopWfpBlock ?? stopWfpBlock,
+    // 真正"拉起 Claude Desktop"这一步：单独可注入，测试才能验证门控逻辑
+    // 而不在开发机上真的弹出应用。
+    launchDesktop: options.deps?.launchDesktop ?? launchDesktopProcess,
+    resolveDesktopTarget: options.deps?.resolveDesktopTarget ?? resolveDesktopTarget,
+    // 启动后的"进程真的出现了吗"验证：同样可注入，否则测试会依赖本机真实进程状态。
+    waitForDesktopProcess:
+      options.deps?.waitForDesktopProcess ?? ((beforeIds) => waitForNewClaudeProcess(beforeIds)),
+    focusDesktopWindow: options.deps?.focusDesktopWindow ?? focusDesktopWindow,
   }
 
   const listeners = new Set()
@@ -411,38 +599,45 @@ export function createUiSession(options = {}) {
     }
   }
 
-  /** 跑一轮完整检测并广播。 */
-  const checkNow = () =>
-    serialize(async () => {
-      try {
-        const result = await deps.runChecks(getConfig())
-        lastCheck = {
-          at: nowIso(),
-          allow: result.verdict.allow,
-          failedClosed: result.verdict.failedClosed,
-          blocked: result.verdict.blockedBy.map((item) => ({ id: item.id, title: item.title, detail: item.detail })),
-          warnings: result.verdict.warnings.map((item) => ({ id: item.id, title: item.title, detail: item.detail })),
-          // 白名单原文：界面要拿它把"为什么通过/不通过"显示成可比对的一行，
-          // 而不是只给一个孤零零的 GB 让人猜。
-          whitelist: result.verdict.whitelistSummary,
-          egress: result.egress,
-          dns: result.dns,
-          environment: result.environment,
-        }
-        lastError = undefined
-        pushLog(
-          result.verdict.allow ? 'ok' : 'block',
-          result.verdict.allow ? '检测通过：环境命中白名单' : '检测未通过',
-          result.verdict.blockedBy.map((item) => item.title).join('；') || undefined,
-        )
-        emit({ type: 'check', check: lastCheck })
-        return lastCheck
-      } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error)
-        pushLog('error', '检测失败', lastError)
-        throw error
+  /**
+   * 跑一轮完整检测并广播。
+   *
+   * 拆成 Internal + 外层排队：门控启动（launchClaudeDesktop）本身已经在队列里执行，
+   * 再调 checkNow 就会等一个由自己占用的队列 —— 直接死锁（实测：点按钮后界面一直
+   * 停在"检测中…"，进程永不返回）。所有"在队列里还要检测"的场景都必须走 Internal。
+   */
+  const checkInternal = async () => {
+    try {
+      const result = await deps.runChecks(getConfig())
+      lastCheck = {
+        at: nowIso(),
+        allow: result.verdict.allow,
+        failedClosed: result.verdict.failedClosed,
+        blocked: result.verdict.blockedBy.map((item) => ({ id: item.id, title: item.title, detail: item.detail })),
+        warnings: result.verdict.warnings.map((item) => ({ id: item.id, title: item.title, detail: item.detail })),
+        // 白名单原文：界面要拿它把"为什么通过/不通过"显示成可比对的一行，
+        // 而不是只给一个孤零零的 GB 让人猜。
+        whitelist: result.verdict.whitelistSummary,
+        egress: result.egress,
+        dns: result.dns,
+        environment: result.environment,
       }
-    })
+      lastError = undefined
+      pushLog(
+        result.verdict.allow ? 'ok' : 'block',
+        result.verdict.allow ? '检测通过：环境命中白名单' : '检测未通过',
+        result.verdict.blockedBy.map((item) => item.title).join('；') || undefined,
+      )
+      emit({ type: 'check', check: lastCheck })
+      return lastCheck
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error)
+      pushLog('error', '检测失败', lastError)
+      throw error
+    }
+  }
+
+  const checkNow = () => serialize(checkInternal)
 
   /**
    * 闸门启停有两层：Internal 是真正的动作，外层 serialize 负责排队。
@@ -551,6 +746,68 @@ export function createUiSession(options = {}) {
       return { killed }
     })
 
+  /**
+   * 门控启动 Claude Desktop：**先检测，判定通过才启动**。
+   *
+   * 为什么需要这条路径：直接双击 Claude 图标是绕过闸门的 —— 闸门只能事后终止它，
+   * 而"启动那一下"的请求已经发出去了。从界面启动则不同：这一次启动有明确的判定作前提。
+   *
+   * 拒绝时不抛异常，返回结构化原因，界面据此把"为什么不让开"直接显示出来。
+   */
+  const launchClaudeDesktop = () =>
+    serialize(async () => {
+      const config = getConfig()
+      // 必须用 Internal：本函数已在串行队列里，再走 checkNow 会等自己占用的队列（死锁）。
+      const check = await checkInternal()
+      if (!check.allow) {
+        const reasons = (check.blocked ?? []).map((item) => item.title)
+        const reason =
+          reasons.join('；') || (check.failedClosed ? '出口身份无法确认（failClosed）' : '白名单未命中')
+        pushLog('block', '已拒绝启动 Claude Desktop', reason)
+        emit({ type: 'status' })
+        return { launched: false, reason, allow: false, check }
+      }
+
+      const target = deps.resolveDesktopTarget()
+      if (!target) {
+        const reason = '找不到 Claude Desktop 的可执行文件'
+        pushLog('error', reason, '已发现的可执行文件里没有桌面版入口；请确认已安装 Claude Desktop。')
+        emit({ type: 'status' })
+        return { launched: false, reason, allow: true, check }
+      }
+
+      try {
+        const before = await deps.listClaudeProcesses()
+        const beforeIds = new Set(before.map((item) => item.pid))
+        const pid = deps.launchDesktop(target, proxyEnvFor(config))
+
+        // 拉起进程不能只看"命令没报错"。
+        // `cmd /c start` 对 MSIX 别名是立即返回成功的 —— 应用可能根本没起来，
+        // 早先就是这么报了个假成功（用户点完按钮，Claude Desktop 实际没运行）。
+        // 这里等真实进程出现，再决定报成功还是失败。
+        const started = await deps.waitForDesktopProcess(beforeIds)
+        if (!started) {
+          const reason = '启动命令已执行，但 12 秒内没有检测到 Claude Desktop 进程'
+          pushLog('error', 'Claude Desktop 未能启动', `${target.path}；请手动启动一次确认程序本身可用`)
+          emit({ type: 'status' })
+          return { launched: false, reason, allow: true, check }
+        }
+
+        // 窗口可能以最小化状态出现（实测：Claude 会缩到托盘），把它带回前台，
+        // 否则用户点完按钮"什么都没发生"。
+        const focused = await deps.focusDesktopWindow()
+        pushLog('ok', '已启动 Claude Desktop', focused ? target.path : `${target.path}（窗口未能置前，请在任务栏切换）`)
+        lastEnforcement = { at: nowIso(), kind: 'launch-desktop', pid }
+        emit({ type: 'status' })
+        return { launched: true, pid, path: target.path, focused, allow: true, check }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        pushLog('error', '启动 Claude Desktop 失败', message)
+        emit({ type: 'status' })
+        return { launched: false, reason: message, allow: true, check }
+      }
+    })
+
   const enableFirewallProfiles = () =>
     serialize(async () => {
       const result = await deps.enableProfiles()
@@ -613,6 +870,7 @@ export function createUiSession(options = {}) {
     stopGuard,
     setFirewall,
     killProcesses,
+    launchClaudeDesktop,
     enableFirewallProfiles,
     saveConfig,
     reloadConfig,

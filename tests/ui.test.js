@@ -178,7 +178,32 @@ describe('ui server', () => {
       assert.equal(response.status, 200)
       assert.match(response.headers.get('content-type') ?? '', /icon/)
       const bytes = Buffer.from(await response.arrayBuffer())
-      assert.deepEqual([...bytes.subarray(0, 6)], [0, 0, 1, 0, 6, 0], '应当是包含 6 个尺寸的 ICO')
+      assert.deepEqual([...bytes.subarray(0, 4)], [0, 0, 1, 0], 'ICO 头')
+      // 任务栏在 100% 缩放下显示 24px。favicon 里给 16 的话，Chromium 会把 16px
+      // 交给窗口、Windows 再放大到 24 —— 放大必然发糊。所以这里必须**没有 16**，
+      // 并且要从 32/48 缩小，缩小才是清晰的。
+      const count = bytes.readUInt16LE(4)
+      const sizes = []
+      for (let index = 0; index < count; index += 1) {
+        let width = bytes[6 + 16 * index]
+        if (width === 0) width = 256
+        sizes.push(width)
+      }
+      assert.ok(sizes.length > 0, 'favicon 至少要有一档')
+      assert.equal(sizes.includes(16), false, '不能提供 16px（任务栏会把它放大成 24）')
+      assert.ok(sizes.some((size) => size >= 32), '必须提供 32px 或更大，让系统缩小使用')
+    })
+  })
+
+  it('serves an SVG icon for crisp taskbar rendering at any DPI', async () => {
+    // 位图挑不到合适尺寸时会被缩放，SVG 由内核按需渲染，任何缩放比例都清晰。
+    await withServer(async ({ base }) => {
+      const response = await fetch(`${base}/icon.svg`)
+      assert.equal(response.status, 200)
+      assert.match(response.headers.get('content-type') ?? '', /svg/)
+      const text = await response.text()
+      assert.match(text, /^<svg /)
+      assert.match(text, /M12 3l7 3v6/, '盾牌路径要与位图版一致')
     })
   })
 
@@ -245,6 +270,121 @@ describe('ui server', () => {
       assert.ok(calls.includes('guard.start'))
       assert.ok(calls.includes('guard.stop'))
     })
+  })
+
+  it('launches Claude Desktop only after a passing check', async () => {
+    // 这是产品约定的核心：从界面启动必须"先判定、后启动"。
+    // 直接双击图标绕过闸门，而这条路径不能有同样的漏洞。
+    const { path } = tempConfig()
+    const launched = []
+    const deps = fakeDeps()
+    const session = createUiSession({
+      configPath: path,
+      deps: {
+        ...deps.deps,
+        resolveDesktopTarget: () => ({ path: 'C:\\fake\\Claude.exe', label: 'test' }),
+        launchDesktop: (target) => {
+          launched.push(target.path)
+          return 4242
+        },
+        // 注入"进程真的起来了"的结果：不依赖本机是否装着 Claude。
+        waitForDesktopProcess: async () => true,
+        focusDesktopWindow: async () => true,
+      },
+    })
+    try {
+      const result = await session.launchClaudeDesktop()
+      assert.equal(result.launched, true)
+      assert.equal(result.pid, 4242)
+      assert.deepEqual(launched, ['C:\\fake\\Claude.exe'], '判定通过时应真的拉起进程')
+    } finally {
+      await session.dispose()
+    }
+  })
+
+  it('refuses to launch when the check fails, and says why', async () => {
+    const { path } = tempConfig()
+    const launched = []
+    const deps = fakeDeps({
+      runChecks: async () => ({
+        verdict: {
+          allow: false,
+          failedClosed: false,
+          blockedBy: [{ id: 'egress-country', title: '出口国家不在白名单：CN', detail: '当前 CN' }],
+          warnings: [],
+        },
+        egress: { ip: '36.161.21.75', country: 'CN', confident: true },
+        dns: undefined,
+        environment: {},
+      }),
+    })
+    const session = createUiSession({
+      configPath: path,
+      deps: {
+        ...deps.deps,
+        resolveDesktopTarget: () => ({ path: 'C:\\fake\\Claude.exe' }),
+        launchDesktop: (target) => {
+          launched.push(target.path)
+          return 1
+        },
+      },
+    })
+    try {
+      const result = await session.launchClaudeDesktop()
+      assert.equal(result.launched, false)
+      assert.equal(result.allow, false)
+      assert.match(result.reason, /出口国家不在白名单：CN/)
+      assert.deepEqual(launched, [], '判定不通过时绝不能启动')
+    } finally {
+      await session.dispose()
+    }
+  })
+
+  it('does not launch when no Claude Desktop target can be found', async () => {
+    const { path } = tempConfig()
+    const deps = fakeDeps()
+    const session = createUiSession({
+      configPath: path,
+      deps: {
+        ...deps.deps,
+        resolveDesktopTarget: () => undefined,
+        launchDesktop: () => {
+          throw new Error('should not be called')
+        },
+      },
+    })
+    try {
+      const result = await session.launchClaudeDesktop()
+      assert.equal(result.launched, false)
+      assert.equal(result.allow, true, '判定本身是通过的，只是找不到入口')
+      assert.match(result.reason, /找不到 Claude Desktop/)
+    } finally {
+      await session.dispose()
+    }
+  })
+
+  it('reports failure when the launch command runs but no process appears', async () => {
+    // 真实踩过的坑：MSIX 别名走外壳激活，`start` 立即返回成功，
+    // 但应用可能根本没起来。只信"命令没报错"就会报假成功。
+    const { path } = tempConfig()
+    const deps = fakeDeps()
+    const session = createUiSession({
+      configPath: path,
+      deps: {
+        ...deps.deps,
+        resolveDesktopTarget: () => ({ path: 'C:\\fake\\Claude.exe' }),
+        launchDesktop: () => 1,
+        waitForDesktopProcess: async () => false,
+        focusDesktopWindow: async () => false,
+      },
+    })
+    try {
+      const result = await session.launchClaudeDesktop()
+      assert.equal(result.launched, false, '没有新进程就不能报成功')
+      assert.match(result.reason, /没有检测到/)
+    } finally {
+      await session.dispose()
+    }
   })
 
   it('saves a config patch and rejects one that would break the whitelist', async () => {

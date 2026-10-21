@@ -298,6 +298,35 @@ namespace CcgaitSetup
     internal static class Installer
     {
         /// <summary>
+        /// 快捷方式要用的图标路径。
+        ///
+        /// 优先用**带内容哈希**的那份（ccgait-&lt;hash&gt;.ico）：Windows 的图标缓存按路径索引，
+        /// 同一个路径换了内容它不一定重读 —— 实测升级后桌面快捷方式还是旧图标。
+        /// 文件名带哈希，图标一变路径就变，缓存必然失效。没有版本化文件时退回固定名。
+        /// </summary>
+        internal static string ResolveIconPath()
+        {
+            string stateDir = Path.Combine(Program.InstallDir, ".ccgait");
+            try
+            {
+                if (Directory.Exists(stateDir))
+                {
+                    string[] versioned = Directory.GetFiles(stateDir, "ccgait-*.ico");
+                    if (versioned.Length > 0)
+                    {
+                        Array.Sort(versioned, StringComparer.OrdinalIgnoreCase);
+                        return versioned[versioned.Length - 1];
+                    }
+                }
+            }
+            catch
+            {
+                // 读不到目录就用固定名兜底。
+            }
+            return Path.Combine(stateDir, "ccgait.ico");
+        }
+
+        /// <summary>
         /// 找出正在从安装目录运行的本程序进程（托盘、WFP 阻断宿主）。
         ///
         /// 为什么必须处理：WFP 宿主 `CCGaitWfp.exe` 常驻期间会锁住自己的 exe，
@@ -504,7 +533,7 @@ namespace CcgaitSetup
 
             // 首次运行生成图标与状态目录（客户端 exe 也会做，这里提前保证快捷方式有图标）。
             string clientExe = Path.Combine(Program.InstallDir, "CCGaitClient.exe");
-            string iconPath = Path.Combine(Program.InstallDir, ".ccgait", "ccgait.ico");
+            string iconPath = ResolveIconPath();
             if (!Directory.Exists(Path.Combine(Program.InstallDir, ".ccgait")))
             {
                 Directory.CreateDirectory(Path.Combine(Program.InstallDir, ".ccgait"));
@@ -521,6 +550,7 @@ namespace CcgaitSetup
                     }
                     catch { }
                 }
+                iconPath = ResolveIconPath();
             }
 
             string startMenu = Program.StartMenuLink;

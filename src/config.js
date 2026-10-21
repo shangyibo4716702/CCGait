@@ -75,7 +75,13 @@ export const DEFAULT_CONFIG = {
     enableFirewallProfiles: true,
     failClosed: true,
     pollIntervalMs: 2000,
-    recheckIntervalMs: 30000,
+    // 复检周期。这不是"额外安全网"，而是漏洞窗口的直接决定因素：
+    // 判定通过后过滤器会被撤掉，撤掉之后到下一轮复检发现异常之前，客户端是完全放行的。
+    // 30 秒 = 最多 30 秒的违规流量可能漏出去。
+    // 压到 10 秒能把窗口缩到 10 秒；代价是探测流量从约 55MB/小时升到约 165MB/小时
+    // （实测一轮约 466KB：出口 4 源 HTTPS + Claude DNS + DNS 服务器探测）。
+    // 想进一步收紧请用 --proxy 或固定 IP 白名单，别盲目压这个值。
+    recheckIntervalMs: 10000,
   },
   network: {
     proxy: { enabled: false, url: '', required: false },
@@ -164,7 +170,7 @@ export function normalizeConfig(input = {}) {
       enableFirewallProfiles: asBoolean(enforcement.enableFirewallProfiles, true),
       failClosed: asBoolean(enforcement.failClosed, true),
       pollIntervalMs: asPositiveInt(enforcement.pollIntervalMs, 2000, 500),
-      recheckIntervalMs: asPositiveInt(enforcement.recheckIntervalMs, 30000, 5000),
+      recheckIntervalMs: asPositiveInt(enforcement.recheckIntervalMs, 10000, 5000),
     },
     network: {
       proxy: {

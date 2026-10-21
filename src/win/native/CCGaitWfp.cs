@@ -29,6 +29,9 @@ namespace CcgaitWfp
         private const uint FWP_ACTION_BLOCK = 0x00001001;
         private const uint FWP_MATCH_EQUAL = 0;
         private const uint FWP_BYTE_BLOB_TYPE = 12;
+        // FWP_DATA_TYPE：FWP_V4_ADDR_MASK 不是顺序值，等于 FWP_SINGLE_DATA_TYPE_MAX(0xff) + 1。
+        private const uint FWP_V4_ADDR_MASK_TYPE = 0x100;
+        private const uint FWP_MATCH_NOT_EQUAL = 10;
         private const uint RPC_C_AUTHN_WINNT = 10;
         private const uint RPC_C_AUTHZ_NONE = 0;
         // 会话级作用域：会话结束（含进程被硬杀）时，本会话加的对象由 BFE 自动清理。
@@ -38,6 +41,9 @@ namespace CcgaitWfp
         private static readonly Guid LayerAleAuthConnectV4 = new Guid("c38d57d1-05a7-4c33-904f-7fbceee60e82");
         private static readonly Guid LayerAleAuthConnectV6 = new Guid("4a72393b-319f-44bc-84c3-ba54dcb3b6b4");
         private static readonly Guid ConditionAleAppId = new Guid("d78e1e87-8644-4ea5-9437-d809ecefc971");
+        // 远端地址条件。实测：ALE_AUTH_CONNECT_V4 接受通用 GUID，传 _V4 变体会返回
+        // FWP_E_CONDITION_NOT_FOUND(0x80320002)。详见 .ccgait 下的验证记录。
+        private static readonly Guid ConditionIpRemoteAddress = new Guid("b235ae9a-1d64-49b8-a44c-5ff3d9095045");
         private static readonly Guid SubLayerKey = new Guid("9e3b1b0a-2c4d-4f8e-9a11-5c7d3f2b8e01");
 
         // FWPM_FILTER0（x64）字段偏移。取值依据本机 SDK 的 shared\fwpmtypes.h：
@@ -119,9 +125,22 @@ namespace CcgaitWfp
         /// <summary>
         /// FWPM_FILTER0：手工按 x64 自然对齐写前导字段（filterKey…action）。
         /// 尾部（context/filterId/effectiveWeight）保持全零，Add 只读它认识的字段。
+        ///
+        /// excludeLoopback=true 时追加条件「远端地址 != 127.0.0.1」。
+        /// 这是给浏览器用的：浏览器同时承载 CCGait 界面（APP 模式，访问 127.0.0.1），
+        /// 一刀切全封会把界面一起打死（实测：阻断程序后连 127.0.0.1 都返回 000）。
+        /// 加了这个条件，浏览器上不了外网、但本地界面照常。
         /// </summary>
-        private static IntPtr BuildFilter(Guid layerKey, IntPtr appIdBlob, out IntPtr conditionBuffer)
+        private static IntPtr BuildFilter(Guid layerKey, IntPtr appIdBlob, bool excludeLoopback,
+            out IntPtr conditionBuffer, out IntPtr addrMaskBuffer)
         {
+            bool hasIpCondition = excludeLoopback;
+            int conditionCount = hasIpCondition ? 2 : 1;
+            // FWPM_FILTER_CONDITION0 是 40 字节：fieldKey(0..16) matchType(16) 填充(20)
+            // conditionValue.type(24) 填充(28) conditionValue.union(32..40)。
+            const int ConditionStride = 40;
+            int conditionBytes = ConditionStride * conditionCount;
+
             IntPtr filter = Marshal.AllocHGlobal(256);
             for (int offset = 0; offset < 256; offset += 8) Marshal.WriteInt64(filter, offset, 0);
 
@@ -136,24 +155,39 @@ namespace CcgaitWfp
             Marshal.Copy(SubLayerKey.ToByteArray(), 0, filter + 80, 16);        // subLayerKey
             Marshal.WriteInt32(filter, 96, 0);                                  // weight.type = FWP_EMPTY
             Marshal.WriteIntPtr(filter, 104, IntPtr.Zero);
-            Marshal.WriteInt32(filter, 112, 1);                                 // numFilterConditions
+            Marshal.WriteInt32(filter, 112, conditionCount);                    // numFilterConditions
             Marshal.WriteIntPtr(filter, 120, IntPtr.Zero);                      // 稍后回填
             Marshal.WriteInt32(filter, 128, unchecked((int)FWP_ACTION_BLOCK));  // action.type
 
-            // 条件数组：ALE_APP_ID == <我们的程序>（一个条件一项）
-            conditionBuffer = Marshal.AllocHGlobal(64);
-            for (int offset = 0; offset < 64; offset += 8) Marshal.WriteInt64(conditionBuffer, offset, 0);
+            conditionBuffer = Marshal.AllocHGlobal(conditionBytes);
+            for (int offset = 0; offset < conditionBytes; offset += 8) Marshal.WriteInt64(conditionBuffer, offset, 0);
+            addrMaskBuffer = IntPtr.Zero;
+
+            // 条件 1：ALE_APP_ID == <我们的程序>
             Marshal.Copy(ConditionAleAppId.ToByteArray(), 0, conditionBuffer, 16);
             Marshal.WriteInt32(conditionBuffer, 16, unchecked((int)FWP_MATCH_EQUAL));
-            Marshal.WriteInt32(conditionBuffer, 20, 0);                          // 对齐填充
             Marshal.WriteInt32(conditionBuffer, 24, unchecked((int)FWP_BYTE_BLOB_TYPE));
             Marshal.WriteIntPtr(conditionBuffer, 32, appIdBlob);
+
+            if (hasIpCondition)
+            {
+                // 条件 2：远端地址 != 127.0.0.1（放行本地回环，其余照拦）
+                IntPtr second = conditionBuffer + ConditionStride;
+                Marshal.Copy(ConditionIpRemoteAddress.ToByteArray(), 0, second, 16);
+                Marshal.WriteInt32(second, 16, unchecked((int)FWP_MATCH_NOT_EQUAL));
+                Marshal.WriteInt32(second, 24, unchecked((int)FWP_V4_ADDR_MASK_TYPE));
+                addrMaskBuffer = Marshal.AllocHGlobal(8);
+                Marshal.WriteInt32(addrMaskBuffer, 0, unchecked((int)0x7F000001)); // 127.0.0.1
+                Marshal.WriteInt32(addrMaskBuffer, 4, unchecked((int)0xFFFFFFFF)); // 精确匹配
+                Marshal.WriteIntPtr(second, 32, addrMaskBuffer);
+            }
+
             Marshal.WriteIntPtr(filter, 120, conditionBuffer);
             return filter;
         }
 
         /// <summary>给一个程序加 V4/V6 两条阻断过滤器，返回过滤器 id 列表。</summary>
-        private static System.Collections.Generic.List<ulong> AddFilters(IntPtr engine, string exePath)
+        private static System.Collections.Generic.List<ulong> AddFilters(IntPtr engine, string exePath, bool excludeLoopback = false)
         {
             var ids = new System.Collections.Generic.List<ulong>();
             IntPtr appId;
@@ -170,7 +204,11 @@ namespace CcgaitWfp
                 foreach (Guid layer in new[] { LayerAleAuthConnectV4, LayerAleAuthConnectV6 })
                 {
                     IntPtr conditionBuffer;
-                    IntPtr filter = BuildFilter(layer, appId, out conditionBuffer);
+                    IntPtr addrMaskBuffer;
+                    // IPv6 层不能配 FWP_V4_ADDR_MASK（实测报 FWP_E_TYPE_MISMATCH 0x80320027，
+                    // 整条过滤器建不起来，连程序级阻断都会失效），所以 V6 一律全封。
+                    bool layerExcludeLoopback = excludeLoopback && layer == LayerAleAuthConnectV4;
+                    IntPtr filter = BuildFilter(layer, appId, layerExcludeLoopback, out conditionBuffer, out addrMaskBuffer);
                     ulong filterId;
                     try
                     {
@@ -197,6 +235,7 @@ namespace CcgaitWfp
                     {
                         Marshal.FreeHGlobal(filter);
                         Marshal.FreeHGlobal(conditionBuffer);
+                        if (addrMaskBuffer != IntPtr.Zero) Marshal.FreeHGlobal(addrMaskBuffer);
                     }
                 }
             }
@@ -522,7 +561,11 @@ namespace CcgaitWfp
             // 为什么不用 stdin：以 detached 方式启动时 stdin 是 NUL，ReadLine() 立刻返回
             // null，会导致过滤器刚挂上就随进程退出而消失（实测踩过）。
             string stopFile = null;
-            var paths = new System.Collections.Generic.List<string>();
+            // --loopback-exempt <exe...> 之前的部分按"全封"处理；
+            // 这个开关之后列出的路径，阻断时放行 127.0.0.1（给浏览器用）。
+            bool loopbackExempt = false;
+            var plainPaths = new System.Collections.Generic.List<string>();
+            var exemptPaths = new System.Collections.Generic.List<string>();
             for (int index = 1; index < args.Length; index++)
             {
                 if (args[index] == "--stop-file" && index + 1 < args.Length)
@@ -531,12 +574,20 @@ namespace CcgaitWfp
                     index++;
                     continue;
                 }
-                paths.Add(args[index]);
+                if (args[index] == "--loopback-exempt")
+                {
+                    loopbackExempt = true;
+                    continue;
+                }
+                if (loopbackExempt) exemptPaths.Add(args[index]);
+                else plainPaths.Add(args[index]);
             }
 
             IntPtr engine = OpenEngine();
             var allIds = new System.Collections.Generic.List<ulong>();
-            foreach (string candidate in paths)
+            var plainValid = new System.Collections.Generic.List<string>();
+            var exemptValid = new System.Collections.Generic.List<string>();
+            foreach (string candidate in plainPaths)
             {
                 string exePath = Path.GetFullPath(candidate);
                 if (!File.Exists(exePath))
@@ -544,9 +595,47 @@ namespace CcgaitWfp
                     Console.WriteLine("SKIP " + exePath + "（文件不存在）");
                     continue;
                 }
-                System.Collections.Generic.List<ulong> ids = AddFilters(engine, exePath);
-                allIds.AddRange(ids);
-                Console.WriteLine("BLOCKED " + exePath + " (" + ids.Count + " filters)");
+                plainValid.Add(exePath);
+            }
+            foreach (string candidate in exemptPaths)
+            {
+                string exePath = Path.GetFullPath(candidate);
+                if (!File.Exists(exePath))
+                {
+                    Console.WriteLine("SKIP " + exePath + "（文件不存在）");
+                    continue;
+                }
+                exemptValid.Add(exePath);
+            }
+
+            // Claude 客户端：全封（它们不需要访问本地服务）。
+            foreach (string exePath in plainValid)
+            {
+                try
+                {
+                    System.Collections.Generic.List<ulong> ids = AddFilters(engine, exePath, false);
+                    allIds.AddRange(ids);
+                    Console.WriteLine("BLOCKED " + exePath + " (" + ids.Count + " filters)");
+                }
+                catch (Exception addError)
+                {
+                    Console.WriteLine("FAIL " + exePath + " " + addError.Message);
+                }
+            }
+            // 浏览器：只封外网、放行 127.0.0.1 —— 否则 CCGait 自己的界面窗口
+            // （Edge APP 模式）会被一起打死，用户连状态都看不到。
+            foreach (string exePath in exemptValid)
+            {
+                try
+                {
+                    System.Collections.Generic.List<ulong> ids = AddFilters(engine, exePath, true);
+                    allIds.AddRange(ids);
+                    Console.WriteLine("BLOCKED-EXT " + exePath + " (" + ids.Count + " filters)");
+                }
+                catch (Exception addError)
+                {
+                    Console.WriteLine("FAIL " + exePath + " " + addError.Message);
+                }
             }
             Console.WriteLine("READY " + allIds.Count);
             Console.Out.Flush();

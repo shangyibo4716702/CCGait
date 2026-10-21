@@ -408,6 +408,19 @@ function renderClaudeAccess() {
   sub.textContent = status.guard.running ? '闸门运行中 · 实时更新' : '闸门未运行 · 仅显示阻断状态'
   host.replaceChildren()
 
+  // 启动按钮要如实反映"现在点下去会怎样"：判定不通过时置灰并写明原因，
+  // 而不是让用户点了才被拒。
+  const launchButton = document.querySelector('#launch-desktop')
+  if (launchButton) {
+    const blocked = access.launchState === 'deny'
+    launchButton.disabled = blocked
+    launchButton.title = blocked
+      ? `当前判定不通过，启动会被拒绝：${access.launchReason ?? ''}`
+      : '先检测，判定通过才启动'
+    launchButton.classList.toggle('primary', !blocked)
+    launchButton.classList.toggle('danger', blocked)
+  }
+
   host.append(
     accessCard('能否打开 Claude', access.launchState, access.launchReason, '▶'),
     accessCard('能否访问网络', access.networkState, access.networkReason, '🌐'),
@@ -899,6 +912,37 @@ const actionHandlers = {
     run('profiles', () => api('/api/firewall/enable-profiles', { method: 'POST' }), '已启用系统防火墙'),
 }
 
+/**
+ * 门控启动 Claude Desktop。
+ *
+ * 与"双击图标"的区别：这里先跑一轮检测，判定通过才真的拉起。拒绝时不能只弹一句
+ * "失败"——要把是哪一项不通过直接说出来，否则用户只看到按钮没反应。
+ */
+async function launchClaudeDesktop() {
+  const button = document.querySelector('#launch-desktop')
+  if (!button || button.disabled) return
+  const original = button.textContent
+  button.disabled = true
+  button.textContent = '检测中…'
+  try {
+    const result = await api('/api/launch', { method: 'POST' })
+    if (result?.launched) {
+      toast('ok', '已启动 Claude Desktop', result.path ?? '')
+    } else if (result?.allow === false) {
+      // 判定不通过：明确写出原因，并说明这次没有启动。
+      toast('error', '环境不满足，已拒绝启动', result.reason ?? '白名单未命中')
+    } else {
+      toast('error', '启动失败', result?.reason ?? '未知原因')
+    }
+  } catch (error) {
+    toast('error', '启动失败', error instanceof Error ? error.message : String(error))
+  } finally {
+    button.disabled = false
+    button.textContent = original
+    void refresh()
+  }
+}
+
 /** 首次构建按钮；重复调用不会重复创建。 */
 function ensureActionButtons() {
   const host = document.querySelector('#action-buttons')
@@ -1273,6 +1317,13 @@ events.addEventListener('error', () => {
 })
 
 void refresh()
+
+// 门控启动按钮：每次点击都重新检测，不缓存上一次的结论 ——
+// 用户点它的目的就是"按当前环境决定能不能开"。
+document.querySelector('#launch-desktop')?.addEventListener('click', () => {
+  void launchClaudeDesktop()
+})
+
 setInterval(() => {
   // 兜底轮询：SSE 只推送"本界面自己"的动作 —— 托盘那边的闸门建立的阻断不会推事件，
   // 必须靠轮询兜住。这里**不再判断标签页是否在前台**：切到后台就不刷新，会让用户
