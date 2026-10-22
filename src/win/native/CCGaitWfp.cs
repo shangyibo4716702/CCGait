@@ -31,6 +31,8 @@ namespace CcgaitWfp
         private const uint FWP_BYTE_BLOB_TYPE = 12;
         // FWP_DATA_TYPE：FWP_V4_ADDR_MASK 不是顺序值，等于 FWP_SINGLE_DATA_TYPE_MAX(0xff) + 1。
         private const uint FWP_V4_ADDR_MASK_TYPE = 0x100;
+        // FWP_V6_ADDR_MASK 同理，是 +2。V6 层只能用它，塞 V4 掩码会 FWP_E_TYPE_MISMATCH。
+        private const uint FWP_V6_ADDR_MASK_TYPE = 0x101;
         private const uint FWP_MATCH_NOT_EQUAL = 10;
         private const uint RPC_C_AUTHN_WINNT = 10;
         private const uint RPC_C_AUTHZ_NONE = 0;
@@ -171,14 +173,36 @@ namespace CcgaitWfp
 
             if (hasIpCondition)
             {
-                // 条件 2：远端地址 != 127.0.0.1（放行本地回环，其余照拦）
+                // 条件 2：远端地址 != 回环（放行本地服务，其余照拦）。
+                //
+                // 必须按层选地址掩码类型：V4 层用 FWP_V4_ADDR_MASK(127.0.0.1/32)，
+                // V6 层用 FWP_V6_ADDR_MASK(::1/128)。在 V6 层塞 V4 掩码会直接
+                // FWP_E_TYPE_MISMATCH，整条过滤器建不起来。
+                //
+                // 为什么 V6 也要豁免：本机服务常常只监听 ::1（实测 vite --port 5273
+                // 只绑 ::1，浏览器访问 localhost 会优先走 IPv6）。V6 层不豁免的话，
+                // 被管控的浏览器连本地开发服务器会直接 ERR_CONNECTION_REFUSED —— 
+                // 看起来像"CCGait 把本地页面也拦了"，实测就是这么被发现的。
                 IntPtr second = conditionBuffer + ConditionStride;
                 Marshal.Copy(ConditionIpRemoteAddress.ToByteArray(), 0, second, 16);
                 Marshal.WriteInt32(second, 16, unchecked((int)FWP_MATCH_NOT_EQUAL));
-                Marshal.WriteInt32(second, 24, unchecked((int)FWP_V4_ADDR_MASK_TYPE));
-                addrMaskBuffer = Marshal.AllocHGlobal(8);
-                Marshal.WriteInt32(addrMaskBuffer, 0, unchecked((int)0x7F000001)); // 127.0.0.1
-                Marshal.WriteInt32(addrMaskBuffer, 4, unchecked((int)0xFFFFFFFF)); // 精确匹配
+                if (layerKey == LayerAleAuthConnectV6)
+                {
+                    Marshal.WriteInt32(second, 24, unchecked((int)FWP_V6_ADDR_MASK_TYPE));
+                    // FWP_V6_ADDR_MASK { UINT8 addr[16]; UINT8 prefixLength; } = 17 字节，
+                    // 多分配几个字节按 4 对齐写，避免踩到边界。
+                    addrMaskBuffer = Marshal.AllocHGlobal(20);
+                    for (int offset = 0; offset < 20; offset += 4) Marshal.WriteInt32(addrMaskBuffer, offset, 0);
+                    Marshal.WriteByte(addrMaskBuffer, 15, 0x01);  // ::1
+                    Marshal.WriteByte(addrMaskBuffer, 16, 128);   // /128
+                }
+                else
+                {
+                    Marshal.WriteInt32(second, 24, unchecked((int)FWP_V4_ADDR_MASK_TYPE));
+                    addrMaskBuffer = Marshal.AllocHGlobal(8);
+                    Marshal.WriteInt32(addrMaskBuffer, 0, unchecked((int)0x7F000001)); // 127.0.0.1
+                    Marshal.WriteInt32(addrMaskBuffer, 4, unchecked((int)0xFFFFFFFF)); // 精确匹配
+                }
                 Marshal.WriteIntPtr(second, 32, addrMaskBuffer);
             }
 
@@ -203,39 +227,31 @@ namespace CcgaitWfp
             {
                 foreach (Guid layer in new[] { LayerAleAuthConnectV4, LayerAleAuthConnectV6 })
                 {
-                    IntPtr conditionBuffer;
-                    IntPtr addrMaskBuffer;
-                    // IPv6 层不能配 FWP_V4_ADDR_MASK（实测报 FWP_E_TYPE_MISMATCH 0x80320027，
-                    // 整条过滤器建不起来，连程序级阻断都会失效），所以 V6 一律全封。
-                    bool layerExcludeLoopback = excludeLoopback && layer == LayerAleAuthConnectV4;
-                    IntPtr filter = BuildFilter(layer, appId, layerExcludeLoopback, out conditionBuffer, out addrMaskBuffer);
                     ulong filterId;
-                    try
+                    uint addStatus = TryAddFilter(engine, layer, appId, excludeLoopback, out filterId);
+                    if (addStatus != 0 && excludeLoopback)
                     {
-                        status = FwpmFilterAdd0(engine, filter, IntPtr.Zero, out filterId);
-                        if (status != 0)
-                        {
-                            throw new InvalidOperationException("添加过滤器失败（层 " + layer + "，0x" + status.ToString("X") + "）");
-                        }
-                        // 回查：确认真的存在于引擎里。
-                        IntPtr verify;
-                        uint verifyStatus = FwpmFilterGetById0(engine, filterId, out verify);
-                        if (verifyStatus == 0 && verify != IntPtr.Zero)
-                        {
-                            FwpmFreeMemory0(ref verify);
-                            ids.Add(filterId);
-                        }
-                        else
-                        {
-                            FwpmFilterDeleteById0(engine, filterId);
-                            throw new InvalidOperationException("过滤器回查失败（0x" + verifyStatus.ToString("X") + "）");
-                        }
+                        // 带回环豁免的条件建不起来时退回"整层全封"：宁可暂时连不上本地服务，
+                        // 也不能让这一层的出站管控整个失守。回退会写日志，方便事后定位。
+                        Console.WriteLine("WARN-EXEMPT " + layer + " 0x" + addStatus.ToString("X") + " 退回全封");
+                        addStatus = TryAddFilter(engine, layer, appId, false, out filterId);
                     }
-                    finally
+                    if (addStatus != 0)
                     {
-                        Marshal.FreeHGlobal(filter);
-                        Marshal.FreeHGlobal(conditionBuffer);
-                        if (addrMaskBuffer != IntPtr.Zero) Marshal.FreeHGlobal(addrMaskBuffer);
+                        throw new InvalidOperationException("添加过滤器失败（层 " + layer + "，0x" + addStatus.ToString("X") + "）");
+                    }
+                    // 回查：确认真的存在于引擎里。
+                    IntPtr verify;
+                    uint verifyStatus = FwpmFilterGetById0(engine, filterId, out verify);
+                    if (verifyStatus == 0 && verify != IntPtr.Zero)
+                    {
+                        FwpmFreeMemory0(ref verify);
+                        ids.Add(filterId);
+                    }
+                    else
+                    {
+                        FwpmFilterDeleteById0(engine, filterId);
+                        throw new InvalidOperationException("过滤器回查失败（0x" + verifyStatus.ToString("X") + "）");
                     }
                 }
             }
@@ -244,6 +260,24 @@ namespace CcgaitWfp
                 FwpmFreeMemory0(ref appId);
             }
             return ids;
+        }
+
+        /// <summary>加一条过滤器，返回 WFP 状态码（0 = 成功）。缓冲区生命周期在内部收干净。</summary>
+        private static uint TryAddFilter(IntPtr engine, Guid layer, IntPtr appId, bool excludeLoopback, out ulong filterId)
+        {
+            IntPtr conditionBuffer;
+            IntPtr addrMaskBuffer;
+            IntPtr filter = BuildFilter(layer, appId, excludeLoopback, out conditionBuffer, out addrMaskBuffer);
+            try
+            {
+                return FwpmFilterAdd0(engine, filter, IntPtr.Zero, out filterId);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(filter);
+                Marshal.FreeHGlobal(conditionBuffer);
+                if (addrMaskBuffer != IntPtr.Zero) Marshal.FreeHGlobal(addrMaskBuffer);
+            }
         }
 
         /// <summary>按偏移尝试读取 UTF-16 字符串；指针无效或内容不像字符串时返回 null。</summary>

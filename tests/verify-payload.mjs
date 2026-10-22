@@ -100,6 +100,8 @@ const checks = [
   ['src/guard.js', 'isDefiniteViolation', '只有"确认违规"才终止进程（抖动只断网）'],
   ['src/guard.js', 'violationSignature', '同一违规原因连续出现才累计（换原因清零）'],
   ['src/guard.js', 'KILL_CONFIRM_ROUNDS', '终止进程要求连续确认多轮'],
+  ['src/guard.js', 'Claude 未运行，浏览器暂不纳入管控', '浏览器只在 Claude 运行时才断网'],
+  ['src/win/wfp.js', 'shouldReuseWfpHost', '宿主复用前核对浏览器管控状态'],
   ['src/ui/session.js', 'networkBlock', '接口：暴露网络阻断实时状态'],
   ['src/ui/public/index.html', 'action-state', '界面：状态条容器'],
   ['src/ui/public/styles.css', 'state-cell', '界面：状态条样式'],
@@ -116,6 +118,7 @@ const binaryChecks = [
   ['CCGaitWfp.exe', 'PURGED', 'purge 模式'],
   ['CCGaitWfp.exe', '--stop-file', '宿主常驻与停止信号'],
   ['CCGaitWfp.exe', 'list-filters', '过滤器自检'],
+  ['CCGaitWfp.exe', 'WARN-EXEMPT', 'IPv6 回环豁免建不起来时退回全封'],
 ]
 
 console.log(`载荷文件数：${files.size}\n`)

@@ -396,7 +396,7 @@ export async function enforce(config, verdict, options = {}) {
   // 登录链路会打开系统默认浏览器做 OAuth：只掐 Claude 自己的进程不够，
   // 浏览器照样上外网、那条流量同样会出去。所以浏览器纳入**网络**管控，
   // 但永不终止它的进程（用户可能正开着几十个标签页）。
-  const browserPaths = options.browserPaths ?? []
+  const browserCandidates = options.browserPaths ?? []
 
   if (verdict.allow) {
     // 放行：撤掉 WFP 阻断与防火墙规则（两者都要撤，避免任一残留继续拦用户）。
@@ -412,6 +412,21 @@ export async function enforce(config, verdict, options = {}) {
     return result
   }
 
+  // 浏览器只在 Claude 客户端**确实在运行**时才纳入管控。
+  //
+  // 为什么：把浏览器拉进管控的唯一理由是登录链路 —— Claude 会拉起默认浏览器走 OAuth，
+  // 那条流量不受管控就等于开了个后门。但用户日常上网也用同一个浏览器；Claude 没运行的
+  // 时候一起断掉，结果就是"我 Claude Code 都没打开，本地页面和网页全打不开"（实测被投诉）。
+  // 判拦截时 Claude 自己的出站照样封死，所以放宽浏览器不会漏流量。
+  const runningClaude = await listClaudeProcesses()
+  const browserPaths = runningClaude.length > 0 ? browserCandidates : []
+  if (!verdict.allow && browserCandidates.length > 0 && runningClaude.length === 0) {
+    logger?.info(
+      'Claude 未运行，浏览器暂不纳入管控',
+      '默认浏览器只在 Claude 客户端运行期间断网（登录链路需要它）；Claude 一旦启动，下一轮就会纳入。',
+    )
+  }
+
   // 终止进程只在「确实违规」且「连续确认」时执行。
   //
   // 为什么不是"测到违规就杀"：出口探测是走网络的，一次抖动、一个数据源超时，
@@ -420,8 +435,7 @@ export async function enforce(config, verdict, options = {}) {
   // 所以这里要求**同一个违规结论连续出现**才动手；中间只要有一轮恢复正常就清零。
   // 断网是即时的（不露馅），杀进程是滞后的（保护正在干活的人）。
   if (shouldKillProcesses(config, verdict, { confirmed: options.killConfirmed === true })) {
-    const running = await listClaudeProcesses()
-    if (running.length > 0) {
+    if (runningClaude.length > 0) {
       const killed = await killAllClaudeProcesses()
       result.killed = killed
       result.killedCount = killed.filter((item) => item.killed).length
@@ -631,9 +645,13 @@ export function createGuard({ config, stateDir, logger, onState, onStopRequest }
     if (!resolveWfpHelper()) return undefined
     // block-first 也要连浏览器一起挂上：登录窗口弹出时正好是"判定还没出结果"的
     // 那几秒，浏览器若不在名单里，OAuth 请求就直接出去了。
+    //
+    // 但只在 Claude 客户端正在运行时才带上浏览器 —— 见 enforce() 里的同一段说明：
+    // Claude 没跑的时候把浏览器一起断掉，用户连本地开发页面都打不开。
+    const browserPaths = (await listClaudeProcesses()).length > 0 ? await resolveBrowserTargets() : []
     return startWfpBlock({
       paths: targets,
-      browserPaths: await resolveBrowserTargets(),
+      browserPaths,
       stateDir,
       timeoutMs: 20_000,
     })

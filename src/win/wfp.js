@@ -22,12 +22,51 @@ const execFileAsync = promisify(execFile)
 export const WFP_PID_FILE = 'wfp.pid'
 export const WFP_STOP_FILE = 'wfp-stop.request'
 
+/**
+ * 当前宿主是否带浏览器过滤器。
+ *
+ * `hold` 是一次性挂载，宿主的过滤器集合在启动那一刻就定死了。所以"复用已有宿主"
+ * 之前必须核对这一位：否则 Claude 退出后浏览器仍被断（网页全打不开），
+ * 或者 Claude 刚启动时复用了不带浏览器的宿主（登录链路的流量漏出去）。
+ */
+export const WFP_BROWSER_FILE = 'wfp.browser'
+
 export function wfpPidPath(stateDir) {
   return join(stateDir, WFP_PID_FILE)
 }
 
 export function wfpStopPath(stateDir) {
   return join(stateDir, WFP_STOP_FILE)
+}
+
+export function wfpBrowserPath(stateDir) {
+  return join(stateDir, WFP_BROWSER_FILE)
+}
+
+function readBrowserManaged(stateDir) {
+  try {
+    return readFileSync(wfpBrowserPath(stateDir), 'utf8').trim() === '1'
+  } catch {
+    // 读不到就按"没带浏览器"算：真要带的话会重建宿主，多一次挂载而已。
+    return false
+  }
+}
+
+/**
+ * 能不能复用已经在跑的宿主。
+ *
+ * `hold` 是一次性挂载，过滤器集合在启动那一刻就定死了。所以"宿主活着 + pid 对得上"
+ * 还不够，浏览器管控状态必须和这一轮一致，否则两个方向都会出问题：
+ *
+ *  - 上一轮带浏览器、这一轮 Claude 已退出 → 复用会让浏览器继续被断，用户"网页全打不开"；
+ *  - 上一轮不带、这一轮 Claude 刚启动 → 复用会让登录链路的浏览器流量漏出去。
+ *
+ * 抽成纯函数是为了能被单测钉住：写反了表现就是用户要么上不了网、要么漏流量。
+ */
+export function shouldReuseWfpHost({ pidAlive, hostPids, pid, browserManaged, wantBrowser }) {
+  if (!pidAlive) return false
+  if (!pid || !(hostPids ?? []).includes(pid)) return false
+  return browserManaged === wantBrowser
 }
 
 /** 找到 WFP 助手：优先安装/构建产物，其次与 CLI 同级的 dist。 */
@@ -169,12 +208,22 @@ export async function startWfpBlock({ paths, browserPaths = [], stateDir, detach
     return { ok: false, error: '未找到 CCGaitWfp.exe（请先执行 ccgait build-installer 或从安装版运行）' }
   }
   const hosts = await listWfpHosts()
-  if (isWfpBlocking(stateDir) && hosts.includes(readWfpPid(stateDir))) {
+  const wantBrowser = browserPaths.length > 0
+  const hostPid = readWfpPid(stateDir)
+  if (
+    shouldReuseWfpHost({
+      pidAlive: isWfpBlocking(stateDir),
+      hostPids: hosts,
+      pid: hostPid,
+      browserManaged: readBrowserManaged(stateDir),
+      wantBrowser,
+    })
+  ) {
     // 复用已有宿主时拿不到这一轮的过滤器条数：明确回 null，别让调用方把 undefined 当成 0。
-    return { ok: true, alreadyRunning: true, pid: readWfpPid(stateDir), blocked: null, filters: null }
+    return { ok: true, alreadyRunning: true, pid: hostPid, blocked: null, filters: null }
   }
   if (hosts.length > 0) {
-    // 有宿主但 pid 文件对不上（孤儿）：先收干净再重建，保证同时只有一个宿主在挂过滤器。
+    // 要重建、或者有宿主但 pid 文件对不上（孤儿）：先收干净，保证同时只有一个宿主在挂过滤器。
     await killAllWfpHosts()
   }
 
@@ -251,6 +300,8 @@ export async function startWfpBlock({ paths, browserPaths = [], stateDir, detach
   }
 
   try {
+    // 先写浏览器标记再写 pid：pid 文件是"宿主活着"的权威信号，读它的时候会一起读标记。
+    writeFileSync(wfpBrowserPath(stateDir), wantBrowser ? '1' : '0', 'utf8')
     writeFileSync(wfpPidPath(stateDir), `${child.pid}\n`, 'utf8')
   } catch {
     // PID 文件只用于状态展示。
@@ -280,6 +331,7 @@ export async function stopWfpBlock({ stateDir, waitMs = 5000 }) {
     try {
       rmSync(wfpPidPath(stateDir), { force: true })
       rmSync(wfpStopPath(stateDir), { force: true })
+      rmSync(wfpBrowserPath(stateDir), { force: true })
     } catch {
       // 忽略
     }

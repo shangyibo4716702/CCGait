@@ -7,6 +7,7 @@ import {
   discoverDefaultBrowser,
   probeDefaultBrowser,
 } from '../src/browser-targets.js'
+import { shouldReuseWfpHost } from '../src/win/wfp.js'
 
 // 这些测试钉住一条产品约定：Claude 登录会拉起系统默认浏览器，
 // 浏览器必须和 Claude 走同一套网络管控，但**永远不终止它的进程**。
@@ -77,5 +78,35 @@ describe('default browser discovery', () => {
     // 用户可能从 Program Files 或 x86 任一位置启动，两个副本都要覆盖；
     // 只覆盖注册表路径会在"从另一个副本启动"时漏放。
     assert.ok(targets.includes(edgePaths[1]))
+  })
+})
+
+describe('浏览器管控只在 Claude 运行时生效', () => {
+  // 用户实测踩到过：Claude Code 根本没打开，Edge 却被断了网 —— 连 localhost 的开发页面
+  // 都打不开。根因是宿主复用逻辑只看"宿主还活着"，没看这一轮还要不要管浏览器。
+  it('宿主活着、pid 对得上、浏览器状态一致才复用', () => {
+    const base = { pidAlive: true, hostPids: [100], pid: 100, browserManaged: true, wantBrowser: true }
+    assert.equal(shouldReuseWfpHost(base), true)
+    assert.equal(shouldReuseWfpHost({ ...base, browserManaged: false, wantBrowser: false }), true)
+  })
+
+  it('浏览器管控状态变了就必须重建宿主', () => {
+    // Claude 退出：上一轮带浏览器，这一轮不带 → 复用会让网页一直打不开。
+    assert.equal(
+      shouldReuseWfpHost({ pidAlive: true, hostPids: [100], pid: 100, browserManaged: true, wantBrowser: false }),
+      false,
+    )
+    // Claude 刚启动：上一轮不带，这一轮要带 → 复用会让登录链路的浏览器流量漏出去。
+    assert.equal(
+      shouldReuseWfpHost({ pidAlive: true, hostPids: [100], pid: 100, browserManaged: false, wantBrowser: true }),
+      false,
+    )
+  })
+
+  it('宿主不在、或 pid 对不上时一律不复用', () => {
+    const base = { pidAlive: true, hostPids: [100], pid: 100, browserManaged: false, wantBrowser: false }
+    assert.equal(shouldReuseWfpHost({ ...base, pidAlive: false }), false)
+    assert.equal(shouldReuseWfpHost({ ...base, hostPids: [999] }), false)
+    assert.equal(shouldReuseWfpHost({ ...base, pid: undefined }), false)
   })
 })
