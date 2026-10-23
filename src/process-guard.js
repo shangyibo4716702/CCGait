@@ -78,9 +78,20 @@ export async function killProcess(pid) {
 
 /** 发现 → 终止，返回本次处理明细。 */
 export async function killAllClaudeProcesses() {
+  return killClaudeProcessesByKind(undefined)
+}
+
+/**
+ * 只终止某一类进程（'desktop' 或 'cli'）。
+ *
+ * 切号只需要动桌面版：它换的是 Desktop 的 profile。把正在跑的 CLI 一起杀掉
+ * 等于顺带毁掉用户手上的活的 —— CLI 的数据目录根本不参与切换。
+ */
+export async function killClaudeProcessesByKind(kind) {
   const processes = await listClaudeProcesses()
+  const targets = kind ? processes.filter((item) => item.kind === kind) : processes
   const results = []
-  for (const processInfo of processes) {
+  for (const processInfo of targets) {
     const outcome = await killProcess(processInfo.pid)
     results.push({ ...processInfo, ...outcome })
   }

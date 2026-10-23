@@ -118,6 +118,25 @@
           </div>
         </section>
 
+        <section class="panel" id="sec-accounts">
+          <div class="panel-header">
+            <div>
+              <h3>账号</h3>
+              <p>只切 Claude Desktop 的登录态（Cookies / 本地存储 / 设备标识），不碰 Claude Code 的数据。</p>
+            </div>
+            <div class="panel-tools">
+              <span class="panel-sub" id="accounts-sub">读取中</span>
+              <input class="account-input" id="account-name" type="text" maxlength="32" placeholder="账号名，如 A" />
+              <button class="action" id="account-save" type="button" title="把当前登录态保存为这个账号">
+                保存当前
+              </button>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="account-list" id="account-list"></div>
+          </div>
+        </section>
+
         <section class="panel" id="sec-env">
           <div class="panel-header">
             <div>

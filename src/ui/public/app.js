@@ -943,6 +943,127 @@ async function launchClaudeDesktop() {
   }
 }
 
+/** -------------------------------------------------------------- 账号切换 */
+
+/**
+ * 账号列表。
+ *
+ * 只做 Desktop：换的是 Desktop profile 里的登录态与设备标识，不动 Claude Code 的
+ * `~/.claude` 与 `~/.claude.json`。切换会结束 Desktop 进程 —— 这些是 SQLite 文件，
+ * 进程还在写的时候复制出来的快照会不一致。
+ */
+function renderAccounts(data) {
+  const host = document.querySelector('#account-list')
+  const sub = document.querySelector('#accounts-sub')
+  if (!host || !sub) return
+
+  if (!data?.profile?.found) {
+    sub.textContent = '未找到 Desktop 数据'
+    host.replaceChildren(
+      el('div', 'empty', '没找到 Claude Desktop 的数据目录（MSIX 包未安装或从未登录过）。'),
+    )
+    return
+  }
+
+  const accounts = list(data.accounts)
+  sub.textContent = data.current ? `当前：${data.current}` : '当前：未记录'
+  host.replaceChildren()
+
+  if (accounts.length === 0) {
+    host.append(
+      el(
+        'div',
+        'empty',
+        '还没有存档。在上面的输入框填一个名字，点「保存当前」把现在的登录态存下来。',
+      ),
+    )
+    return
+  }
+
+  for (const account of accounts) {
+    const row = el('div', 'account-row')
+    const isCurrent = account.name === data.current
+    if (isCurrent) row.classList.add('is-current')
+
+    const name = el('span', 'account-name', account.name)
+    const meta = el('span', 'account-meta')
+    meta.textContent = [
+      isCurrent ? '当前账号' : '已存档',
+      account.complete ? '' : '存档不完整',
+      account.savedAt ? new Date(account.savedAt).toLocaleString() : '',
+    ]
+      .filter(Boolean)
+      .join(' · ')
+
+    const button = el('button', 'action', isCurrent ? '重新载入' : '切换')
+    button.type = 'button'
+    button.disabled = !account.complete
+    button.addEventListener('click', () => {
+      void switchToAccount(account.name, button)
+    })
+
+    row.append(name, meta, button)
+    host.append(row)
+  }
+}
+
+async function refreshAccounts() {
+  try {
+    renderAccounts(await api('/api/accounts'))
+  } catch {
+    // 读不到就保持上一屏，不要把界面清空。
+  }
+}
+
+async function switchToAccount(name, button) {
+  const original = button?.textContent
+  if (button) {
+    button.disabled = true
+    button.textContent = '切换中…'
+  }
+  try {
+    const result = await api('/api/accounts/switch', { method: 'POST', body: { name } })
+    toast('ok', `已切换到账号 ${name}`, result?.archivedFrom ? `已存档 ${result.archivedFrom}` : '')
+    renderAccounts(result)
+  } catch (error) {
+    toast('error', '切换失败', error instanceof Error ? error.message : String(error))
+  } finally {
+    if (button) {
+      button.disabled = false
+      button.textContent = original
+    }
+  }
+}
+
+async function saveCurrentAccount() {
+  const input = document.querySelector('#account-name')
+  const button = document.querySelector('#account-save')
+  const name = (input?.value ?? '').trim()
+  if (!name) {
+    toast('error', '先填账号名', '例如 A 或 work')
+    input?.focus()
+    return
+  }
+  const original = button?.textContent
+  if (button) {
+    button.disabled = true
+    button.textContent = '保存中…'
+  }
+  try {
+    const result = await api('/api/accounts/save', { method: 'POST', body: { name } })
+    toast('ok', `已保存账号 ${name}`, `${result?.entries ?? 0} 个身份条目`)
+    if (input) input.value = ''
+    renderAccounts(result)
+  } catch (error) {
+    toast('error', '保存失败', error instanceof Error ? error.message : String(error))
+  } finally {
+    if (button) {
+      button.disabled = false
+      button.textContent = original
+    }
+  }
+}
+
 /** 首次构建按钮；重复调用不会重复创建。 */
 function ensureActionButtons() {
   const host = document.querySelector('#action-buttons')
@@ -1323,6 +1444,17 @@ void refresh()
 document.querySelector('#launch-desktop')?.addEventListener('click', () => {
   void launchClaudeDesktop()
 })
+
+document.querySelector('#account-save')?.addEventListener('click', () => {
+  void saveCurrentAccount()
+})
+
+// 回车就保存，省得每次都要去找按钮。
+document.querySelector('#account-name')?.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') void saveCurrentAccount()
+})
+
+void refreshAccounts()
 
 setInterval(() => {
   // 兜底轮询：SSE 只推送"本界面自己"的动作 —— 托盘那边的闸门建立的阻断不会推事件，

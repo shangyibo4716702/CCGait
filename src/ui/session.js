@@ -19,7 +19,17 @@ import {
   listManagedRules,
   removeAllBlocks,
 } from '../firewall.js'
-import { claudeDiscovery, killAllClaudeProcesses, listClaudeProcesses } from '../process-guard.js'
+import { claudeDiscovery, killAllClaudeProcesses, killClaudeProcessesByKind, listClaudeProcesses } from '../process-guard.js'
+import {
+  accountsRoot,
+  listAccounts,
+  locateDesktopProfile,
+  readCurrentAccount,
+  recoverInterruptedSwitch,
+  saveAccount,
+  switchAccount,
+  writeCurrentAccount,
+} from '../accounts.js'
 import { startupStatus } from '../startup.js'
 import { isWfpBlocking, listWfpHosts, readWfpPid, startWfpBlock, stopWfpBlock } from '../win/wfp.js'
 
@@ -432,6 +442,9 @@ function resolveAppUserModelId() {
     enableProfiles: options.deps?.enableProfiles ?? enableProfiles,
     listClaudeProcesses: options.deps?.listClaudeProcesses ?? listClaudeProcesses,
     killAllClaudeProcesses: options.deps?.killAllClaudeProcesses ?? killAllClaudeProcesses,
+    killClaudeProcessesByKind: options.deps?.killClaudeProcessesByKind ?? killClaudeProcessesByKind,
+    accountsRoot: options.deps?.accountsRoot ?? accountsRoot,
+    locateDesktopProfile: options.deps?.locateDesktopProfile ?? locateDesktopProfile,
     claudeDiscovery: options.deps?.claudeDiscovery ?? claudeDiscovery,
     startupStatus: options.deps?.startupStatus ?? startupStatus,
     isWfpBlocking: options.deps?.isWfpBlocking ?? isWfpBlocking,
@@ -747,6 +760,92 @@ function resolveAppUserModelId() {
     })
 
   /**
+   * 账号切换（只针对 Claude Desktop）。
+   *
+   * 边界：只动 Desktop 的 profile，不碰 CLI 的 `~/.claude` 与 `~/.claude.json`。
+   * 切号换的是登录态与设备标识（Cookies / Local Storage / IndexedDB / ant-did），
+   * 缓存和 CLI 二进制保持共享。
+   */
+  const accountsBase = deps.accountsRoot()
+  const resolveProfile = () => deps.locateDesktopProfile()
+
+  const readAccountsState = () => {
+    const profile = resolveProfile()
+    return {
+      profile: profile ? { found: true, path: profile } : { found: false },
+      accountsDir: accountsBase,
+      current: readCurrentAccount(accountsBase),
+      accounts: listAccounts(accountsBase),
+    }
+  }
+
+  const getAccounts = () => serialize(async () => readAccountsState())
+
+  /** 把当前登录态存成账号 <name>。这是快照动作，不改变"当前账号"。 */
+  const saveCurrentAccount = (name) =>
+    serialize(async () => {
+      const profile = resolveProfile()
+      if (!profile) throw new Error('没找到 Claude Desktop 的数据目录（MSIX 包未安装或从未登录）')
+      // 存档前让 Desktop 退出：Cookies 是 SQLite，进程还在写的时候复制的快照可能不一致。
+      const running = (await deps.listClaudeProcesses()).filter((item) => item.kind === 'desktop')
+      if (running.length > 0) {
+        await deps.killClaudeProcessesByKind('desktop')
+        await waitForDesktopExit()
+      }
+      const result = saveAccount({ name, profileDir: profile, accountsDir: accountsBase })
+      // 必须无条件更新「当前账号」：把现在这份登录保存为 <name>，就意味着"我现在是 <name>"。
+      // 只在未记录时才写会产生危险的不一致 —— 用户登出 A、登录 B、保存为 B 之后，
+      // current 还写着 A；下次切回 A 时会把 B 的登录态存进 A，直接覆盖 A 的数据。
+      writeCurrentAccount(accountsBase, name)
+      pushLog('info', `已把当前登录态保存为账号 ${name}`, `共 ${result.entries} 个身份条目`)
+      emit({ type: 'status' })
+      return { ...result, ...readAccountsState() }
+    })
+
+  const waitForDesktopExit = async () => {
+    for (let i = 0; i < 40; i += 1) {
+      const still = (await deps.listClaudeProcesses()).filter((item) => item.kind === 'desktop')
+      if (still.length === 0) return true
+      await new Promise((resolve) => setTimeout(resolve, 250))
+    }
+    return false
+  }
+
+  const switchAccountTo = (name) =>
+    serialize(async () => {
+      const profile = resolveProfile()
+      if (!profile) throw new Error('没找到 Claude Desktop 的数据目录（MSIX 包未安装或从未登录）')
+      const current = readCurrentAccount(accountsBase)
+      pushLog('info', `正在切换到账号 ${name}`, current ? `当前：${current}` : '当前：未记录')
+      const result = await switchAccount({
+        name,
+        profileDir: profile,
+        accountsDir: accountsBase,
+        current,
+        // 用户明确选择"直接结束进程"：切号必须独占 profile 里的文件。
+        killProcesses: async () => {
+          const killed = await deps.killClaudeProcessesByKind('desktop')
+          const exited = await waitForDesktopExit()
+          return { killed, exited }
+        },
+      })
+      writeCurrentAccount(accountsBase, name)
+      pushLog(
+        'info',
+        `已切换到账号 ${name}`,
+        [
+          result.archivedFrom ? `已把 ${result.archivedFrom} 的登录态存档` : undefined,
+          result.captured ? '首次运行：现有登录已收编' : undefined,
+          result.killed?.exited === false ? '注意：Desktop 进程未完全退出，切换可能不完整' : undefined,
+        ]
+          .filter(Boolean)
+          .join('；') || undefined,
+      )
+      emit({ type: 'status' })
+      return { ...result, ...readAccountsState() }
+    })
+
+  /**
    * 门控启动 Claude Desktop：**先检测，判定通过才启动**。
    *
    * 为什么需要这条路径：直接双击 Claude 图标是绕过闸门的 —— 闸门只能事后终止它，
@@ -870,6 +969,9 @@ function resolveAppUserModelId() {
     stopGuard,
     setFirewall,
     killProcesses,
+    getAccounts,
+    saveCurrentAccount,
+    switchAccountTo,
     launchClaudeDesktop,
     enableFirewallProfiles,
     saveConfig,

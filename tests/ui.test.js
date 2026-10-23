@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -470,5 +470,53 @@ describe('ui server', () => {
       await session.dispose()
       await ui.close()
     }
+  })
+})
+
+describe('账号切换接口', () => {
+  // 切号只针对 Desktop，而且必须在"没装 Desktop"时明确报错，
+  // 不能悄悄在别处建目录、也不能把 Claude Code 的数据当目标。
+  it('没找到 Desktop 数据目录时返回 found:false，不假装成功', async () => {
+    const deps = fakeDeps({ locateDesktopProfile: () => undefined })
+    const session = createUiSession({ configPath: deps.path, deps: deps.deps })
+    const state = await session.getAccounts()
+    assert.equal(state.profile.found, false)
+    assert.deepEqual(state.accounts, [])
+    await assert.rejects(session.switchAccountTo('A'), /没找到 Claude Desktop/)
+    await assert.rejects(session.saveCurrentAccount('A'), /没找到 Claude Desktop/)
+  })
+
+  it('切换时只结束 Desktop 进程，不碰 CLI', async () => {
+    const root = tempConfig().dir
+    const accounts = join(root, 'accounts')
+    const profile = join(root, 'profile')
+    mkdirSync(join(profile, 'Network'), { recursive: true })
+    writeFileSync(join(profile, 'Network', 'Cookies'), 'cookies-1')
+    writeFileSync(join(profile, 'ant-did'), 'did-1')
+
+    const kinds = []
+    const deps = fakeDeps({
+      locateDesktopProfile: () => profile,
+      accountsRoot: () => accounts,
+      killClaudeProcessesByKind: async (kind) => {
+        kinds.push(kind)
+        return [{ pid: 1, killed: true, kind }]
+      },
+      listClaudeProcesses: async () => [],
+    })
+    const session = createUiSession({ configPath: deps.path, deps: deps.deps })
+
+    const saved = await session.saveCurrentAccount('A')
+    assert.equal(saved.entries > 0, true)
+    assert.equal(saved.current, 'A', '保存即代表当前账号，必须同步 current')
+    // 登出 A、登录 B、再存成 B：current 必须变成 B，否则下次切回 A 会把 B 存进 A。
+    const savedB = await session.saveCurrentAccount('B')
+    assert.equal(savedB.current, 'B')
+    assert.equal(savedB.accounts.length, 2)
+    const switched = await session.switchAccountTo('A')
+    assert.equal(switched.current, 'A')
+    // 没进程在跑时不必杀；关键是凡杀必是 desktop，绝不能顺手把 CLI 一起结束。
+    assert.ok(kinds.length >= 1, '切换前必须处理 Desktop 进程')
+    assert.ok(kinds.every((kind) => kind === 'desktop'), '只允许结束 desktop 进程')
   })
 })

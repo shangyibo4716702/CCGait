@@ -1260,3 +1260,62 @@ input[type='checkbox']:checked::after {
     padding: 20px 18px 48px;
   }
 }
+
+/* ---------------------------------------------------------------- 账号切换 */
+
+/* 账号名输入框：跟按钮同高、同圆角，放在 panel-tools 里不破坏对齐 */
+.account-input {
+  width: 132px;
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface-2, rgba(255, 255, 255, 0.04));
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.12));
+  border-radius: 8px;
+}
+
+.account-input:focus {
+  outline: none;
+  border-color: var(--accent, #4c8dff);
+}
+
+.account-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.account-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.1));
+  border-radius: 10px;
+}
+
+/* 当前账号用左侧高亮条区分，不靠颜色填充（深色底上填充块太吵） */
+.account-row.is-current {
+  border-color: var(--accent, #4c8dff);
+  box-shadow: inset 3px 0 0 var(--accent, #4c8dff);
+}
+
+.account-name {
+  font-weight: 600;
+  font-size: 13.5px;
+  min-width: 72px;
+}
+
+.account-meta {
+  flex: 1;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-row .action {
+  flex-shrink: 0;
+}

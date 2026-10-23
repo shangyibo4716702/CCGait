@@ -251,6 +251,11 @@ export function createUiServer({ session, logger, token = randomBytes(24).toStri
         return
       }
 
+      if (path === '/api/accounts' && request.method === 'GET') {
+        sendJson(response, 200, await session.getAccounts())
+        return
+      }
+
       if (request.method !== 'POST') {
         sendJson(response, 405, { error: '只支持 GET / POST' })
         return
@@ -278,8 +283,18 @@ export function createUiServer({ session, logger, token = randomBytes(24).toStri
             sendJson(response, 200, { result: await session.enableFirewallProfiles() })
             return
           case '/api/kill':
-            sendJson(response, 200, await session.killProcesses())
+            sendJson(response, 200, { result: await session.killProcesses() })
             return
+          case '/api/accounts/save': {
+            const body = await readJsonBody(request)
+            sendJson(response, 200, await session.saveCurrentAccount(body.name))
+            return
+          }
+          case '/api/accounts/switch': {
+            const body = await readJsonBody(request)
+            sendJson(response, 200, await session.switchAccountTo(body.name))
+            return
+          }
           case '/api/launch': {
             // 门控启动：内部会先跑一轮检测，判定通过才真的拉起 Claude Desktop。
             sendJson(response, 200, await session.launchClaudeDesktop())
