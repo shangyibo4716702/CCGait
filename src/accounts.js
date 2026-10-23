@@ -263,7 +263,19 @@ export function saveAccount({
     throw new Error('存档不完整（缺少 Network/Cookies），已放弃本次存档')
   }
 
-  rmrf(target)
+  // 覆盖同名存档前先留一份旧的。
+  //
+  // 用户重复保存同一个名字很常见（"我重登了一次，再存一遍"），而且旧的那份很可能是
+  // 唯一还能用的登录态 —— 静默覆盖等于把它删了，还看不出来发生过什么。
+  // 备份固定叫 `<name>.bak`（只保留最近一份），且因为名字里带点，不会被 listAccounts
+  // 当成一个账号列出来。
+  const backup = `${target}.bak`
+  if (exists(target)) {
+    rmrf(backup)
+    renameSync(target, backup)
+  } else {
+    rmrf(target)
+  }
   renameSync(staging, target)
   writeFileSync(join(target, '.ccgait-account.json'), `${JSON.stringify({ name, savedAt: new Date().toISOString() }, null, 2)}\n`, 'utf8')
   return { name, entries: entries.length, dir: target }

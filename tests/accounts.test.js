@@ -229,3 +229,24 @@ describe('账号列表', () => {
     assert.deepEqual(listed.map((item) => item.name).sort(), ['A', 'B'])
   })
 })
+
+describe('重复保存同名账号', () => {
+  it('旧存档留一份 .bak，不会被静默覆盖掉', () => {
+    const root = tempDir()
+    const profile = makeProfile(root, 'v1')
+    const accounts = join(root, 'accounts')
+    saveAccount({ name: 'A', profileDir: profile, accountsDir: accounts, ...opts })
+
+    writeFileSync(join(profile, 'Network', 'Cookies'), 'cookies-v2')
+    saveAccount({ name: 'A', profileDir: profile, accountsDir: accounts, ...opts })
+
+    assert.equal(readFileSync(join(accounts, 'A', 'Network', 'Cookies'), 'utf8'), 'cookies-v2')
+    assert.equal(
+      readFileSync(join(accounts, 'A.bak', 'Network', 'Cookies'), 'utf8'),
+      'cookies-v1',
+      '上一份必须留得下来',
+    )
+    // .bak 不该被当成一个可选账号
+    assert.deepEqual(listAccounts(accounts).map((item) => item.name), ['A'])
+  })
+})
