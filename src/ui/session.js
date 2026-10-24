@@ -24,7 +24,9 @@ import {
   accountsRoot,
   listAccounts,
   locateDesktopProfile,
+  nextAccountName,
   readCurrentAccount,
+  assertAccountName,
   recoverInterruptedSwitch,
   saveAccount,
   switchAccount,
@@ -781,23 +783,26 @@ function resolveAppUserModelId() {
 
   const getAccounts = () => serialize(async () => readAccountsState())
 
-  /** 把当前登录态存成账号 <name>。这是快照动作，不改变"当前账号"。 */
+  /** 把当前登录态存成账号 <name>；名字留空就自动分配 A、B、C… */
   const saveCurrentAccount = (name) =>
     serialize(async () => {
       const profile = resolveProfile()
       if (!profile) throw new Error('没找到 Claude Desktop 的数据目录（MSIX 包未安装或从未登录）')
+      const wanted = (name ?? '').trim()
+      const target = wanted || nextAccountName(listAccounts(accountsBase).map((item) => item.name))
+      if (wanted) assertAccountName(wanted)
       // 存档前让 Desktop 退出：Cookies 是 SQLite，进程还在写的时候复制的快照可能不一致。
       const running = (await deps.listClaudeProcesses()).filter((item) => item.kind === 'desktop')
       if (running.length > 0) {
         await deps.killClaudeProcessesByKind('desktop')
         await waitForDesktopExit()
       }
-      const result = saveAccount({ name, profileDir: profile, accountsDir: accountsBase })
+      const result = saveAccount({ name: target, profileDir: profile, accountsDir: accountsBase })
       // 必须无条件更新「当前账号」：把现在这份登录保存为 <name>，就意味着"我现在是 <name>"。
       // 只在未记录时才写会产生危险的不一致 —— 用户登出 A、登录 B、保存为 B 之后，
       // current 还写着 A；下次切回 A 时会把 B 的登录态存进 A，直接覆盖 A 的数据。
-      writeCurrentAccount(accountsBase, name)
-      pushLog('info', `已把当前登录态保存为账号 ${name}`, `共 ${result.entries} 个身份条目`)
+      writeCurrentAccount(accountsBase, target)
+      pushLog('info', `已把当前登录态保存为账号 ${target}`, `共 ${result.entries} 个身份条目`)
       emit({ type: 'status' })
       return { ...result, ...readAccountsState() }
     })
@@ -815,6 +820,23 @@ function resolveAppUserModelId() {
     serialize(async () => {
       const profile = resolveProfile()
       if (!profile) throw new Error('没找到 Claude Desktop 的数据目录（MSIX 包未安装或从未登录）')
+
+      // 切号必须先过环境判定。
+      //
+      // 理由：切号之后用户紧接着就要启动 Desktop，而闸门不会因为"换了个号"就放行。
+      // 环境不合规时切过去，结果是新号一启动就被断网、甚至被终止 —— 用户会以为切号坏了，
+      // 实际是两个机制各干各的。所以这里和门控启动用同一条判定，不通过就**不动现场**：
+      // 不杀进程、不存档，把原因直接返回。
+      const check = await checkInternal()
+      if (!check.allow) {
+        const reasons = (check.blocked ?? []).map((item) => item.title)
+        const reason =
+          reasons.join('；') || (check.failedClosed ? '出口身份无法确认（failClosed）' : '白名单未命中')
+        pushLog('block', `已拒绝切换到账号 ${name}`, reason)
+        emit({ type: 'status' })
+        return { switched: false, allow: false, reason, check, ...readAccountsState() }
+      }
+
       const current = readCurrentAccount(accountsBase)
       pushLog('info', `正在切换到账号 ${name}`, current ? `当前：${current}` : '当前：未记录')
       const result = await switchAccount({
@@ -842,7 +864,7 @@ function resolveAppUserModelId() {
           .join('；') || undefined,
       )
       emit({ type: 'status' })
-      return { ...result, ...readAccountsState() }
+      return { ...result, switched: true, ...readAccountsState() }
     })
 
   /**

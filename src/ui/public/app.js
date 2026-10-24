@@ -958,25 +958,17 @@ function renderAccounts(data) {
   if (!host || !sub) return
 
   if (!data?.profile?.found) {
-    sub.textContent = '未找到 Desktop 数据'
-    host.replaceChildren(
-      el('div', 'empty', '没找到 Claude Desktop 的数据目录（MSIX 包未安装或从未登录过）。'),
-    )
+    sub.textContent = '未找到'
+    host.replaceChildren(el('div', 'side-hint', '没找到 Desktop 数据目录（MSIX 包未安装或从未登录）。'))
     return
   }
 
   const accounts = list(data.accounts)
-  sub.textContent = data.current ? `当前：${data.current}` : '当前：未记录'
+  sub.textContent = data.current ? `当前 ${data.current}` : '未记录'
   host.replaceChildren()
 
   if (accounts.length === 0) {
-    host.append(
-      el(
-        'div',
-        'empty',
-        '还没有存档。在上面的输入框填一个名字，点「保存当前」把现在的登录态存下来。',
-      ),
-    )
+    host.append(el('div', 'side-hint', '还没有账号。点下面的「添加账号」把当前登录存下来。'))
     return
   }
 
@@ -984,25 +976,56 @@ function renderAccounts(data) {
     const row = el('div', 'account-row')
     const isCurrent = account.name === data.current
     if (isCurrent) row.classList.add('is-current')
+    if (!account.complete) row.classList.add('is-disabled')
+    row.tabIndex = 0
+    row.setAttribute('role', 'button')
 
+    const head = el('div', 'account-head')
     const name = el('span', 'account-name', account.name)
+    // 只有一个号是"在线"的 —— 就是当前载入到 Claude 数据目录里的那个。
+    // 其余号的 Cookies 存在磁盘上，本机没有它们的运行实例。
+    const status = el(
+      'span',
+      `account-status ${isCurrent ? 'is-online' : 'is-offline'}`,
+      account.complete ? (isCurrent ? '在线' : '离线') : '存档不完整',
+    )
+    head.append(name, status)
+
     const meta = el('span', 'account-meta')
     meta.textContent = [
-      isCurrent ? '当前账号' : '已存档',
-      account.complete ? '' : '存档不完整',
-      account.savedAt ? new Date(account.savedAt).toLocaleString() : '',
+      isCurrent ? '正在使用' : '点击切换',
+      account.savedAt ? new Date(account.savedAt).toLocaleDateString() : undefined,
     ]
       .filter(Boolean)
       .join(' · ')
 
-    const button = el('button', 'action', isCurrent ? '重新载入' : '切换')
-    button.type = 'button'
-    button.disabled = !account.complete
-    button.addEventListener('click', () => {
-      void switchToAccount(account.name, button)
+    const activate = () => {
+      if (!account.complete) return
+      if (isCurrent) {
+        toast('info', `当前就是账号 ${account.name}`, '已经在用它了，不需要切换')
+        return
+      }
+      // 切换必须结束 Desktop 才能搬运登录文件。这一步用户必须事先知道，
+      // 否则就是"点了一下，Claude 莫名其妙被关掉"。
+      const confirmed = window.confirm(
+        `切换到账号 ${account.name}？\n\n` +
+          `· 会先关闭当前的 Claude Desktop，未发送的对话会丢失\n` +
+          `· 然后载入 ${account.name} 的登录态\n` +
+          `· 切换完成后请手动打开 Claude\n\n` +
+          `继续吗？`,
+      )
+      if (!confirmed) return
+      void switchToAccount(account.name)
+    }
+    row.addEventListener('click', activate)
+    row.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault()
+        activate()
+      }
     })
 
-    row.append(name, meta, button)
+    row.append(head, meta)
     host.append(row)
   }
 }
@@ -1015,44 +1038,56 @@ async function refreshAccounts() {
   }
 }
 
-async function switchToAccount(name, button) {
-  const original = button?.textContent
-  if (button) {
-    button.disabled = true
-    button.textContent = '切换中…'
-  }
+let switchingAccount = false
+
+async function switchToAccount(name) {
+  // 切换要几秒（结束进程 + 搬运 13MB），期间重复点击会排队执行好几次切换。
+  if (switchingAccount) return
+  switchingAccount = true
+  document.querySelectorAll('.account-row').forEach((row) => row.classList.add('is-busy'))
   try {
     const result = await api('/api/accounts/switch', { method: 'POST', body: { name } })
-    toast('ok', `已切换到账号 ${name}`, result?.archivedFrom ? `已存档 ${result.archivedFrom}` : '')
+    if (result?.switched === false) {
+      // 合规检查没过：切换根本没发生，现场也没动过。
+      toast('error', '环境不满足，已拒绝切号', result.reason ?? '白名单未命中')
+      renderAccounts(result)
+      return
+    }
+    toast('ok', `已切换到账号 ${name}`, 'Claude Desktop 需要你手动打开')
     renderAccounts(result)
   } catch (error) {
     toast('error', '切换失败', error instanceof Error ? error.message : String(error))
   } finally {
-    if (button) {
-      button.disabled = false
-      button.textContent = original
-    }
+    switchingAccount = false
+    document.querySelectorAll('.account-row').forEach((row) => row.classList.remove('is-busy'))
   }
 }
 
 async function saveCurrentAccount() {
   const input = document.querySelector('#account-name')
   const button = document.querySelector('#account-save')
+  // 名字可以留空：留空就自动分配 A、B、C…，这样"存一份"就是点一下的事。
   const name = (input?.value ?? '').trim()
-  if (!name) {
-    toast('error', '先填账号名', '例如 A 或 work')
-    input?.focus()
-    return
-  }
   const original = button?.textContent
+  // 保存同样要结束 Desktop（Cookies 是 SQLite，进程还在写的时候复制出来的快照可能不一致），
+  // 所以也得先讲清楚，别让用户莫名其妙发现应用被关了。
+  const confirmed = window.confirm(
+    `把当前登录保存为账号 ${name || '（自动命名）'}？\n\n` +
+      `· 如果 Claude Desktop 正在运行，会先关闭它\n` +
+      `· 保存完成后请手动重新打开\n\n` +
+      `继续吗？`,
+  )
+  if (!confirmed) return
   if (button) {
     button.disabled = true
     button.textContent = '保存中…'
   }
   try {
     const result = await api('/api/accounts/save', { method: 'POST', body: { name } })
-    toast('ok', `已保存账号 ${name}`, `${result?.entries ?? 0} 个身份条目`)
+    toast('ok', `已保存账号 ${result?.name ?? ''}`, `${result?.entries ?? 0} 个身份条目`)
     if (input) input.value = ''
+    const form = document.querySelector('#account-form')
+    if (form) form.hidden = true
     renderAccounts(result)
   } catch (error) {
     toast('error', '保存失败', error instanceof Error ? error.message : String(error))
@@ -1447,6 +1482,14 @@ document.querySelector('#launch-desktop')?.addEventListener('click', () => {
 
 document.querySelector('#account-save')?.addEventListener('click', () => {
   void saveCurrentAccount()
+})
+
+// 「添加账号」默认收起：只有要加新号时才展开，展开后直接给出该做什么。
+document.querySelector('#account-add')?.addEventListener('click', () => {
+  const form = document.querySelector('#account-form')
+  if (!form) return
+  form.hidden = !form.hidden
+  if (!form.hidden) document.querySelector('#account-name')?.focus()
 })
 
 // 回车就保存，省得每次都要去找按钮。

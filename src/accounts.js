@@ -156,6 +156,28 @@ export function assertAccountName(name) {
   return name
 }
 
+/**
+ * 下一个可用的默认账号名：A、B、C…Z，用完再 A1、B1…
+ *
+ * 有了它，"保存当前登录"就不必先让用户起名字 —— 直接点一下就存好。
+ * 名字只是本地标签（跟 Claude 账号邮箱无关），自动分配完全够用，
+ * 想改成"工作号"这类记号时再改。
+ */
+export function nextAccountName(existingNames) {
+  const used = new Set(existingNames)
+  for (let i = 0; i < 26; i += 1) {
+    const name = String.fromCharCode(65 + i)
+    if (!used.has(name)) return name
+  }
+  for (let round = 1; round < 100; round += 1) {
+    for (let i = 0; i < 26; i += 1) {
+      const name = `${String.fromCharCode(65 + i)}${round}`
+      if (!used.has(name)) return name
+    }
+  }
+  throw new Error('账号数量已达上限')
+}
+
 /** 这份 profile 里哪些顶层条目属于账号身份（= 全部 - 排除项）。 */
 export function identityEntries(profileDir, readDir = readdirSync) {
   let entries

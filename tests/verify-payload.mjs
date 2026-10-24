@@ -104,7 +104,7 @@ const checks = [
   ['src/win/wfp.js', 'shouldReuseWfpHost', '宿主复用前核对浏览器管控状态'],
   ['src/accounts.js', 'locateDesktopProfile', '账号切换：定位 MSIX 容器里的 Desktop profile'],
   ['src/accounts.js', 'PROFILE_EXCLUDES', '账号切换：缓存与 CLI 二进制不跟着账号走'],
-  ['src/ui/public/index.html', 'sec-accounts', '界面：账号切换面板'],
+  ['src/ui/public/index.html', 'side-accounts', '界面：侧栏账号面板'],
   ['src/ui/public/app.js', 'switchToAccount', '界面：切号动作'],
   ['src/ui/session.js', 'networkBlock', '接口：暴露网络阻断实时状态'],
   ['src/ui/public/index.html', 'action-state', '界面：状态条容器'],

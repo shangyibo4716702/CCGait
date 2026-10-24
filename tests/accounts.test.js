@@ -10,6 +10,7 @@ import {
   identityEntries,
   listAccounts,
   locateDesktopProfile,
+  nextAccountName,
   PROFILE_EXCLUDES,
   recoverInterruptedSwitch,
   saveAccount,
@@ -248,5 +249,17 @@ describe('重复保存同名账号', () => {
     )
     // .bak 不该被当成一个可选账号
     assert.deepEqual(listAccounts(accounts).map((item) => item.name), ['A'])
+  })
+})
+
+describe('默认账号名', () => {
+  it('按 A、B、C 顺序分配，跳已用的，用完字母后用 A1 这类', () => {
+    assert.equal(nextAccountName([]), 'A')
+    assert.equal(nextAccountName(['A']), 'B')
+    assert.equal(nextAccountName(['A', 'B', 'C']), 'D')
+    // 名字是乱序存的，不该影响分配
+    assert.equal(nextAccountName(['B']), 'A')
+    const allLetters = Array.from({ length: 26 }, (_, i) => String.fromCharCode(65 + i))
+    assert.equal(nextAccountName(allLetters), 'A1')
   })
 })

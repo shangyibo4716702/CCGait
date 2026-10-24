@@ -1261,61 +1261,178 @@ input[type='checkbox']:checked::after {
   }
 }
 
-/* ---------------------------------------------------------------- 账号切换 */
+/* ---------------------------------------------------------------- 侧栏账号 */
 
-/* 账号名输入框：跟按钮同高、同圆角，放在 panel-tools 里不破坏对齐 */
-.account-input {
-  width: 132px;
-  padding: 8px 10px;
-  font: inherit;
-  font-size: 13px;
-  color: var(--text);
-  background: var(--surface-2, rgba(255, 255, 255, 0.04));
-  border: 1px solid var(--line, rgba(255, 255, 255, 0.12));
-  border-radius: 8px;
-}
-
-.account-input:focus {
-  outline: none;
-  border-color: var(--accent, #4c8dff);
-}
-
-.account-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.account-row {
+.side-section-account {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 12px;
-  border: 1px solid var(--line, rgba(255, 255, 255, 0.1));
-  border-radius: 10px;
+  justify-content: space-between;
 }
 
-/* 当前账号用左侧高亮条区分，不靠颜色填充（深色底上填充块太吵） */
+.side-account-state {
+  font-weight: 400;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.side-accounts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.side-account-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* 两行网格：名字 + 按钮一行，元信息独占第二行 —— 296px 侧栏放不下三列横排 */
+.account-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
 .account-row.is-current {
-  border-color: var(--accent, #4c8dff);
-  box-shadow: inset 3px 0 0 var(--accent, #4c8dff);
+  border-color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.account-row:hover {
+  border-color: var(--border-strong);
+  background: var(--panel-inset);
+}
+
+.account-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 切换进行中：整列压暗并禁止指针，避免重复点击排队 */
+.account-row.is-busy {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.account-row.is-disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .account-name {
   font-weight: 600;
-  font-size: 13.5px;
-  min-width: 72px;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .account-meta {
-  flex: 1;
-  font-size: 12.5px;
+  font-size: 11.5px;
   color: var(--text-dim);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.account-row .action {
+
+.side-account-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 8px;
+  background: var(--panel-inset);
+}
+
+/* hidden 属性必须压过 display:flex，否则表单永远收不起来 */
+.side-account-form[hidden] {
+  display: none;
+}
+
+.side-account-row {
+  display: flex;
+  gap: 6px;
+}
+
+.account-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* 在线/离线徽章：只有当前账号是在线的，其余号的 Cookies 只是躺在磁盘上 */
+.account-status {
   flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.6;
+}
+
+.account-status.is-online {
+  background: var(--ok-bg);
+  color: var(--ok-text);
+}
+
+.account-status.is-offline {
+  background: var(--pill-bg);
+  color: var(--pill-text);
+}
+
+.side-account-add {
+  width: 100%;
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px dashed var(--border-strong);
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.side-account-add:hover {
+  color: var(--text);
+  border-color: var(--text-dim);
+  background: var(--panel-inset);
+}
+
+.account-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 9px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+}
+
+.account-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.side-account-form .action {
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+.side-hint {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-dim);
 }

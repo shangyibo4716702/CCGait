@@ -477,7 +477,11 @@ describe('账号切换接口', () => {
   // 切号只针对 Desktop，而且必须在"没装 Desktop"时明确报错，
   // 不能悄悄在别处建目录、也不能把 Claude Code 的数据当目标。
   it('没找到 Desktop 数据目录时返回 found:false，不假装成功', async () => {
-    const deps = fakeDeps({ locateDesktopProfile: () => undefined })
+    // accountsRoot 也必须注入：否则会读到本机真实的账号目录，测试结果取决于用户存过什么。
+    const deps = fakeDeps({
+      locateDesktopProfile: () => undefined,
+      accountsRoot: () => join(tempConfig().dir, 'accounts'),
+    })
     const session = createUiSession({ configPath: deps.path, deps: deps.deps })
     const state = await session.getAccounts()
     assert.equal(state.profile.found, false)
@@ -518,5 +522,76 @@ describe('账号切换接口', () => {
     // 没进程在跑时不必杀；关键是凡杀必是 desktop，绝不能顺手把 CLI 一起结束。
     assert.ok(kinds.length >= 1, '切换前必须处理 Desktop 进程')
     assert.ok(kinds.every((kind) => kind === 'desktop'), '只允许结束 desktop 进程')
+  })
+})
+
+describe('切号的合规门控', () => {
+  // 切完号就要启动 Desktop，闸门不会因为"换了个号"就放行。环境不合规时切过去，
+  // 新号一启动就被断网，用户会以为切号坏了。所以判定不通过就不能动现场。
+  it('判定不通过时拒绝切换，且不杀进程、不改当前账号', async () => {
+    const root = tempConfig().dir
+    const profile = join(root, 'profile')
+    mkdirSync(join(profile, 'Network'), { recursive: true })
+    writeFileSync(join(profile, 'Network', 'Cookies'), 'cookies-1')
+    writeFileSync(join(profile, 'ant-did'), 'did-1')
+    const accounts = join(root, 'accounts')
+
+    let killed = 0
+    const deps = fakeDeps({
+      locateDesktopProfile: () => profile,
+      accountsRoot: () => accounts,
+      killClaudeProcessesByKind: async () => {
+        killed += 1
+        return []
+      },
+      runChecks: async () => ({
+        verdict: {
+          allow: false,
+          failedClosed: false,
+          blockedBy: [{ id: 'egress-country', title: '出口国家不在白名单：CN' }],
+          warnings: [],
+        },
+        egress: { ip: '111.0.116.114', country: 'CN', confident: true, hosting: false },
+        dns: { hosts: [], deniedHits: [], resolved: true, hasResolutionError: false },
+        environment: { timezone: { intl: 'Asia/Shanghai', domestic: true } },
+      }),
+    })
+    const session = createUiSession({ configPath: deps.path, deps: deps.deps })
+
+    // 存档本身是本地操作，不需要合规 —— 先存一份出来。
+    await session.saveCurrentAccount('A')
+    const killedBefore = killed
+
+    const result = await session.switchAccountTo('A')
+    assert.equal(result.switched, false, '合规未过不能算切换成功')
+    assert.match(result.reason, /出口国家不在白名单/)
+    assert.equal(killed, killedBefore, '拒绝时不能结束任何进程')
+  })
+})
+
+describe('保存时留空账号名', () => {
+  it('留空自动分配 A，再存一次分配 B', async () => {
+    const root = tempConfig().dir
+    const profile = join(root, 'profile')
+    mkdirSync(join(profile, 'Network'), { recursive: true })
+    writeFileSync(join(profile, 'Network', 'Cookies'), 'cookies-1')
+    writeFileSync(join(profile, 'ant-did'), 'did-1')
+    const accounts = join(root, 'accounts')
+
+    const deps = fakeDeps({
+      locateDesktopProfile: () => profile,
+      accountsRoot: () => accounts,
+      killClaudeProcessesByKind: async () => [],
+      listClaudeProcesses: async () => [],
+    })
+    const session = createUiSession({ configPath: deps.path, deps: deps.deps })
+
+    const first = await session.saveCurrentAccount('')
+    assert.equal(first.name, 'A', '留空应自动分配 A')
+    assert.deepEqual(first.accounts.map((item) => item.name), ['A'])
+
+    const second = await session.saveCurrentAccount('   ')
+    assert.equal(second.name, 'B', '纯空格也算留空，应分配 B')
+    assert.deepEqual(second.accounts.map((item) => item.name).sort(), ['A', 'B'])
   })
 })
