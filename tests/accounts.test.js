@@ -11,6 +11,7 @@ import {
   listAccounts,
   locateDesktopProfile,
   nextAccountName,
+  readAccountInsights,
   PROFILE_EXCLUDES,
   recoverInterruptedSwitch,
   saveAccount,
@@ -261,5 +262,95 @@ describe('默认账号名', () => {
     assert.equal(nextAccountName(['B']), 'A')
     const allLetters = Array.from({ length: 26 }, (_, i) => String.fromCharCode(65 + i))
     assert.equal(nextAccountName(allLetters), 'A1')
+  })
+})
+
+// 这两个函数只读本地文件、零网络请求 —— 安全前提就靠这条钉死。
+function makeInsights(dir, { email, fullName, fh, sd }) {
+  mkdirSync(join(dir, 'plan-usage-history.json'.slice(0, 0) || '.'), { recursive: true })
+  writeFileSync(
+    join(dir, 'plan-usage-history.json'),
+    JSON.stringify({
+      version: 2,
+      samples: [
+        { t: 1, org: 'old', u: {} },
+        { t: Date.UTC(2026, 9, 25, 7, 37, 40), org: 'org1', u: { fh, sd } },
+      ],
+    }),
+  )
+  if (email) {
+    // 模拟 IndexedDB blob：leveldb 记录里是 "email_address" "<邮箱>" "full_name" "<名字>"
+    const blobDir = join(dir, 'IndexedDB', 'https_claude.ai_0.indexeddb.blob', '5', '04')
+    mkdirSync(blobDir, { recursive: true })
+    writeFileSync(join(blobDir, '415'), `prefix bytes"uuid-key""email_address""${email}""full_name""${fullName ?? ''}"trailing`)
+  }
+}
+
+describe('账号识别与用量读取', () => {
+
+  it('从 IndexedDB 锚点后提取邮箱和显示名，从用量历史取最后一条采样', () => {
+    const root = tempDir()
+    makeInsights(root, { email: 'work.example+1@gmail.com', fullName: 'Bradshaw Georgie', fh: 43, sd: 6 })
+    const insights = readAccountInsights(root)
+    assert.equal(insights.email, 'work.example+1@gmail.com')
+    assert.equal(insights.fullName, 'Bradshaw Georgie')
+    assert.equal(insights.usage.fiveHourPercent, 43)
+    assert.equal(insights.usage.weeklyPercent, 6)
+    assert.equal(insights.usage.sampledAt, new Date(Date.UTC(2026, 9, 25, 7, 37, 40)).toISOString())
+  })
+
+  it('文件缺失时不抛错，只少给对应字段', () => {
+    const root = tempDir()
+    const insights = readAccountInsights(root)
+    assert.equal(insights.email, undefined)
+    assert.equal(insights.usage, undefined)
+  })
+
+  it('老采样没有用量字段时跳过它们，取最近一条带用量的', () => {
+    const root = tempDir()
+    writeFileSync(
+      join(root, 'plan-usage-history.json'),
+      JSON.stringify({
+        samples: [
+          { t: 1, org: 'a', u: { fh: 90, sd: 80 } },
+          { t: 2, org: 'a', u: {} },
+          { t: 3, org: 'a', u: { fh: 7, sd: 5 } },
+        ],
+      }),
+    )
+    const insights = readAccountInsights(root)
+    assert.equal(insights.usage.fiveHourPercent, 7, '空采样不算数')
+  })
+
+  it('存档时把识别结果写进元数据，列表能读出来', () => {
+    const root = tempDir()
+    const profile = makeProfile(root, 'A')
+    makeInsights(profile, { email: 'someone@privaterelay.appleid.com', fullName: 'Some One', fh: 0, sd: 73 })
+    const accounts = join(root, 'accounts')
+    saveAccount({ name: 'A', profileDir: profile, accountsDir: accounts, ...opts })
+    const listed = listAccounts(accounts)
+    assert.equal(listed[0].email, 'someone@privaterelay.appleid.com')
+    assert.equal(listed[0].fullName, 'Some One')
+    assert.equal(listed[0].usage.weeklyPercent, 73)
+  })
+})
+
+describe('老存档兼容', () => {
+  it('元数据里没有识别结果时，现场从存档目录读一次', () => {
+    const root = tempDir()
+    const profile = makeProfile(root, 'A')
+    const accounts = join(root, 'accounts')
+    // 先正常存一份（带识别），然后手动抹掉元数据里的识别字段，模拟老存档
+    makeInsights(profile, { email: 'old@icloud.com', fullName: 'Old One', fh: 10, sd: 20 })
+    saveAccount({ name: 'A', profileDir: profile, accountsDir: accounts, ...opts })
+    const metaPath = join(accounts, 'A', '.ccgait-account.json')
+    const meta = JSON.parse(readFileSync(metaPath, 'utf8'))
+    delete meta.email
+    delete meta.usage
+    writeFileSync(metaPath, JSON.stringify(meta), 'utf8')
+
+    const listed = listAccounts(accounts)
+    assert.equal(listed[0].email, 'old@icloud.com', '老存档也要能显示真账号')
+    assert.equal(listed[0].usage.fiveHourPercent, 10)
   })
 })

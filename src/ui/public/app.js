@@ -980,10 +980,12 @@ function renderAccounts(data) {
     row.tabIndex = 0
     row.setAttribute('role', 'button')
 
+    // 标题优先显示真实账号（IndexedDB 里的邮箱），本地名字退居第二行。
+    const label = account.email ?? account.name
+    if (account.fullName) row.title = account.fullName
+
     const head = el('div', 'account-head')
-    const name = el('span', 'account-name', account.name)
-    // 只有一个号是"在线"的 —— 就是当前载入到 Claude 数据目录里的那个。
-    // 其余号的 Cookies 存在磁盘上，本机没有它们的运行实例。
+    const name = el('span', 'account-name', label)
     const status = el(
       'span',
       `account-status ${isCurrent ? 'is-online' : 'is-offline'}`,
@@ -991,31 +993,39 @@ function renderAccounts(data) {
     )
     head.append(name, status)
 
+    // 用量是"最后一次记录"：在线号读的是 profile 里持续追加的采样，
+    // 离线号是它存档那一刻的 —— 都不发任何网络请求。
+    const usage = account.usage
     const meta = el('span', 'account-meta')
     meta.textContent = [
-      isCurrent ? '正在使用' : '点击切换',
+      label !== account.name ? account.name : undefined,
       account.savedAt ? new Date(account.savedAt).toLocaleDateString() : undefined,
     ]
       .filter(Boolean)
       .join(' · ')
 
+    row.append(head, meta)
+    if (usage) {
+      row.append(usageBar('5h', usage.fiveHourPercent), usageBar('周', usage.weeklyPercent))
+    }
+
     const activate = () => {
       if (!account.complete) return
       if (isCurrent) {
-        toast('info', `当前就是账号 ${account.name}`, '已经在用它了，不需要切换')
+        toast('info', `当前就是 ${label}`, '已经在用它了，不需要切换')
         return
       }
       // 切换必须结束 Desktop 才能搬运登录文件。这一步用户必须事先知道，
       // 否则就是"点了一下，Claude 莫名其妙被关掉"。
       const confirmed = window.confirm(
-        `切换到账号 ${account.name}？\n\n` +
+        `切换到 ${label}？\n\n` +
           `· 会先关闭当前的 Claude Desktop，未发送的对话会丢失\n` +
-          `· 然后载入 ${account.name} 的登录态\n` +
+          `· 然后载入这个账号的登录态\n` +
           `· 切换完成后请手动打开 Claude\n\n` +
           `继续吗？`,
       )
       if (!confirmed) return
-      void switchToAccount(account.name)
+      void switchToAccount(account.name, label)
     }
     row.addEventListener('click', activate)
     row.addEventListener('keydown', (event) => {
@@ -1025,9 +1035,28 @@ function renderAccounts(data) {
       }
     })
 
-    row.append(head, meta)
     host.append(row)
   }
+}
+
+/** 细进度条：标签 + 3px 轨道 + 百分比。≥80% 变红提示快到顶。 */
+function usageBar(label, percent) {
+  const bar = el('div', 'usage-bar')
+  const caption = el('span', 'usage-label', label)
+  const track = el('div', 'usage-track')
+  const value = typeof percent === 'number' ? Math.max(0, Math.min(100, Math.round(percent))) : null
+  const fill = el('div', 'usage-fill')
+  if (value !== null) {
+    fill.style.width = `${value}%`
+    if (value >= 80) fill.classList.add('is-high')
+  } else {
+    fill.style.width = '0%'
+    fill.classList.add('is-unknown')
+  }
+  track.append(fill)
+  const text = el('span', 'usage-value', value === null ? '?' : `${value}%`)
+  bar.append(caption, track, text)
+  return bar
 }
 
 async function refreshAccounts() {
@@ -1040,7 +1069,7 @@ async function refreshAccounts() {
 
 let switchingAccount = false
 
-async function switchToAccount(name) {
+async function switchToAccount(name, label) {
   // 切换要几秒（结束进程 + 搬运 13MB），期间重复点击会排队执行好几次切换。
   if (switchingAccount) return
   switchingAccount = true
@@ -1053,7 +1082,7 @@ async function switchToAccount(name) {
       renderAccounts(result)
       return
     }
-    toast('ok', `已切换到账号 ${name}`, 'Claude Desktop 需要你手动打开')
+    toast('ok', `已切换到 ${label ?? name}`, 'Claude Desktop 需要你手动打开')
     renderAccounts(result)
   } catch (error) {
     toast('error', '切换失败', error instanceof Error ? error.message : String(error))

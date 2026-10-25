@@ -1436,3 +1436,54 @@ input[type='checkbox']:checked::after {
   line-height: 1.55;
   color: var(--text-dim);
 }
+
+/* 用量细进度条：3px 轨道，sub2abi 那种贴边的细条 */
+.usage-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.usage-label {
+  flex-shrink: 0;
+  width: 16px;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-track {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--pill-bg);
+  overflow: hidden;
+}
+
+.usage-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.35s ease;
+}
+
+/* 快用满时换红：阈值和 JS 里保持一致（80%） */
+.usage-fill.is-high {
+  background: var(--danger-text);
+}
+
+.usage-fill.is-unknown {
+  background: var(--border-strong);
+}
+
+.usage-value {
+  flex-shrink: 0;
+  width: 30px;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-dim);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}

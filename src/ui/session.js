@@ -25,6 +25,7 @@ import {
   listAccounts,
   locateDesktopProfile,
   nextAccountName,
+  readAccountInsights,
   readCurrentAccount,
   assertAccountName,
   recoverInterruptedSwitch,
@@ -773,11 +774,27 @@ function resolveAppUserModelId() {
 
   const readAccountsState = () => {
     const profile = resolveProfile()
+    const current = readCurrentAccount(accountsBase)
+    const accounts = listAccounts(accountsBase)
+    // 在线账号的用量直接读当前 profile（plan-usage-history.json 是普通 JSON，
+    // Desktop 运行中也读得到，而且它在持续追加 —— 这才是"最后一次记录"的本意）。
+    // 邮箱所在的 IndexedDB 在运行中会被锁，读不到就沿用存档时记录的那个。
+    if (profile && current) {
+      const live = readAccountInsights(profile)
+      const index = accounts.findIndex((item) => item.name === current)
+      if (index >= 0) {
+        accounts[index] = {
+          ...accounts[index],
+          ...(live.email ? { email: live.email } : {}),
+          ...(live.usage ? { usage: live.usage } : {}),
+        }
+      }
+    }
     return {
       profile: profile ? { found: true, path: profile } : { found: false },
       accountsDir: accountsBase,
-      current: readCurrentAccount(accountsBase),
-      accounts: listAccounts(accountsBase),
+      current,
+      accounts,
     }
   }
 

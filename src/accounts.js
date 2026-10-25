@@ -203,6 +203,107 @@ export function accountComplete(dir, exists = existsSync, size = (p) => statSync
   }
 }
 
+/**
+ * 邮箱的匹配范围：email_address 之后 300 字节内的窗口里找。
+ * 值域放宽到 40 字符用户名，覆盖 privaterelay.appleid.com 这类长前缀。
+ */
+const EMAIL_PATTERN = /[a-zA-Z0-9][a-zA-Z0-9._%+-]{1,40}@[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,8}/
+
+function walkFiles(dir, depth, out, readDir = readdirSync) {
+  if (depth > 5) return
+  let entries
+  try {
+    entries = readDir(dir, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const entry of entries) {
+    const full = join(dir, entry.name)
+    if (entry.isDirectory()) {
+      walkFiles(full, depth + 1, out, readDir)
+    } else {
+      out.push(full)
+    }
+  }
+}
+
+/**
+ * 从 profile（或存档）目录里提取「这个号是谁、用量还剩多少」。
+ *
+ * 两个来源都是**本地文件，不发任何网络请求**：
+ *
+ *  - 邮箱 / 显示名：IndexedDB 的 blob 文件里，leveldb 记录是明文的
+ *    `"email_address" "<邮箱>" "full_name" "<名字>"`，拿 `email_address` 当锚点向后找。
+ *    注意运行中的 Desktop 会锁住这些文件（实测 EBUSY）—— 所以在存档时（进程必已
+ *    退出）提取并写进元数据；在线账号读不到就显示上次存档时的。
+ *  - 用量：`plan-usage-history.json` 的 `samples[]`，Desktop 持续追加，取最后一条
+ *    带用量的采样。`u.fh` = 5 小时窗已用百分比，`u.sd` = 7 天窗已用百分比
+ *    （实测两条：在线号 fh=43/sd=6，存档 A fh=0/sd=73，都是 0-100 的整数）。
+ *    这个是普通 JSON，进程运行时也能读（读到写一半的会解析失败，跳过即可）。
+ */
+export function readAccountInsights(dir, { readDir = readdirSync, readFile = readFileSync } = {}) {
+  const insights = {}
+
+  try {
+    const history = JSON.parse(readFile(join(dir, 'plan-usage-history.json'), 'utf8'))
+    const samples = Array.isArray(history?.samples) ? history.samples : []
+    for (let i = samples.length - 1; i >= 0; i -= 1) {
+      const usage = samples[i]?.u
+      if (usage && (typeof usage.fh === 'number' || typeof usage.sd === 'number')) {
+        insights.usage = {
+          fiveHourPercent: typeof usage.fh === 'number' ? usage.fh : undefined,
+          weeklyPercent: typeof usage.sd === 'number' ? usage.sd : undefined,
+          sampledAt: typeof samples[i].t === 'number' ? new Date(samples[i].t).toISOString() : undefined,
+        }
+        break
+      }
+    }
+  } catch {
+    // 文件不存在 / 正被重写读到半截：不显示用量即可。
+  }
+
+  try {
+    const files = []
+    walkFiles(join(dir, 'IndexedDB'), 0, files, readDir)
+    const anchor = Buffer.from('email_address', 'latin1')
+    const nameAnchor = Buffer.from('full_name', 'latin1')
+    outer: for (const file of files) {
+      let buffer
+      try {
+        buffer = readFile(file)
+      } catch {
+        // 被占用（在线的 Desktop 锁着）就跳过这个文件。
+        continue
+      }
+      let index = buffer.indexOf(anchor)
+      while (index >= 0) {
+        const window = buffer
+          .subarray(index + anchor.length, index + anchor.length + 300)
+          .toString('latin1')
+        const match = EMAIL_PATTERN.exec(window)
+        if (match) {
+          insights.email = match[0]
+          // 显示名通常紧跟在邮箱后面：锚点 full_name 后第一个 "…" 里的内容。
+          const nameIndex = buffer.indexOf(nameAnchor, index)
+          if (nameIndex > index) {
+            const nameWindow = buffer.subarray(nameIndex, nameIndex + 200).toString('utf8')
+            const quoted = /full_name"\s*"([^"]{1,60})"/.exec(nameWindow)
+            if (quoted && /^[\x20-\x7e\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+$/.test(quoted[1])) {
+              insights.fullName = quoted[1]
+            }
+          }
+          break outer
+        }
+        index = buffer.indexOf(anchor, index + 1)
+      }
+    }
+  } catch {
+    // IndexedDB 不存在或整个目录读不了：只少显示邮箱，不影响其余功能。
+  }
+
+  return insights
+}
+
 function rmrf(path) {
   try {
     rmSync(path, { recursive: true, force: true })
@@ -299,8 +400,15 @@ export function saveAccount({
     rmrf(target)
   }
   renameSync(staging, target)
-  writeFileSync(join(target, '.ccgait-account.json'), `${JSON.stringify({ name, savedAt: new Date().toISOString() }, null, 2)}\n`, 'utf8')
-  return { name, entries: entries.length, dir: target }
+  // 在存档时刻提取"这个号是谁、用量还剩多少"：此刻 Desktop 必已退出，IndexedDB 不会被锁。
+  // 写进元数据后列表接口直接读 JSON，不必每次扫 leveldb。
+  const insights = readAccountInsights(target)
+  writeFileSync(
+    join(target, '.ccgait-account.json'),
+    `${JSON.stringify({ name, savedAt: new Date().toISOString(), ...insights }, null, 2)}\n`,
+    'utf8',
+  )
+  return { name, entries: entries.length, dir: target, ...insights }
 }
 
 /** 读出所有账号（按修改时间倒序，最近用过的在前）。 */
@@ -316,11 +424,23 @@ export function listAccounts(accountsDir, readDir = readdirSync) {
     if (!item.isDirectory() || !ACCOUNT_NAME.test(item.name)) continue
     const dir = join(accountsDir, item.name)
     let savedAt
+    let insights = {}
     try {
       const meta = JSON.parse(readFileSync(join(dir, '.ccgait-account.json'), 'utf8'))
       savedAt = meta.savedAt
+      insights = {
+        email: typeof meta.email === 'string' ? meta.email : undefined,
+        fullName: typeof meta.fullName === 'string' ? meta.fullName : undefined,
+        usage: meta.usage && typeof meta.usage === 'object' ? meta.usage : undefined,
+      }
     } catch {
       // 老存档没有元数据文件，按目录时间算。
+    }
+    // 老存档的元数据里没有识别结果（功能是后来加的）：现场读一次存档目录。
+    // 存档不受运行中的 Desktop 锁定，随时读得到；不回写元数据，避免列表接口带副作用。
+    if (!insights.email && !insights.usage) {
+      const live = readAccountInsights(dir)
+      if (live.email || live.usage) insights = { ...insights, ...live }
     }
     if (!savedAt) {
       try {
@@ -329,7 +449,7 @@ export function listAccounts(accountsDir, readDir = readdirSync) {
         savedAt = undefined
       }
     }
-    accounts.push({ name: item.name, complete: accountComplete(dir), savedAt, dir })
+    accounts.push({ name: item.name, complete: accountComplete(dir), savedAt, dir, ...insights })
   }
   return accounts.sort((a, b) => String(b.savedAt ?? '').localeCompare(String(a.savedAt ?? '')))
 }
