@@ -1488,6 +1488,88 @@ for (const id of ['#cidrs', '#countries', '#asns']) {
   })
 }
 
+/**
+ * 国家点选器：常用国家做成可点的 chip，点一下加入/移出白名单。
+ * 数据来自 CLDR 的常用地区中文名 —— 纯静态映射，不联网。
+ */
+const COUNTRY_CHOICES = [
+  ['GB', '英国'],
+  ['US', '美国'],
+  ['JP', '日本'],
+  ['SG', '新加坡'],
+  ['HK', '香港'],
+  ['DE', '德国'],
+  ['FR', '法国'],
+  ['NL', '荷兰'],
+  ['KR', '韩国'],
+  ['TW', '台湾'],
+  ['CA', '加拿大'],
+  ['AU', '澳大利亚'],
+  ['IT', '意大利'],
+  ['SE', '瑞典'],
+  ['CH', '瑞士'],
+  ['MY', '马来西亚'],
+  ['TH', '泰国'],
+  ['AE', '阿联酋'],
+]
+
+// 国家点选器默认收起：只在用户点「选择国家」时展开，避免整块 chip 墙占屏。
+let countryPickerOpen = false
+
+function renderCountryPicker() {
+  const host = document.querySelector('#country-picker')
+  if (!host) return
+  const input = document.querySelector('#countries')
+  const selected = () => new Set(splitList(input.value).map((item) => item.toUpperCase()))
+
+  // 展开条：显示当前已选的 chip（紧凑），点击切换展开/收起。
+  const toggle = el('button', 'country-toggle')
+  toggle.type = 'button'
+  const activeCodes = COUNTRY_CHOICES.filter(([code]) => selected().has(code))
+  toggle.textContent = countryPickerOpen
+    ? '收起国家列表 ▲'
+    : `选择国家 ▼${activeCodes.length ? `（已选 ${activeCodes.length} 个）` : ''}`
+  toggle.addEventListener('click', () => {
+    countryPickerOpen = !countryPickerOpen
+    renderCountryPicker()
+  })
+
+  host.replaceChildren(toggle)
+  if (!countryPickerOpen) return
+
+  const grid = el('div', 'country-grid')
+  for (const [code, label] of COUNTRY_CHOICES) {
+    const chip = el('button', 'country-chip', `${label} ${code}`)
+    chip.type = 'button'
+    chip.dataset.code = code
+    chip.addEventListener('click', () => {
+      const set = selected()
+      if (set.has(code)) {
+        set.delete(code)
+      } else {
+        set.add(code)
+      }
+      // 保留手写进去的非列表项：只按 COUNTRY_CHOICES 的顺序重排，不丢其它代码
+      const chosen = COUNTRY_CHOICES.filter(([c]) => set.has(c)).map(([c]) => c)
+      const extras = [...set].filter((code2) => !COUNTRY_CHOICES.some(([c]) => c === code2))
+      input.value = [...chosen, ...extras].join(', ')
+      formDirty = true
+      renderCountryPicker()
+    })
+    if (selected().has(code)) chip.classList.add('is-active')
+    grid.append(chip)
+  }
+  host.append(grid)
+}
+renderCountryPicker()
+// 配置回填后（renderForm 会重写 #countries）再渲染一次，选中态才对得上磁盘上的值。
+// 包一层而不是替换函数：调用方拿到的引用不变。
+const originalRenderForm = renderForm
+renderForm = function (...args) {
+  originalRenderForm(...args)
+  renderCountryPicker()
+}
+
 const events = new EventSource(`/api/events?token=${encodeURIComponent(TOKEN)}`)
 events.addEventListener('log', (event) => {
   const payload = JSON.parse(event.data)

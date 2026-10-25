@@ -1487,3 +1487,64 @@ input[type='checkbox']:checked::after {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
+
+/* ---------------------------------------------------------------- 国家点选 */
+
+/* 常用国家 chip：点选加入/移出白名单，替代手写两位代码 */
+.country-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 7px;
+}
+
+.country-chip {
+  padding: 4px 9px;
+  font: inherit;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--text-muted);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s, color 0.12s;
+}
+
+.country-chip:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+/* 已选中的 chip 反色：黑底白字，一眼看清白名单里有什么 */
+.country-chip.is-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--panel);
+}
+
+/* 收起状态的「选择国家」展开条与展开后的 chip 网格 */
+.country-toggle {
+  width: 100%;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.country-toggle:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.country-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
