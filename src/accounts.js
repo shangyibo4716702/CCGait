@@ -226,6 +226,41 @@ export function accountComplete(dir, exists = existsSync, size = (p) => statSync
 }
 
 /**
+ * 新建一个「空白账号」：存档里只有元数据、没有任何登录态。
+ *
+ * 用途：先占一个位置，切过去之后 Claude 打开就是登录页，走完 OAuth 再点「更新」
+ * 把真实登录态存进来。比"先在别的账号里登出、登录、再保存"省事，也不会
+ * 把当前账号的 Cookies 误存成新账号。
+ *
+ * 刻意不复制任何身份条目：空白就是真的空白。切换时会把现有身份全部移除，
+ * Claude 启动后读到的是没有 sessionKey 的干净状态，于是展示登录页。
+ */
+export function createEmptyAccount(accountsDir, name, { exists = existsSync, mkdirSyncFn = mkdirSync } = {}) {
+  assertAccountName(name)
+  const dir = accountDir(accountsDir, name)
+  if (exists(join(dir, '.ccgait-account.json')) || exists(join(dir, ...REQUIRED_ENTRY))) {
+    throw new Error(`账号 ${name} 已存在`)
+  }
+  mkdirSyncFn(dir, { recursive: true })
+  writeFileSync(
+    join(dir, '.ccgait-account.json'),
+    `${JSON.stringify({ name, savedAt: new Date().toISOString(), empty: true }, null, 2)}\n`,
+    'utf8',
+  )
+  return { name, dir, empty: true }
+}
+
+/** 这个存档是不是"还没登录过"的空白账号。 */
+export function isEmptyAccount(dir, exists = existsSync, readFile = (p) => readFileSync(p, 'utf8')) {
+  if (accountComplete(dir, exists)) return false
+  try {
+    return JSON.parse(readFile(join(dir, '.ccgait-account.json')))?.empty === true
+  } catch {
+    return false
+  }
+}
+
+/**
  * 邮箱的匹配范围：email_address 之后 300 字节内的窗口里找。
  * 值域放宽到 40 字符用户名，覆盖 privaterelay.appleid.com 这类长前缀。
  */
@@ -534,6 +569,8 @@ export function listAccounts(accountsDir, readDir = readdirSync) {
       savedAt,
       dir,
       uuid: readAccountUuid(dir),
+      // 空白账号（只有元数据、没登录态）：界面要标成空白/待登录而不是存档不完整
+      empty: isEmptyAccount(dir),
       ...insights,
     })
   }
@@ -571,7 +608,10 @@ export async function switchAccount({
   if (!isFirstCapture && !exists(source)) {
     throw new Error(`账号 ${name} 还没有存档，请先登录它并保存`)
   }
-  if (!isFirstCapture && !accountComplete(source, exists)) {
+  // 空白账号允许切换：它的意义就是"切过去之后由 Claude 弹登录页"。
+  // 非空白但不完整的存档仍然拒绝 —— 那通常意味着存档被破坏，切过去会变成坏登录态。
+  const isEmpty = !isFirstCapture && isEmptyAccount(source, exists)
+  if (!isFirstCapture && !isEmpty && !accountComplete(source, exists)) {
     throw new Error(`账号 ${name} 的存档不完整（缺少 Network/Cookies）`)
   }
 
@@ -581,7 +621,13 @@ export async function switchAccount({
   // 2. 存档当前登录态。首次运行时就是把现有登录收编成 A。
   const archivedFrom = isFirstCapture ? DEFAULT_ACCOUNT : current
   if (archivedFrom) {
-    saveAccount({ name: archivedFrom, profileDir, accountsDir, runRobocopy, readDir, exists })
+    // 当前用的是空白账号、且用户还没登录：现场没有 Cookies，saveAccount 会以
+    // "存档不完整"抛错，结果连"切回去"都做不到。这种情况跳过存档，让它保持空白。
+    const currentWasEmpty = isEmptyAccount(accountDir(accountsDir, archivedFrom), exists)
+    const liveHasLogin = accountComplete(profileDir, exists)
+    if (!(currentWasEmpty && !liveHasLogin)) {
+      saveAccount({ name: archivedFrom, profileDir, accountsDir, runRobocopy, readDir, exists })
+    }
   }
 
   if (isFirstCapture && name === DEFAULT_ACCOUNT) {
@@ -605,10 +651,13 @@ export async function switchAccount({
   }
 
   try {
-    // 4. 载入目标存档。
-    copyEntries({ from: source, to: profileDir, entries: identityEntries(source, readDir), runRobocopy })
-    if (!accountComplete(profileDir, exists)) {
-      throw new Error('切换后校验失败（Network/Cookies 不在位）')
+    // 4. 载入目标存档。空白账号没有身份条目，复制这一步天然跳过 ——
+    // 结果就是一个没有 sessionKey 的干净 profile，Claude 打开即登录页。
+    if (!isEmpty) {
+      copyEntries({ from: source, to: profileDir, entries: identityEntries(source, readDir), runRobocopy })
+      if (!accountComplete(profileDir, exists)) {
+        throw new Error('切换后校验失败（Network/Cookies 不在位）')
+      }
     }
   } catch (error) {
     // 5. 回滚：把搬走的条目放回去。

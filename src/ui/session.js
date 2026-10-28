@@ -32,6 +32,7 @@ import {
   assertAccountName,
   recoverInterruptedSwitch,
   removeAccount,
+  createEmptyAccount,
   accountDir,
   saveAccount,
   switchAccount,
@@ -888,6 +889,21 @@ function resolveAppUserModelId() {
 
   const getAccounts = () => serialize(async () => readAccountsState())
 
+  /**
+   * 新建空白账号：先占位，切过去由 Claude 弹登录页，登录完再点「更新」。
+   *
+   * 为什么不直接复制当前登录态：当前账号的 Cookies 是**别人的**。
+   * 复制过去就成了重复账号（两个名字同一身份），登录页也不会出现。
+   */
+  const createEmptyAccountFor = (name) =>
+    serialize(async () => {
+      const wanted = (name ?? '').trim() || nextAccountName(listAccounts(accountsBase).map((item) => item.name))
+      const result = createEmptyAccount(accountsBase, wanted)
+      pushLog('info', `已新建空白账号 ${wanted}`, '切换过去后 Claude 会要求登录，登录完成请点「更新」保存')
+      emit({ type: 'status' })
+      return { ...result, ...readAccountsState() }
+    })
+
   /** 把当前登录态存成账号 <name>；名字留空就自动分配 A、B、C… */
   const saveCurrentAccount = (name) =>
     serialize(async () => {
@@ -1233,6 +1249,7 @@ function resolveAppUserModelId() {
     killProcesses,
     getAccounts,
     saveCurrentAccount,
+    createEmptyAccountFor,
     updateAccount,
     deleteAccount,
     listSyncableSessions,

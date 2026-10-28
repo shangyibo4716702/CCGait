@@ -77,10 +77,15 @@
           <button class="side-account-add" id="account-add" type="button">+ 添加账号</button>
           <div class="side-account-form" id="account-form" hidden>
             <p class="side-hint">
-              先在 Claude 里退出当前账号、登录要保存的那个，再回来点「保存当前登录」。
+              两种加法：<br />
+              · <strong>新建空白账号</strong> —— 切过去后 Claude 会要求登录，登录完点「更新」保存<br />
+              · <strong>保存当前登录</strong> —— 已经在 Claude 里登录好了，直接把这份登录态存下来
             </p>
             <div class="side-account-row">
               <input class="account-input" id="account-name" type="text" maxlength="32" placeholder="名字（可留空）" />
+            </div>
+            <div class="side-account-row">
+              <button class="action primary" id="account-create-empty" type="button">新建空白账号</button>
               <button class="action" id="account-save" type="button">保存当前登录</button>
             </div>
           </div>

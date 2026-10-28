@@ -290,6 +290,11 @@ export function createUiServer({ session, logger, token = randomBytes(24).toStri
             sendJson(response, 200, await session.saveCurrentAccount(body.name))
             return
           }
+          case '/api/accounts/create-empty': {
+            const body = await readJsonBody(request)
+            sendJson(response, 200, await session.createEmptyAccountFor(body.name))
+            return
+          }
           case '/api/accounts/update': {
             const body = await readJsonBody(request)
             sendJson(response, 200, await session.updateAccount(body.name))

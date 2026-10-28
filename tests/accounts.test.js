@@ -13,6 +13,8 @@ import {
   nextAccountName,
   readAccountInsights,
   removeAccount,
+  createEmptyAccount,
+  isEmptyAccount,
   readAccountUuid,
   matchLiveAccount,
   writeCurrentAccount,
@@ -468,5 +470,103 @@ describe('登录态识别', () => {
     const root = tempDir()
     writeFileSync(join(root, 'config.json'), JSON.stringify({ first_launch_at: 1 }))
     assert.equal(readAccountInsights(root).signedIn, undefined)
+  })
+})
+
+describe('空白账号', () => {
+  it('新建时只写元数据，不带任何登录态', () => {
+    const root = tempDir()
+    const accounts = join(root, 'accounts')
+    const result = createEmptyAccount(accounts, 'NEW')
+    assert.equal(result.empty, true)
+    assert.ok(!existsSync(join(accounts, 'NEW', 'Network', 'Cookies')), '不能有 Cookies')
+    assert.equal(accountComplete(join(accounts, 'NEW')), false)
+    assert.equal(isEmptyAccount(join(accounts, 'NEW')), true)
+  })
+
+  it('同名已存在时拒绝，不覆盖别人的存档', () => {
+    const root = tempDir()
+    const profile = makeProfile(root, 'A')
+    const accounts = join(root, 'accounts')
+    saveAccount({ name: 'A', profileDir: profile, accountsDir: accounts, ...opts })
+    assert.throws(() => createEmptyAccount(accounts, 'A'), /已存在/)
+    assert.equal(accountComplete(join(accounts, 'A')), true, '原有存档不能被破坏')
+  })
+
+  it('空白账号允许切换，且切过去后现场没有 Cookies（Claude 会弹登录页）', async () => {
+    const root = tempDir()
+    const profile = makeProfile(root, 'A')
+    const accounts = join(root, 'accounts')
+    saveAccount({ name: 'A', profileDir: profile, accountsDir: accounts, ...opts })
+    createEmptyAccount(accounts, 'BLANK')
+
+    const result = await switchAccount({
+      name: 'BLANK',
+      profileDir: profile,
+      accountsDir: accounts,
+      current: 'A',
+      ...opts,
+    })
+    assert.equal(result.archivedFrom, 'A')
+    assert.equal(accountComplete(profile), false, '切到空白账号后现场不该有 Cookies')
+    // A 的登录态完好保留在存档里
+    assert.equal(accountComplete(join(accounts, 'A')), true)
+  })
+
+  it('不完整但不是空白的存档仍然拒绝切换', async () => {
+    const root = tempDir()
+    const profile = makeProfile(root, 'A')
+    const accounts = join(root, 'accounts')
+    saveAccount({ name: 'A', profileDir: profile, accountsDir: accounts, ...opts })
+    // 造一个"有目录、有元数据，但没 Cookies 也不是 empty"的坏存档
+    mkdirSync(join(accounts, 'BROKEN'), { recursive: true })
+    writeFileSync(join(accounts, 'BROKEN', '.ccgait-account.json'), JSON.stringify({ name: 'BROKEN' }))
+    await assert.rejects(
+      switchAccount({ name: 'BROKEN', profileDir: profile, accountsDir: accounts, current: 'A', ...opts }),
+      /存档不完整/,
+    )
+  })
+})
+
+describe('从空白账号切走', () => {
+  it('还没登录就切回去也能成功（不因为没 Cookies 而卡死）', async () => {
+    const root = tempDir()
+    const profile = makeProfile(root, 'A')
+    const accounts = join(root, 'accounts')
+    saveAccount({ name: 'A', profileDir: profile, accountsDir: accounts, ...opts })
+    createEmptyAccount(accounts, 'BLANK')
+
+    // 切到空白：现场变成没有 Cookies 的状态
+    await switchAccount({ name: 'BLANK', profileDir: profile, accountsDir: accounts, current: 'A', ...opts })
+    assert.equal(accountComplete(profile), false)
+
+    // 用户没登录就想切回 A —— 之前这里会以"存档不完整"抛错
+    const back = await switchAccount({
+      name: 'A',
+      profileDir: profile,
+      accountsDir: accounts,
+      current: 'BLANK',
+      ...opts,
+    })
+    assert.equal(back.archivedFrom, 'BLANK')
+    assert.equal(accountComplete(profile), true, 'A 的登录态应当恢复')
+    assert.equal(isEmptyAccount(join(accounts, 'BLANK')), true, '空白账号仍是空白，没被写坏')
+  })
+
+  it('空白账号登录过之后再切走，会把登录态存进去', async () => {
+    const root = tempDir()
+    const profile = makeProfile(root, 'A')
+    const accounts = join(root, 'accounts')
+    saveAccount({ name: 'A', profileDir: profile, accountsDir: accounts, ...opts })
+    createEmptyAccount(accounts, 'BLANK')
+    await switchAccount({ name: 'BLANK', profileDir: profile, accountsDir: accounts, current: 'A', ...opts })
+
+    // 模拟"用户在这个空白账号里登录了"
+    mkdirSync(join(profile, 'Network'), { recursive: true })
+    writeFileSync(join(profile, 'Network', 'Cookies'), 'cookies-new-login')
+
+    await switchAccount({ name: 'A', profileDir: profile, accountsDir: accounts, current: 'BLANK', ...opts })
+    assert.equal(accountComplete(join(accounts, 'BLANK')), true, '登录态要存进空白账号')
+    assert.equal(isEmptyAccount(join(accounts, 'BLANK')), false, '不再是空白')
   })
 })

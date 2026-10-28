@@ -983,7 +983,8 @@ function renderAccounts(data) {
     const row = el('div', 'account-row')
     const isCurrent = account.name === data.current
     if (isCurrent) row.classList.add('is-current')
-    if (!account.complete) row.classList.add('is-disabled')
+    // 空白账号可以点（切过去就是要它弹登录页）；只有"存档不完整且不是空白"的才禁用。
+    if (!account.complete && !account.empty) row.classList.add('is-disabled')
     row.tabIndex = 0
     row.setAttribute('role', 'button')
 
@@ -998,11 +999,20 @@ function renderAccounts(data) {
     if (account.fullName) row.title = account.fullName
 
     const head = el('div', 'account-head')
-    const name = el('span', 'account-name', label)
+    // 空白账号没有邮箱也没有 uuid，用本地名字当标题就够了。
+    const name = el('span', 'account-name', account.empty ? account.name : label)
     const status = el(
       'span',
       `account-status ${isCurrent ? 'is-online' : 'is-offline'}`,
-      account.complete ? (isCurrent ? '在线' : '离线') : '存档不完整',
+      account.empty
+        ? isCurrent
+          ? '待登录'
+          : '空白'
+        : account.complete
+          ? isCurrent
+            ? '在线'
+            : '离线'
+          : '存档不完整',
     )
     head.append(name, status)
 
@@ -1020,9 +1030,11 @@ function renderAccounts(data) {
     meta.textContent = [
       // 本地名字始终显示（用户自己起的标签，切换时要用它）
       account.name,
+      // 空白账号要说清楚下一步做什么，否则用户不知道"空白"该干嘛。
+      account.empty ? '点一下切过去，Claude 会让你登录' : undefined,
       // 登录态：windowSizeWasSignedIn=false 只说明"窗口尺寸不是在登录状态下保存的"，
       // 不等于当前没登录 —— 之前我按"登录失效"显示是错的，这里只提示、不下结论。
-      account.signedIn === false ? '本窗口可能在登录前打开' : undefined,
+      account.empty ? undefined : account.signedIn === false ? '本窗口可能在登录前打开' : undefined,
       account.savedAt ? new Date(account.savedAt).toLocaleDateString() : undefined,
     ]
       .filter(Boolean)
@@ -1072,22 +1084,26 @@ function renderAccounts(data) {
     row.append(actions)
 
     const activate = () => {
-      if (!account.complete) return
+      if (!account.complete && !account.empty) return
       if (isCurrent) {
         toast('info', `当前就是 ${label}`, '已经在用它了，不需要切换')
         return
       }
       // 切换必须结束 Desktop 才能搬运登录文件。这一步用户必须事先知道，
       // 否则就是"点了一下，Claude 莫名其妙被关掉"。
+      // 空白账号要说清楚会变成"要登录"的状态，避免用户以为切号坏了。
       const confirmed = window.confirm(
-        `切换到 ${label}？\n\n` +
+        `切换到 ${account.name}？\n\n` +
           `· 会先关闭当前的 Claude Desktop，未发送的对话会丢失\n` +
-          `· 然后载入这个账号的登录态\n` +
+          (account.empty
+            ? `· 这是空白账号，载入后没有任何登录态 —— 打开 Claude 会让你登录\n` +
+              `· 登录完成后回来点「更新」把这份登录态存下来\n`
+            : `· 然后载入这个账号的登录态\n`) +
           `· 切换完成后请手动打开 Claude\n\n` +
           `继续吗？`,
       )
       if (!confirmed) return
-      void switchToAccount(account.name, label)
+      void switchToAccount(account.name, account.empty ? account.name : label)
     }
     row.addEventListener('click', activate)
     row.addEventListener('keydown', (event) => {
@@ -1365,6 +1381,36 @@ async function deleteAccount(name, label) {
     renderAccounts(result)
   } catch (error) {
     toast('error', '删除失败', error instanceof Error ? error.message : String(error))
+  }
+}
+
+/**
+ * 新建空白账号：只写元数据、不带任何登录态。
+ * 切过去之后 Claude 读到的是干净 profile，会直接弹登录页。
+ */
+async function createEmptyAccount() {
+  const input = document.querySelector('#account-name')
+  const button = document.querySelector('#account-create-empty')
+  const name = (input?.value ?? '').trim()
+  const original = button?.textContent
+  if (button) {
+    button.disabled = true
+    button.textContent = '新建中…'
+  }
+  try {
+    const result = await api('/api/accounts/create-empty', { method: 'POST', body: { name } })
+    toast('ok', `已新建空白账号 ${result?.name ?? ''}`, '切过去后 Claude 会要求登录')
+    if (input) input.value = ''
+    const form = document.querySelector('#account-form')
+    if (form) form.hidden = true
+    renderAccounts(result)
+  } catch (error) {
+    toast('error', '新建失败', error instanceof Error ? error.message : String(error))
+  } finally {
+    if (button) {
+      button.disabled = false
+      button.textContent = original
+    }
   }
 }
 
@@ -1869,6 +1915,10 @@ document.querySelector('#launch-desktop')?.addEventListener('click', () => {
 
 document.querySelector('#account-save')?.addEventListener('click', () => {
   void saveCurrentAccount()
+})
+
+document.querySelector('#account-create-empty')?.addEventListener('click', () => {
+  void createEmptyAccount()
 })
 
 // 「添加账号」默认收起：只有要加新号时才展开，展开后直接给出该做什么。
