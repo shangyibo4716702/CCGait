@@ -120,7 +120,10 @@ async function run(action, fn, successMessage) {
 
 async function refresh() {
   try {
-    status = await api('/api/status')
+    // 账号面板也一起刷：它在侧栏常驻，用户改完登录态/切完号回来看到的是屏幕上的旧值，
+    // 必须关掉页面重开才更新（实测被投诉）。这里并行拉，互不阻塞。
+    const [next] = await Promise.all([api('/api/status'), refreshAccounts()])
+    status = next
     checkBuildMatch()
     render()
   } catch (error) {
@@ -1897,8 +1900,6 @@ document.querySelector('#sync-confirm')?.addEventListener('click', () => void co
 document.querySelector('#account-name')?.addEventListener('keydown', (event) => {
   if (event.key === 'Enter') void saveCurrentAccount()
 })
-
-void refreshAccounts()
 
 setInterval(() => {
   // 兜底轮询：SSE 只推送"本界面自己"的动作 —— 托盘那边的闸门建立的阻断不会推事件，
