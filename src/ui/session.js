@@ -546,16 +546,48 @@ function resolveAppUserModelId() {
     home: process.env.USERPROFILE,
   })
 
+  /**
+   * 给"几乎不会变"的探测加一个短 TTL 缓存。
+   *
+   * 为什么需要：界面每 8 秒轮询一次 /api/status，而每一项都要起一次 PowerShell
+   * （实测 firewallProfileState 290ms、listManagedRules 300ms、listClaudeProcesses
+   * 560ms…）。全部并行也有 600ms 以上，用户点开面板、切个账号都觉得"卡"。
+   *
+   * 缓存多久：管理员权限、防火墙规则、开机自启这几项只会在用户主动改设置时变化，
+   * 而改设置的动作走的是本会话（会主动失效缓存）。3 秒足够挡住连续轮询的重复开销，
+   * 又短到不会让界面显示过期状态。
+   *
+   * 刻意不缓存 listClaudeProcesses：它是"现在有没有 Claude 在跑"的唯一依据，
+   * 缓存它会让"启动 Claude 后界面仍说没在跑"。
+   */
+  const TTL_MS = 3000
+  const cache = new Map()
+  const cached = (key, load) => {
+    const now = Date.now()
+    const hit = cache.get(key)
+    if (hit && now - hit.at < TTL_MS) return Promise.resolve(hit.value)
+    return Promise.resolve(load()).then((value) => {
+      cache.set(key, { at: now, value })
+      return value
+    })
+  }
+  const invalidateCache = () => cache.clear()
+
   const getConfig = () => loaded.config
 
   /** 当前完整状态快照（UI 的主要数据源）。 */
   const getStatus = async () => {
-    const [elevated, profile, rules, processes, startup] = await Promise.all([
-      deps.isElevated(),
-      deps.firewallProfileState(),
-      deps.listManagedRules(),
+    // WFP 宿主探测也并进 Promise.all：它本身是一次 WMI 查询（实测 471ms），
+    // 之前排在后面串行执行，等于每轮白等半秒 —— 面板 8 秒轮询一次，
+    // 累计下来就是用户感知到的"卡"。
+    const [elevated, profile, rules, processes, startup, wfpHosts] = await Promise.all([
+      cached('elevated', deps.isElevated),
+      cached('firewallProfile', deps.firewallProfileState),
+      cached('managedRules', deps.listManagedRules),
+      // 进程列表不缓存：它是"现在有没有 Claude 在跑"的唯一依据。
       deps.listClaudeProcesses(),
-      deps.startupStatus(),
+      cached('startup', deps.startupStatus),
+      cached('wfpHosts', deps.listWfpHosts),
     ])
     const discovery = deps.claudeDiscovery(clientDiscoveryOptions())
 
@@ -563,7 +595,6 @@ function resolveAppUserModelId() {
     // WFP 是第一层（不依赖防火墙开关），防火墙规则是第二层；任一层在生效就算"阻断中"。
     // WFP 用**实际在跑的宿主进程**为准，而不是只看 pid 文件 —— pid 文件可能被删掉，
     // 那时候只看文件会报"未生效"，而内核里其实还挂着过滤器（实测踩过）。
-    const wfpHosts = await deps.listWfpHosts()
     const wfpPid = deps.readWfpPid(stateDir)
     const wfpOrphan = wfpHosts.length > 0 && !wfpHosts.includes(wfpPid)
     const activeRules = rules.filter((rule) => rule.enabled)
@@ -719,6 +750,8 @@ function resolveAppUserModelId() {
 
   const setFirewall = (enabled) =>
     serialize(async () => {
+      // 会改动防火墙规则与 WFP 宿主：动作结束后清缓存（见函数末尾），
+      // 否则界面在 TTL 内还会报旧状态。
       if (!enabled) {
         // 两层都要撤。只删防火墙规则会把 WFP 内核过滤器留在那里继续断网 ——
         // 界面显示"已解除"、程序却依然上不了网，是最难排查的一种残留。
@@ -733,6 +766,7 @@ function resolveAppUserModelId() {
           '已解除网络阻断',
           `防火墙规则 ${result.removed} 条；WFP ${wfp.stopped ? '宿主已退出' : '本就没有宿主'}${wfp.purged ? `，另清理遗留过滤器 ${wfp.purged} 条` : ''}`,
         )
+        invalidateCache()
         emit({ type: 'status' })
         return { ...result, wfp }
       }
@@ -757,6 +791,7 @@ function resolveAppUserModelId() {
       lastEnforcement = { at: nowIso(), kind: 'firewall-manual', verified: result.verified.length, failed: result.failed }
       pushLog('block', '已建立网络阻断', `${result.verified.length}/${targets.length} 个程序已生效`)
       for (const item of result.failed) pushLog('warn', '阻断未生效', `${item.path}：${item.error}`)
+      invalidateCache()
       emit({ type: 'status' })
       return { ...result, wfp }
     })
@@ -817,6 +852,8 @@ function resolveAppUserModelId() {
           ...accounts[index],
           ...(live.email ? { email: live.email } : {}),
           ...(live.usage ? { usage: live.usage } : {}),
+          // 登录态以现场为准：存档里的值只代表保存那一刻，token 可能早过期了。
+          ...(typeof live.signedIn === 'boolean' ? { signedIn: live.signedIn } : {}),
         }
       }
     }
@@ -1134,6 +1171,7 @@ function resolveAppUserModelId() {
   const enableFirewallProfiles = () =>
     serialize(async () => {
       const result = await deps.enableProfiles()
+      invalidateCache()
       if (!result.ok) {
         pushLog('error', '启用防火墙配置文件失败', result.error)
         throw new Error(result.error)

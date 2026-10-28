@@ -1010,9 +1010,13 @@ function renderAccounts(data) {
     const meta = el('span', 'account-meta')
     meta.textContent = [
       label !== account.name ? account.name : undefined,
-      // 没有邮箱时明确写出来：只显示字母会让用户以为"名字丢了"，
-      // 实际是这个存档里没有账号信息（存档时没登录过页面）。
-      account.email ? undefined : '未识别到账号',
+      // 没登录时优先说"需要重新登录"，这比"未识别到账号"更接近用户要做的动作：
+      // 实测登录态失效后 IndexedDB 里就没有账户信息，两个症状是同一件事。
+      account.signedIn === false
+        ? '登录已失效，需重新登录'
+        : account.email
+          ? undefined
+          : '未识别到账号',
       account.savedAt ? new Date(account.savedAt).toLocaleDateString() : undefined,
     ]
       .filter(Boolean)

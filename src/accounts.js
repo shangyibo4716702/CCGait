@@ -266,6 +266,21 @@ function walkFiles(dir, depth, out, readDir = readdirSync) {
 export function readAccountInsights(dir, { readDir = readdirSync, readFile = readFileSync } = {}) {
   const insights = {}
 
+  // 登录态是否有效：Claude 自己写的 windowSizeWasSignedIn 是唯一可靠的本地信号。
+  //
+  // 为什么需要它：存档"看着完整"（Cookies 32KB 在）但 token 已过期，切过去会停在
+  // 登录页。实测：现场 profile 的 windowSizeWasSignedIn=false 时，IndexedDB 里也
+  // 没有 email_address（登录页不写账户信息），所以"读不到邮箱"往往就是"没登录"的
+  // 同一个症状。把它读出来，界面能直接说"需要重新登录"而不是让用户猜。
+  try {
+    const config = JSON.parse(readFile(join(dir, 'config.json'), 'utf8'))
+    if (typeof config?.windowSizeWasSignedIn === 'boolean') {
+      insights.signedIn = config.windowSizeWasSignedIn
+    }
+  } catch {
+    // config.json 读不到就不标状态。
+  }
+
   try {
     const history = JSON.parse(readFile(join(dir, 'plan-usage-history.json'), 'utf8'))
     const samples = Array.isArray(history?.samples) ? history.samples : []
@@ -491,6 +506,7 @@ export function listAccounts(accountsDir, readDir = readdirSync) {
         email: typeof meta.email === 'string' ? meta.email : undefined,
         fullName: typeof meta.fullName === 'string' ? meta.fullName : undefined,
         usage: meta.usage && typeof meta.usage === 'object' ? meta.usage : undefined,
+        signedIn: typeof meta.signedIn === 'boolean' ? meta.signedIn : undefined,
       }
     } catch {
       // 老存档没有元数据文件，按目录时间算。
@@ -499,7 +515,9 @@ export function listAccounts(accountsDir, readDir = readdirSync) {
     // 存档不受运行中的 Desktop 锁定，随时读得到；不回写元数据，避免列表接口带副作用。
     if (!insights.email && !insights.usage) {
       const live = readAccountInsights(dir)
-      if (live.email || live.usage) insights = { ...insights, ...live }
+      if (live.email || live.usage || typeof live.signedIn === 'boolean') {
+        insights = { ...insights, ...live }
+      }
     }
     if (!savedAt) {
       try {

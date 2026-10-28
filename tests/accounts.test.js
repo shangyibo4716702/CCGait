@@ -450,3 +450,23 @@ describe('按 uuid 识别真实账号', () => {
     assert.deepEqual(match.duplicates.sort(), ['A', 'D', 'E'])
   })
 })
+
+describe('登录态识别', () => {
+  // 实测：登录态失效后 IndexedDB 里就没有 email_address，"读不到邮箱"和"没登录"
+  // 是同一个症状。windowSizeWasSignedIn 是 Claude 自己写的、唯一可靠的本地信号。
+  it('读出 windowSizeWasSignedIn', () => {
+    const root = tempDir()
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ windowSizeWasSignedIn: false }))
+    assert.equal(readAccountInsights(root).signedIn, false)
+
+    const other = tempDir()
+    writeFileSync(join(other, 'config.json'), JSON.stringify({ windowSizeWasSignedIn: true }))
+    assert.equal(readAccountInsights(other).signedIn, true)
+  })
+
+  it('字段缺失时不瞎猜', () => {
+    const root = tempDir()
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ first_launch_at: 1 }))
+    assert.equal(readAccountInsights(root).signedIn, undefined)
+  })
+})
