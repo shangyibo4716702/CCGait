@@ -1009,6 +1009,32 @@ function renderAccounts(data) {
       row.append(usageBar('5h', usage.fiveHourPercent), usageBar('周', usage.weeklyPercent))
     }
 
+    // 每个账号一行的操作：更新 / 删除。放在 meta 之后，整行可点的前提下
+    // 必须 stopPropagation，否则点按钮会连带触发切换。
+    const actions = el('div', 'account-actions')
+    if (isCurrent) {
+      // 只有当前在用的号才能"更新"：更新 = 把现在机器上的登录态存成这个名字，
+      // 对离线号做这件事只会把别人的登录态覆盖进来。
+      const update = el('button', 'account-mini', '更新')
+      update.type = 'button'
+      update.title = '把当前登录态存回这个账号（登录过期后重新登录再点这里）'
+      update.addEventListener('click', (event) => {
+        event.stopPropagation()
+        void updateAccount(account.name, label)
+      })
+      actions.append(update)
+    }
+    const remove = el('button', 'account-mini is-danger', '删除')
+    remove.type = 'button'
+    remove.disabled = isCurrent
+    remove.title = isCurrent ? '正在使用的账号不能删除' : '删除这个账号的存档'
+    remove.addEventListener('click', (event) => {
+      event.stopPropagation()
+      void deleteAccount(account.name, label)
+    })
+    actions.append(remove)
+    row.append(actions)
+
     const activate = () => {
       if (!account.complete) return
       if (isCurrent) {
@@ -1089,6 +1115,49 @@ async function switchToAccount(name, label) {
   } finally {
     switchingAccount = false
     document.querySelectorAll('.account-row').forEach((row) => row.classList.remove('is-busy'))
+  }
+}
+
+/**
+ * 更新账号存档：登录过期后，先在 Claude 里重新登录，再点这个把新登录态存回去。
+ * 后端只允许更新"当前正在用的"那个号 —— 详见 session.js 里的说明。
+ */
+async function updateAccount(name, label) {
+  const running = true
+  if (running) {
+    const confirmed = window.confirm(
+      `用当前登录态更新 ${label} 的存档？\n\n` +
+        `· 会先关闭 Claude Desktop\n` +
+        `· 把现在的登录态存成 ${name}（覆盖旧存档，旧的一份留作 .bak）\n` +
+        `· 完成后请手动重新打开 Claude\n\n` +
+        `确认你已经在 Claude 里重新登录过了吗？`,
+    )
+    if (!confirmed) return
+  }
+  try {
+    const result = await api('/api/accounts/update', { method: 'POST', body: { name } })
+    toast('ok', `已更新 ${label}`, `${result?.entries ?? 0} 个身份条目`)
+    renderAccounts(result)
+  } catch (error) {
+    toast('error', '更新失败', error instanceof Error ? error.message : String(error))
+  }
+}
+
+async function deleteAccount(name, label) {
+  const confirmed = window.confirm(
+    `删除账号 ${label} 的存档？\n\n` +
+      `· 会删掉这个账号在本机的 Cookies、会话历史和用量记录\n` +
+      `· 不影响 Anthropic 服务端的账号本身\n` +
+      `· 删掉后要再来得重新登录一次\n\n` +
+      `确定删除吗？`,
+  )
+  if (!confirmed) return
+  try {
+    const result = await api('/api/accounts/delete', { method: 'POST', body: { name } })
+    toast('ok', `已删除 ${label}`, '本机存档已移除')
+    renderAccounts(result)
+  } catch (error) {
+    toast('error', '删除失败', error instanceof Error ? error.message : String(error))
   }
 }
 

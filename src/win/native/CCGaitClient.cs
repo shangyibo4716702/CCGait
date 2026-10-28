@@ -47,6 +47,8 @@ namespace Ccgait
             switch (mode)
             {
                 case "tray":
+                    // 托盘常驻：顺带负责把 Edge APP 窗口的任务栏图标修清晰（WM_SETICON）。
+                    TaskbarIconEnforcer.Start(Program.WindowTitle);
                     Application.Run(new TrayContext());
                     return;
                 case "startup":
@@ -185,7 +187,7 @@ namespace Ccgait
 
         // ---------------------------------------------------- 单实例窗口
 
-        private const string WindowTitle = "CCGait · Claude 客户端环境闸门";
+        internal const string WindowTitle = "CCGait · Claude 客户端环境闸门";
 
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
@@ -452,6 +454,162 @@ namespace Ccgait
                 index = text.IndexOf(token, index + token.Length, StringComparison.Ordinal);
             }
             return count;
+        }
+    }
+
+    /// <summary>
+    /// 任务栏图标清晰度修复。
+    ///
+    /// 糊的根因（解剖 Edge 的 Favicons 缓存实测）：无论 favicon.ico 给多少档位图，
+    /// Chromium 只缓存 16 和 32 两档；任务栏在 100% DPI 需要 24px —— 只能从 16px
+    /// 放大，必然发虚。这是 Edge APP 模式的内部流水线，配置无法改变。
+    ///
+    /// 修复：窗口出现后用 WM_SETICON 跨进程把 ccgait.ico 里**精确的** 16/24/32
+    /// 三档设到 Edge 窗口上（ico 里有这三档，LoadImage 精确命中、零缩放），
+    /// 任务栏/标题栏要用哪档就取哪档，彻底消除放大。
+    ///
+    /// 为什么要反复设置：Edge 在页面 favicon 加载完成后会自己再设一次图标
+    /// （那张 16px 的糊图），覆盖我们的结果；所以在窗口出现后的约 10 秒内设置
+    /// 若干次，最后一次落在 Edge 之后，图标即保持清晰。
+    /// </summary>
+    internal static class TaskbarIconEnforcer
+    {
+        private const uint WM_SETICON = 0x0080;
+        private const uint IMAGE_ICON = 1;
+        private const uint LR_LOADFROMFILE = 0x0010;
+        private const string EdgeWindowClass = "Chrome_WidgetWin_1";
+        private const int MaxAttempts = 6;
+
+        private const int IconSmall = 0;   // 标题栏/任务栏小图标槽
+        private const int IconSmall2 = 2;  // 任务栏实际使用的备用小图标槽
+        private const int IconBig = 1;     // Alt-Tab 等使用的大图标槽
+
+        private static readonly object Gate = new object();
+        private static readonly Dictionary<long, int> Attempts = new Dictionary<long, int>();
+        private static System.Threading.Timer timer;
+        private static string windowTitle;
+        private static string iconFile;
+
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern int GetWindowTextLength(IntPtr hWnd);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern int GetClassName(IntPtr hWnd, StringBuilder text, int maxCount);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern IntPtr LoadImage(IntPtr instance, string fileName, uint type, int width, int height, uint load);
+
+        /// <summary>托盘常驻时启动；只轮询，不阻塞 UI。</summary>
+        internal static void Start(string title)
+        {
+            windowTitle = title;
+            iconFile = Path.Combine(Program.AppRoot, "ccgait.ico");
+            if (!File.Exists(iconFile)) return;
+            if (timer != null) return;
+            timer = new System.Threading.Timer(Tick, null, 500, 1500);
+        }
+
+        private static void Tick(object state)
+        {
+            try
+            {
+                EnumWindows(Scan, IntPtr.Zero);
+                lock (Gate)
+                {
+                    // 字典只增不减会缓慢泄漏：窗口多时清理已消失的句柄。
+                    if (Attempts.Count > 32)
+                    {
+                        var alive = new List<long>();
+                        EnumWindows(
+                            delegate(IntPtr hWnd, IntPtr lParam)
+                            {
+                                alive.Add(hWnd.ToInt64());
+                                return true;
+                            },
+                            IntPtr.Zero);
+                        var stale = new List<long>();
+                        foreach (long key in Attempts.Keys)
+                        {
+                            if (!alive.Contains(key)) stale.Add(key);
+                        }
+                        foreach (long key in stale) Attempts.Remove(key);
+                    }
+                }
+            }
+            catch
+            {
+                // 后台尽力而为的任务：失败不影响闸门。
+            }
+        }
+
+        private static bool Scan(IntPtr hWnd, IntPtr lParam)
+        {
+            var className = new StringBuilder(64);
+            GetClassName(hWnd, className, 64);
+            if (className.ToString() != EdgeWindowClass) return true;
+
+            int length = GetWindowTextLength(hWnd);
+            if (length <= 0) return true;
+            var text = new StringBuilder(length + 1);
+            GetWindowText(hWnd, text, text.Capacity);
+            if (!text.ToString().StartsWith(windowTitle, StringComparison.Ordinal)) return true;
+
+            uint processId;
+            GetWindowThreadProcessId(hWnd, out processId);
+            try
+            {
+                using (Process process = Process.GetProcessById((int)processId))
+                {
+                    string name = process.ProcessName.ToLowerInvariant();
+                    if (name != "msedge" && name != "chrome") return true;
+                }
+            }
+            catch
+            {
+                return true; // 进程已退出
+            }
+
+            lock (Gate)
+            {
+                int attempts;
+                if (!Attempts.TryGetValue(hWnd.ToInt64(), out attempts)) attempts = 0;
+                if (attempts >= MaxAttempts) return true;
+                Attempts[hWnd.ToInt64()] = attempts + 1;
+            }
+
+            Apply(hWnd, IconSmall, 16);
+            Apply(hWnd, IconSmall2, 24);
+            Apply(hWnd, IconBig, 32);
+            return true;
+        }
+
+        private static void Apply(IntPtr hWnd, int slot, int size)
+        {
+            try
+            {
+                // ccgait.ico 含 16/20/24/32/40/48/... 全档，请求哪档精确命中哪档，零缩放。
+                IntPtr handle = LoadImage(IntPtr.Zero, iconFile, IMAGE_ICON, size, size, LR_LOADFROMFILE);
+                if (handle == IntPtr.Zero) return;
+                SendMessage(hWnd, WM_SETICON, (IntPtr)slot, handle);
+            }
+            catch
+            {
+                // 单次失败忽略，下一轮会重试。
+            }
         }
     }
 

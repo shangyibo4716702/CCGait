@@ -1548,3 +1548,38 @@ input[type='checkbox']:checked::after {
   gap: 5px;
   margin-top: 6px;
 }
+
+/* 账号行的更新/删除小按钮：默认低调，悬停才显眼，避免误点 */
+.account-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 5px;
+}
+
+.account-mini {
+  padding: 2px 8px;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-muted);
+  background: var(--panel-inset);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.account-mini:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.account-mini.is-danger:hover:not(:disabled) {
+  color: var(--danger-text);
+  border-color: var(--danger-text);
+  background: var(--danger-bg);
+}
+
+.account-mini:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

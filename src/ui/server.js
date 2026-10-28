@@ -290,6 +290,16 @@ export function createUiServer({ session, logger, token = randomBytes(24).toStri
             sendJson(response, 200, await session.saveCurrentAccount(body.name))
             return
           }
+          case '/api/accounts/update': {
+            const body = await readJsonBody(request)
+            sendJson(response, 200, await session.updateAccount(body.name))
+            return
+          }
+          case '/api/accounts/delete': {
+            const body = await readJsonBody(request)
+            sendJson(response, 200, await session.deleteAccount(body.name))
+            return
+          }
           case '/api/accounts/switch': {
             const body = await readJsonBody(request)
             sendJson(response, 200, await session.switchAccountTo(body.name))

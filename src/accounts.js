@@ -137,6 +137,28 @@ export function readCurrentAccount(accountsDir, readFile = (p) => readFileSync(p
   }
 }
 
+/**
+ * 删除账号存档。
+ *
+ * 两条安全线：
+ *  1. **不允许删当前账号** —— 它的登录态正活在 profile 里，删掉存档看似没事，
+ *     但一旦以后切换走就再也回不来了。要删当前账号，先切到别的号。
+ *  2. 名字带 `.bak` 后缀的备份也会一起删掉：否则用户以为删干净了，
+ *     十几 MB 的旧 Cookies 还躺在磁盘上。
+ */
+export function removeAccount(accountsDir, name, { readDir = readdirSync, exists = existsSync } = {}) {
+  assertAccountName(name)
+  const current = readCurrentAccount(accountsDir)
+  if (current === name) {
+    throw new Error(`账号 ${name} 正在使用中，先切换到别的账号再删除`)
+  }
+  const dir = accountDir(accountsDir, name)
+  if (!exists(dir)) throw new Error(`账号 ${name} 不存在`)
+  rmrf(dir)
+  rmrf(`${dir}.bak`)
+  return { name, removed: true }
+}
+
 export function writeCurrentAccount(accountsDir, name) {
   assertAccountName(name)
   mkdirSync(accountsDir, { recursive: true })

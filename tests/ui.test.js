@@ -595,3 +595,48 @@ describe('保存时留空账号名', () => {
     assert.deepEqual(second.accounts.map((item) => item.name).sort(), ['A', 'B'])
   })
 })
+
+describe('更新与删除账号接口', () => {
+  it('更新非当前账号时拒绝，避免把当前号的登录态覆盖进别人', async () => {
+    const root = tempConfig().dir
+    const profile = join(root, 'profile')
+    mkdirSync(join(profile, 'Network'), { recursive: true })
+    writeFileSync(join(profile, 'Network', 'Cookies'), 'cookies-a')
+    writeFileSync(join(profile, 'ant-did'), 'did')
+    const accounts = join(root, 'accounts')
+
+    const deps = fakeDeps({
+      locateDesktopProfile: () => profile,
+      accountsRoot: () => accounts,
+      killClaudeProcessesByKind: async () => [],
+      listClaudeProcesses: async () => [],
+    })
+    const session = createUiSession({ configPath: deps.path, deps: deps.deps })
+    await session.saveCurrentAccount('A') // current = A
+    await session.saveCurrentAccount('B') // current = B
+
+    await assert.rejects(session.updateAccount('A'), /不能直接把它的登录态存成 A|用的是 B/)
+  })
+
+  it('删除当前账号被拒绝，删除其它账号成功', async () => {
+    const root = tempConfig().dir
+    const profile = join(root, 'profile')
+    mkdirSync(join(profile, 'Network'), { recursive: true })
+    writeFileSync(join(profile, 'Network', 'Cookies'), 'cookies')
+    const accounts = join(root, 'accounts')
+    const deps = fakeDeps({
+      locateDesktopProfile: () => profile,
+      accountsRoot: () => accounts,
+      killClaudeProcessesByKind: async () => [],
+      listClaudeProcesses: async () => [],
+    })
+    const session = createUiSession({ configPath: deps.path, deps: deps.deps })
+    await session.saveCurrentAccount('A')
+    await session.saveCurrentAccount('B')
+
+    await assert.rejects(session.deleteAccount('B'), /正在使用中/)
+    const after = await session.deleteAccount('A')
+    assert.equal(after.removed, true)
+    assert.deepEqual(after.accounts.map((item) => item.name), ['B'])
+  })
+})

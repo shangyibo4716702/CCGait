@@ -29,6 +29,7 @@ import {
   readCurrentAccount,
   assertAccountName,
   recoverInterruptedSwitch,
+  removeAccount,
   saveAccount,
   switchAccount,
   writeCurrentAccount,
@@ -833,6 +834,50 @@ function resolveAppUserModelId() {
     return false
   }
 
+  /**
+   * 更新某个账号的存档（重新保存登录态）。
+   *
+   * 使用场景：登录态过期了 —— 用户先在 Claude 里重新登录，然后点这个账号的「更新」，
+   * 把新鲜的 Cookies 存回原来的名字，不用删了重建。
+   *
+   * 关键判断：**只有当这个账号就是当前在用的账号时才允许更新**。
+   * 因为"更新 C"的语义是"把现在这台机器上的登录态存成 C" —— 如果当前用的是 B，
+   * 那存进去的是 B 的登录态，会把 C 覆盖成 B（数据直接串号）。
+   * 想更新离线账号，正确路径是先切过去、重新登录、再更新。
+   */
+  const updateAccount = (name) =>
+    serialize(async () => {
+      const profile = resolveProfile()
+      if (!profile) throw new Error('没找到 Claude Desktop 的数据目录（MSIX 包未安装或从未登录）')
+      const current = readCurrentAccount(accountsBase)
+      const target = (name ?? '').trim()
+      assertAccountName(target)
+      if (current !== target) {
+        throw new Error(
+          `现在用的是 ${current ?? '（未记录）'}，不能直接把它的登录态存成 ${target}。` +
+            `要更新 ${target}，先切换到它、在 Claude 里重新登录，再点更新。`,
+        )
+      }
+      const running = (await deps.listClaudeProcesses()).filter((item) => item.kind === 'desktop')
+      if (running.length > 0) {
+        await deps.killClaudeProcessesByKind('desktop')
+        await waitForDesktopExit()
+      }
+      const result = saveAccount({ name: target, profileDir: profile, accountsDir: accountsBase })
+      pushLog('info', `已更新账号 ${target} 的存档`, `共 ${result.entries} 个身份条目`)
+      emit({ type: 'status' })
+      return { ...result, updated: true, ...readAccountsState() }
+    })
+
+  /** 删除账号存档（不允许删当前正在用的那个）。 */
+  const deleteAccount = (name) =>
+    serialize(async () => {
+      const result = removeAccount(accountsBase, (name ?? '').trim())
+      pushLog('info', `已删除账号 ${result.name} 的存档`, '该账号的 Cookies 与会话历史已从本机移除')
+      emit({ type: 'status' })
+      return { ...result, ...readAccountsState() }
+    })
+
   const switchAccountTo = (name) =>
     serialize(async () => {
       const profile = resolveProfile()
@@ -1010,6 +1055,8 @@ function resolveAppUserModelId() {
     killProcesses,
     getAccounts,
     saveCurrentAccount,
+    updateAccount,
+    deleteAccount,
     switchAccountTo,
     launchClaudeDesktop,
     enableFirewallProfiles,

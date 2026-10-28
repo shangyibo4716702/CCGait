@@ -12,6 +12,8 @@ import {
   locateDesktopProfile,
   nextAccountName,
   readAccountInsights,
+  removeAccount,
+  writeCurrentAccount,
   PROFILE_EXCLUDES,
   recoverInterruptedSwitch,
   saveAccount,
@@ -352,5 +354,49 @@ describe('老存档兼容', () => {
     const listed = listAccounts(accounts)
     assert.equal(listed[0].email, 'old@icloud.com', '老存档也要能显示真账号')
     assert.equal(listed[0].usage.fiveHourPercent, 10)
+  })
+})
+
+describe('删除账号', () => {
+  it('删掉存档连同 .bak 备份', () => {
+    const root = tempDir()
+    const profile = makeProfile(root, 'A')
+    const accounts = join(root, 'accounts')
+    saveAccount({ name: 'A', profileDir: profile, accountsDir: accounts, ...opts })
+    saveAccount({ name: 'A', profileDir: profile, accountsDir: accounts, ...opts })
+    assert.ok(existsSync(join(accounts, 'A.bak')), '前提：备份存在')
+    const result = removeAccount(accounts, 'A')
+    assert.equal(result.removed, true)
+    assert.ok(!existsSync(join(accounts, 'A')))
+    assert.ok(!existsSync(join(accounts, 'A.bak')), '备份也要删，不能留十几 MB 的旧 Cookies')
+  })
+
+  it('不允许删除正在使用的账号', () => {
+    const root = tempDir()
+    const profile = makeProfile(root, 'A')
+    const accounts = join(root, 'accounts')
+    saveAccount({ name: 'A', profileDir: profile, accountsDir: accounts, ...opts })
+    writeCurrentAccount(accounts, 'A')
+    assert.throws(() => removeAccount(accounts, 'A'), /正在使用中/)
+    assert.ok(existsSync(join(accounts, 'A')), '拒绝时不能动文件')
+  })
+
+  it('删不存在的账号报错', () => {
+    const root = tempDir()
+    assert.throws(() => removeAccount(join(root, 'accounts'), 'ZZ'), /不存在/)
+  })
+})
+
+describe('更新账号存档', () => {
+  it('更新后内容换成新的，旧的一份留作 .bak', () => {
+    const root = tempDir()
+    const profile = makeProfile(root, 'A')
+    const accounts = join(root, 'accounts')
+    saveAccount({ name: 'A', profileDir: profile, accountsDir: accounts, ...opts })
+    // 模拟"重新登录过了"：refresh token 变了
+    writeFileSync(join(profile, 'Network', 'Cookies'), 'cookies-refreshed')
+    saveAccount({ name: 'A', profileDir: profile, accountsDir: accounts, ...opts })
+    assert.equal(readFileSync(join(accounts, 'A', 'Network', 'Cookies'), 'utf8'), 'cookies-refreshed')
+    assert.equal(readFileSync(join(accounts, 'A.bak', 'Network', 'Cookies'), 'utf8'), 'cookies-A')
   })
 })
