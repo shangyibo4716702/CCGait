@@ -433,6 +433,43 @@ export function saveAccount({
   return { name, entries: entries.length, dir: target, ...insights }
 }
 
+/**
+ * 从一个 profile / 存档目录里读出「这个目录属于哪个 Claude 账号」。
+ *
+ * `lastKnownAccountUuid` 是唯一可靠的账号标识：
+ *  - Cookie 值不能比，运行中的 Desktop 会独占锁住它（实测 EBUSY，连共享读都拿不到）；
+ *  - 本地名字（A/B/C）是我们自己起的标签，跟真实账号无关；
+ *  - `ant-did` 是包级设备标识，所有账号共用一份，不能用来区分。
+ *
+ * 为什么必须靠它：`current.json` 只是我们记的标签，用户可能直接在 Claude 里换账号、
+ * 或者切换中途崩溃，于是标签和现场对不上。靠 uuid 才知道"现在真正登录的是谁"。
+ */
+export function readAccountUuid(dir, readFile = (p) => readFileSync(p, 'utf8')) {
+  try {
+    const config = JSON.parse(readFile(join(dir, 'config.json')))
+    const uuid = config?.lastKnownAccountUuid
+    return typeof uuid === 'string' && uuid.length > 0 ? uuid : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 哪个存档就是当前 profile 里正在用的那个账号。
+ *
+ * `matched=false` 表示没有存档与现场对得上（例如用户直接在 Claude 里登录了一个
+ * 没保存过的账号）—— 这时候绝不能随便挑一个贴数据，那会把别人的邮箱/用量贴在它身上。
+ */
+export function matchLiveAccount(accounts, liveUuid, readUuid = readAccountUuid) {
+  if (!liveUuid) return { name: undefined, matched: false }
+  const hits = accounts.filter((account) => readUuid(account.dir) === liveUuid)
+  if (hits.length === 0) return { name: undefined, matched: false }
+  // 同一 uuid 可能有多份存档（同一账号存过多次）。取最近保存的那份作代表，
+  // 其余作为 duplicates 返回，界面可以提示"这几个是同一个账号"。
+  const sorted = [...hits].sort((a, b) => String(b.savedAt ?? '').localeCompare(String(a.savedAt ?? '')))
+  return { name: sorted[0].name, matched: true, duplicates: hits.map((item) => item.name) }
+}
+
 /** 读出所有账号（按修改时间倒序，最近用过的在前）。 */
 export function listAccounts(accountsDir, readDir = readdirSync) {
   let entries

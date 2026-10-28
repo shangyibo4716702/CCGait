@@ -13,6 +13,8 @@ import {
   nextAccountName,
   readAccountInsights,
   removeAccount,
+  readAccountUuid,
+  matchLiveAccount,
   writeCurrentAccount,
   PROFILE_EXCLUDES,
   recoverInterruptedSwitch,
@@ -398,5 +400,53 @@ describe('更新账号存档', () => {
     saveAccount({ name: 'A', profileDir: profile, accountsDir: accounts, ...opts })
     assert.equal(readFileSync(join(accounts, 'A', 'Network', 'Cookies'), 'utf8'), 'cookies-refreshed')
     assert.equal(readFileSync(join(accounts, 'A.bak', 'Network', 'Cookies'), 'utf8'), 'cookies-A')
+  })
+})
+
+describe('按 uuid 识别真实账号', () => {
+  // 实测踩到的坑：current.json 写着 C，但现场 profile 的 lastKnownAccountUuid 是 B 的，
+  // 旧代码按标签把现场数据贴到 C 身上，界面上两个账号显示同一个邮箱。
+  function profileWith(dir, uuid) {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ lastKnownAccountUuid: uuid }))
+    return dir
+  }
+
+  it('读出 profile 的账号 uuid', () => {
+    const root = tempDir()
+    const dir = profileWith(join(root, 'p'), 'uuid-1')
+    assert.equal(readAccountUuid(dir), 'uuid-1')
+    assert.equal(readAccountUuid(join(root, 'missing')), undefined)
+  })
+
+  it('按 uuid 匹配，不看本地名字', () => {
+    const root = tempDir()
+    const accounts = [
+      { name: 'C', dir: profileWith(join(root, 'c'), 'uuid-c'), savedAt: '2026-10-28T06:10:00Z' },
+      { name: 'B', dir: profileWith(join(root, 'b'), 'uuid-b'), savedAt: '2026-10-28T06:11:00Z' },
+    ]
+    const match = matchLiveAccount(accounts, 'uuid-b')
+    assert.equal(match.name, 'B', '必须是 uuid 对上的那个，不是列表第一个')
+    assert.equal(match.matched, true)
+  })
+
+  it('没有存档对得上时不乱贴数据', () => {
+    const root = tempDir()
+    const accounts = [{ name: 'A', dir: profileWith(join(root, 'a'), 'uuid-a') }]
+    const match = matchLiveAccount(accounts, 'uuid-unknown')
+    assert.equal(match.matched, false)
+    assert.equal(match.name, undefined, '匹配不上就不能指定任何账号')
+  })
+
+  it('同一 uuid 多份存档时取最近保存的那份，并列出重复项', () => {
+    const root = tempDir()
+    const accounts = [
+      { name: 'A', dir: profileWith(join(root, 'a'), 'same-uuid'), savedAt: '2026-10-25T09:20:00Z' },
+      { name: 'D', dir: profileWith(join(root, 'd'), 'same-uuid'), savedAt: '2026-10-28T06:08:00Z' },
+      { name: 'E', dir: profileWith(join(root, 'e'), 'same-uuid'), savedAt: '2026-10-28T06:09:00Z' },
+    ]
+    const match = matchLiveAccount(accounts, 'same-uuid')
+    assert.equal(match.name, 'E', '取最近保存的那份')
+    assert.deepEqual(match.duplicates.sort(), ['A', 'D', 'E'])
   })
 })

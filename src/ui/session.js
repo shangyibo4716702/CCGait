@@ -26,6 +26,8 @@ import {
   locateDesktopProfile,
   nextAccountName,
   readAccountInsights,
+  readAccountUuid,
+  matchLiveAccount,
   readCurrentAccount,
   assertAccountName,
   recoverInterruptedSwitch,
@@ -785,14 +787,31 @@ function resolveAppUserModelId() {
 
   const readAccountsState = () => {
     const profile = resolveProfile()
-    const current = readCurrentAccount(accountsBase)
+    const recorded = readCurrentAccount(accountsBase)
     const accounts = listAccounts(accountsBase)
+
+    // 谁是"真正在线的"必须按 uuid 判断，不能信 current.json 那个标签。
+    //
+    // 实测踩到的坑：current.json 写着 C，但现场 profile 的 lastKnownAccountUuid
+    // 其实是 B 的。旧代码按标签把现场数据贴到 C 身上，结果 C 显示了 B 的邮箱 ——
+    // 界面上就是"两个账号同一个邮箱"，用户根本没法分辨谁是谁。
+    // 标签对不上时以现场为准，并把标签纠正过来。
+    let liveName
+    let liveMatched = false
+    if (profile) {
+      const liveUuid = readAccountUuid(profile)
+      const match = matchLiveAccount(accounts, liveUuid)
+      liveName = match.name
+      liveMatched = match.matched
+      if (liveName && liveName !== recorded) writeCurrentAccount(accountsBase, liveName)
+    }
+
     // 在线账号的用量直接读当前 profile（plan-usage-history.json 是普通 JSON，
     // Desktop 运行中也读得到，而且它在持续追加 —— 这才是"最后一次记录"的本意）。
     // 邮箱所在的 IndexedDB 在运行中会被锁，读不到就沿用存档时记录的那个。
-    if (profile && current) {
+    if (profile && liveName) {
       const live = readAccountInsights(profile)
-      const index = accounts.findIndex((item) => item.name === current)
+      const index = accounts.findIndex((item) => item.name === liveName)
       if (index >= 0) {
         accounts[index] = {
           ...accounts[index],
@@ -801,10 +820,31 @@ function resolveAppUserModelId() {
         }
       }
     }
+
+    // 同一 uuid 有多份存档 = 同一个 Claude 账号被保存了好几次。标出来，
+    // 否则用户会以为那是几个不同账号（A/D/E 现在就共用 28a11d61）。
+    // 注意要按**所有**账号分组，不能只看现场匹配上的那一个 —— 重复账号往往
+    // 恰好不是当前在线的那个。
+    const byUuid = new Map()
+    for (const account of accounts) {
+      const uuid = readAccountUuid(account.dir)
+      if (!uuid) continue
+      if (!byUuid.has(uuid)) byUuid.set(uuid, [])
+      byUuid.get(uuid).push(account.name)
+    }
+    for (const names of byUuid.values()) {
+      if (names.length < 2) continue
+      for (const account of accounts) {
+        if (!names.includes(account.name)) continue
+        account.sameAccountAs = names.filter((name) => name !== account.name)
+      }
+    }
+
     return {
       profile: profile ? { found: true, path: profile } : { found: false },
       accountsDir: accountsBase,
-      current,
+      current: liveName ?? recorded,
+      liveMatched,
       accounts,
     }
   }

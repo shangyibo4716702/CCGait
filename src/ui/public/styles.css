@@ -1743,3 +1743,15 @@ input[type='checkbox']:checked::after {
   opacity: 0.45;
   cursor: not-allowed;
 }
+
+/* 「同 A/D 账号」标记：同一 Claude 账号存了多份存档时提示，避免被当成不同账号 */
+.account-badge {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.6;
+  color: var(--warn-text);
+  background: var(--warn-bg);
+  border-radius: 999px;
+}

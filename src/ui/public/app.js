@@ -997,12 +997,22 @@ function renderAccounts(data) {
     )
     head.append(name, status)
 
+    // 同一个 Claude 账号存了多份：标出来，否则会被当成几个不同账号。
+    if (list(account.sameAccountAs).length > 0) {
+      const same = el('span', 'account-badge', `同 ${account.sameAccountAs.join('/')}`)
+      same.title = `这些存档是同一个 Claude 账号：${account.sameAccountAs.join('、')}`
+      head.append(same)
+    }
+
     // 用量是"最后一次记录"：在线号读的是 profile 里持续追加的采样，
     // 离线号是它存档那一刻的 —— 都不发任何网络请求。
     const usage = account.usage
     const meta = el('span', 'account-meta')
     meta.textContent = [
       label !== account.name ? account.name : undefined,
+      // 没有邮箱时明确写出来：只显示字母会让用户以为"名字丢了"，
+      // 实际是这个存档里没有账号信息（存档时没登录过页面）。
+      account.email ? undefined : '未识别到账号',
       account.savedAt ? new Date(account.savedAt).toLocaleDateString() : undefined,
     ]
       .filter(Boolean)
