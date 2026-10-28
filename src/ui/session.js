@@ -30,10 +30,19 @@ import {
   assertAccountName,
   recoverInterruptedSwitch,
   removeAccount,
+  accountDir,
   saveAccount,
   switchAccount,
   writeCurrentAccount,
 } from '../accounts.js'
+import {
+  claudeProjectsDir,
+  copySessions,
+  listSessionGroups,
+  listSessions,
+  projectFolderFor,
+  sessionBodyExists,
+} from '../sessions-sync.js'
 import { startupStatus } from '../startup.js'
 import { isWfpBlocking, listWfpHosts, readWfpPid, startWfpBlock, stopWfpBlock } from '../win/wfp.js'
 
@@ -449,6 +458,7 @@ function resolveAppUserModelId() {
     killClaudeProcessesByKind: options.deps?.killClaudeProcessesByKind ?? killClaudeProcessesByKind,
     accountsRoot: options.deps?.accountsRoot ?? accountsRoot,
     locateDesktopProfile: options.deps?.locateDesktopProfile ?? locateDesktopProfile,
+    claudeProjectsDir: options.deps?.claudeProjectsDir ?? claudeProjectsDir,
     claudeDiscovery: options.deps?.claudeDiscovery ?? claudeDiscovery,
     startupStatus: options.deps?.startupStatus ?? startupStatus,
     isWfpBlocking: options.deps?.isWfpBlocking ?? isWfpBlocking,
@@ -878,6 +888,96 @@ function resolveAppUserModelId() {
       return { ...result, ...readAccountsState() }
     })
 
+  /**
+   * 会话同步：把一个账号的 Desktop 会话索引复制到另一个账号。
+   *
+   * 三条设计约束（用户明确要求「我自己选择是否同步」）：
+   *  1. **必须显式选择**：不传 sessionIds 就报错，绝不提供"同步全部"的默认行为。
+   *  2. **必须显式指定目标**：不猜、不默认同步到当前账号。
+   *  3. **只搬索引，不动正文**：正文在 ~/.claude 里本来就全账号共享（切号不碰它），
+   *     所以复制索引就够；列清单时逐条标出正文是否还在，缺正文的由界面提示。
+   */
+  const listSyncableSessions = (name) =>
+    serialize(async () => {
+      const target = (name ?? '').trim()
+      assertAccountName(target)
+      const dir = accountDir(accountsBase, target)
+      if (!existsSync(dir)) throw new Error(`账号 ${target} 不存在`)
+      const projectsDir = deps.claudeProjectsDir()
+      const sessions = []
+      for (const group of listSessionGroups(dir)) {
+        for (const session of listSessions(group.dir)) {
+          sessions.push({
+            ...session,
+            orgUuid: group.orgUuid,
+            accountUuid: group.accountUuid,
+            bodyExists: sessionBodyExists({
+              claudeProjectsDir: projectsDir,
+              projectFolder: projectFolderFor(session.cwd),
+              cliSessionId: session.cliSessionId,
+            }),
+          })
+        }
+      }
+      return { account: target, sessions }
+    })
+
+  const syncSessionsTo = ({ from, to, sessionIds, sourceOrgUuid, targetOrgUuid } = {}) =>
+    serialize(async () => {
+      const source = (from ?? '').trim()
+      const target = (to ?? '').trim()
+      assertAccountName(source)
+      assertAccountName(target)
+      if (source === target) throw new Error('源账号和目标账号不能是同一个')
+
+      const sourceRoot = accountDir(accountsBase, source)
+      const targetRoot = accountDir(accountsBase, target)
+      if (!existsSync(sourceRoot)) throw new Error(`源账号 ${source} 不存在`)
+      if (!existsSync(targetRoot)) throw new Error(`目标账号 ${target} 不存在`)
+
+      const sourceGroups = listSessionGroups(sourceRoot)
+      const sourceGroup = sourceOrgUuid
+        ? sourceGroups.find((group) => group.orgUuid === sourceOrgUuid)
+        : sourceGroups.find((group) => group.count > 0)
+      if (!sourceGroup) throw new Error(`源账号 ${source} 没有会话目录`)
+
+      // 目标组织目录必须已经存在——不新建，因为那等于我们猜了一个 org ID，
+      // Desktop 未必认，会话会变成"看得见但打不开"。
+      const targetGroups = listSessionGroups(targetRoot).filter((group) => group.count > 0)
+      const targetGroup = targetOrgUuid
+        ? targetGroups.find((group) => group.orgUuid === targetOrgUuid)
+        : targetGroups[0]
+      if (!targetGroup) {
+        throw new Error(
+          `目标账号 ${target} 还没有可用的组织目录：先在 ${target} 里创建一个会话，再回来同步`,
+        )
+      }
+
+      const result = copySessions({
+        sourceDir: sourceGroup.dir,
+        targetDir: targetGroup.dir,
+        sessionIds,
+      })
+      pushLog(
+        'info',
+        `已同步 ${result.copied.length} 个会话到账号 ${target}`,
+        [
+          result.skipped.length ? `跳过 ${result.skipped.length} 个（目标已有）` : undefined,
+          result.missing.length ? `缺失 ${result.missing.length} 个` : undefined,
+        ]
+          .filter(Boolean)
+          .join('；') || undefined,
+      )
+      emit({ type: 'status' })
+      return {
+        from: source,
+        to: target,
+        copied: result.copied,
+        skipped: result.skipped,
+        missing: result.missing,
+      }
+    })
+
   const switchAccountTo = (name) =>
     serialize(async () => {
       const profile = resolveProfile()
@@ -1057,6 +1157,8 @@ function resolveAppUserModelId() {
     saveCurrentAccount,
     updateAccount,
     deleteAccount,
+    listSyncableSessions,
+    syncSessionsTo,
     switchAccountTo,
     launchClaudeDesktop,
     enableFirewallProfiles,

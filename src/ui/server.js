@@ -300,6 +300,26 @@ export function createUiServer({ session, logger, token = randomBytes(24).toStri
             sendJson(response, 200, await session.deleteAccount(body.name))
             return
           }
+          case '/api/accounts/sync/list': {
+            const body = await readJsonBody(request)
+            sendJson(response, 200, await session.listSyncableSessions(body.name))
+            return
+          }
+          case '/api/accounts/sync': {
+            const body = await readJsonBody(request)
+            sendJson(
+              response,
+              200,
+              await session.syncSessionsTo({
+                from: body.from,
+                to: body.to,
+                sessionIds: body.sessionIds,
+                sourceOrgUuid: body.sourceOrgUuid,
+                targetOrgUuid: body.targetOrgUuid,
+              }),
+            )
+            return
+          }
           case '/api/accounts/switch': {
             const body = await readJsonBody(request)
             sendJson(response, 200, await session.switchAccountTo(body.name))

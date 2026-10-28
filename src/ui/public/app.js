@@ -952,7 +952,11 @@ async function launchClaudeDesktop() {
  * `~/.claude` 与 `~/.claude.json`。切换会结束 Desktop 进程 —— 这些是 SQLite 文件，
  * 进程还在写的时候复制出来的快照会不一致。
  */
+/** 最近一次读到的账号状态：同步弹层要用它列出"同步到哪个账号"。 */
+let accountsState = undefined
+
 function renderAccounts(data) {
+  accountsState = data
   const host = document.querySelector('#account-list')
   const sub = document.querySelector('#accounts-sub')
   if (!host || !sub) return
@@ -1024,6 +1028,18 @@ function renderAccounts(data) {
       })
       actions.append(update)
     }
+    // 会话同步：从哪个号搬出去由用户自己点，不自动、不批量。
+    // 只有一个以上账号时才有意义。
+    if (list(accountsState?.accounts).length > 1) {
+      const sync = el('button', 'account-mini', '同步会话')
+      sync.type = 'button'
+      sync.title = '手动选择这个账号的会话，同步到另一个账号'
+      sync.addEventListener('click', (event) => {
+        event.stopPropagation()
+        void openSyncModal(account.name)
+      })
+      actions.append(sync)
+    }
     const remove = el('button', 'account-mini is-danger', '删除')
     remove.type = 'button'
     remove.disabled = isCurrent
@@ -1083,6 +1099,177 @@ function usageBar(label, percent) {
   const text = el('span', 'usage-value', value === null ? '?' : `${value}%`)
   bar.append(caption, track, text)
   return bar
+}
+
+/** ---------------------------------------------------------- 会话同步弹层 */
+
+// 当前弹层里可选的会话与已选集合。放模块级是为了让全选/计数/确认共用同一份状态。
+let syncState = { from: undefined, sessions: [], selected: new Set(), targetsLoading: false }
+
+async function openSyncModal(fromAccount) {
+  const modal = document.querySelector('#sync-modal')
+  if (!modal) return
+  syncState = { from: fromAccount, sessions: [], selected: new Set(), targetsLoading: true }
+  modal.hidden = false
+  document.querySelector('#sync-note').textContent = `正在读取账号 ${fromAccount} 的会话…`
+  document.querySelector('#sync-list').replaceChildren()
+  document.querySelector('#sync-confirm').disabled = true
+  document.querySelector('#sync-count').textContent = '已选 0 个'
+  const all = document.querySelector('#sync-all')
+  if (all) all.checked = false
+
+  try {
+    // 这个接口在读磁盘（几十个索引文件），用 POST 和其它写操作走同一条分支；
+    // 它不是写操作，但服务端只对 POST 开放业务路由。
+    const data = await api('/api/accounts/sync/list', {
+      method: 'POST',
+      body: { name: fromAccount },
+    })
+    syncState.sessions = list(data?.sessions)
+    renderSyncTargets(fromAccount)
+    renderSyncList()
+    const bodyless = syncState.sessions.filter((item) => !item.bodyExists).length
+    document.querySelector('#sync-note').textContent =
+      `账号 ${fromAccount} 共 ${syncState.sessions.length} 个会话。勾选要同步的那些，再选目标账号。` +
+      (bodyless > 0 ? ` 其中 ${bodyless} 个的正文已不在本机（标黄的），同步过去可能打不开。` : '')
+  } catch (error) {
+    document.querySelector('#sync-note').textContent = '读取会话失败：' + (error?.message ?? '')
+  } finally {
+    syncState.targetsLoading = false
+  }
+}
+
+function closeSyncModal() {
+  const modal = document.querySelector('#sync-modal')
+  if (modal) modal.hidden = true
+}
+
+/** 目标账号下拉：排除源账号自己。 */
+function renderSyncTargets(fromAccount) {
+  const select = document.querySelector('#sync-to')
+  if (!select) return
+  const others = list(accountsState?.accounts).filter((item) => item.name !== fromAccount)
+  select.replaceChildren()
+  if (others.length === 0) {
+    const option = el('option', undefined, '（没有其它账号可同步）')
+    option.value = ''
+    select.append(option)
+    select.disabled = true
+    return
+  }
+  select.disabled = false
+  for (const account of others) {
+    const option = el('option', undefined, account.email ?? account.name)
+    option.value = account.name
+    select.append(option)
+  }
+}
+
+function renderSyncList() {
+  const host = document.querySelector('#sync-list')
+  if (!host) return
+  host.replaceChildren()
+  const sessions = syncState.sessions
+  if (sessions.length === 0) {
+    host.append(el('div', 'side-hint', '这个账号没有可同步的会话。'))
+    updateSyncCount()
+    return
+  }
+  for (const session of sessions) {
+    const row = el('label', 'sync-item')
+    if (!session.bodyExists) row.classList.add('is-bodyless')
+
+    const box = document.createElement('input')
+    box.type = 'checkbox'
+    box.checked = syncState.selected.has(session.sessionId)
+    box.addEventListener('change', () => {
+      if (box.checked) syncState.selected.add(session.sessionId)
+      else syncState.selected.delete(session.sessionId)
+      syncListItemState()
+    })
+
+    const title = el('span', 'sync-item-title', session.title)
+    title.title = [session.title, session.cwd, session.bodyExists ? '' : '正文缺失']
+      .filter(Boolean)
+      .join('\n')
+
+    const meta = el(
+      'span',
+      'sync-item-meta',
+      [
+        session.lastActivityAt ? new Date(session.lastActivityAt).toLocaleDateString() : undefined,
+        session.completedTurns !== undefined ? `${session.completedTurns} 轮` : undefined,
+        session.bodyExists ? undefined : '正文缺失',
+      ]
+        .filter(Boolean)
+        .join(' · '),
+    )
+
+    row.append(box, title, meta)
+    host.append(row)
+  }
+  updateSyncCount()
+}
+
+/** 勾选变化后同步"全选"框与按钮状态。 */
+function syncListItemState() {
+  updateSyncCount()
+}
+
+function updateSyncCount() {
+  const count = syncState.selected.size
+  document.querySelector('#sync-count').textContent = `已选 ${count} 个`
+  const confirm = document.querySelector('#sync-confirm')
+  const target = document.querySelector('#sync-to')
+  if (confirm) confirm.disabled = count === 0 || !target?.value
+  const all = document.querySelector('#sync-all')
+  if (all) all.checked = count > 0 && count === syncState.sessions.length
+}
+
+async function confirmSync() {
+  const target = document.querySelector('#sync-to')
+  const button = document.querySelector('#sync-confirm')
+  if (!target?.value || syncState.selected.size === 0) return
+  const sessions = syncState.sessions.filter((item) => syncState.selected.has(item.sessionId))
+  // 正文缺失的会话要单独警告：同步过去看得见标题，但点开是空的。
+  const bodyless = sessions.filter((item) => !item.bodyExists)
+  const detail =
+    `· 源账号：${syncState.from}\n` +
+    `· 目标账号：${target.value}\n` +
+    `· 会话数量：${sessions.length}\n` +
+    (bodyless.length > 0 ? `· 其中 ${bodyless.length} 个正文缺失，同步过去可能打不开\n` : '') +
+    `\n同步后，目标账号就能看到这些会话的内容。`
+  if (!window.confirm(`确认同步这些会话？\n\n${detail}`)) return
+
+  const original = button.textContent
+  button.disabled = true
+  button.textContent = '同步中…'
+  try {
+    const result = await api('/api/accounts/sync', {
+      method: 'POST',
+      body: {
+        from: syncState.from,
+        to: target.value,
+        sessionIds: [...syncState.selected],
+        sourceOrgUuid: sessions[0]?.orgUuid,
+        targetOrgUuid: undefined,
+      },
+    })
+    const copied = result?.copied?.length ?? 0
+    const skipped = result?.skipped?.length ?? 0
+    toast(
+      'ok',
+      `已同步 ${copied} 个会话到 ${target.value}`,
+      skipped > 0 ? `${skipped} 个因目标已存在而跳过` : '请重新打开 Claude 查看',
+    )
+    closeSyncModal()
+    await refreshAccounts()
+  } catch (error) {
+    toast('error', '同步失败', error instanceof Error ? error.message : String(error))
+  } finally {
+    button.disabled = false
+    button.textContent = original
+  }
 }
 
 async function refreshAccounts() {
@@ -1671,6 +1858,23 @@ document.querySelector('#account-add')?.addEventListener('click', () => {
   form.hidden = !form.hidden
   if (!form.hidden) document.querySelector('#account-name')?.focus()
 })
+
+// 会话同步弹层：关闭 / 取消 / 全选 / 目标变化 / 确认。
+document.querySelector('#sync-close')?.addEventListener('click', () => closeSyncModal())
+document.querySelector('#sync-cancel')?.addEventListener('click', () => closeSyncModal())
+document.querySelector('#sync-modal')?.addEventListener('click', (event) => {
+  // 只有点到背景才关，点弹层内部不关（否则拖动选择就会误关）。
+  if (event.target?.id === 'sync-modal') closeSyncModal()
+})
+document.querySelector('#sync-all')?.addEventListener('change', (event) => {
+  const checked = event.target.checked
+  syncState.selected = checked
+    ? new Set(syncState.sessions.map((item) => item.sessionId))
+    : new Set()
+  renderSyncList()
+})
+document.querySelector('#sync-to')?.addEventListener('change', () => updateSyncCount())
+document.querySelector('#sync-confirm')?.addEventListener('click', () => void confirmSync())
 
 // 回车就保存，省得每次都要去找按钮。
 document.querySelector('#account-name')?.addEventListener('keydown', (event) => {

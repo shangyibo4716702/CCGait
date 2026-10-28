@@ -278,6 +278,36 @@
     </div>
 
     <div class="toasts" id="toasts"></div>
+
+    <!-- 会话同步：手动勾选要搬哪些会话、搬到哪个账号。默认关闭，只有点了才会打开。 -->
+    <div class="modal-backdrop" id="sync-modal" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="sync-title">
+        <div class="modal-head">
+          <h3 id="sync-title">同步会话</h3>
+          <button class="modal-close" id="sync-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="modal-body">
+          <p class="modal-note" id="sync-note"></p>
+          <div class="sync-target">
+            <label for="sync-to">同步到</label>
+            <select id="sync-to"></select>
+          </div>
+          <div class="sync-toolbar">
+            <label class="sync-selectall">
+              <input type="checkbox" id="sync-all" />
+              全选
+            </label>
+            <span class="sync-count" id="sync-count">已选 0 个</span>
+          </div>
+          <div class="sync-list" id="sync-list"></div>
+        </div>
+        <div class="modal-foot">
+          <button class="action" id="sync-cancel" type="button">取消</button>
+          <button class="action primary" id="sync-confirm" type="button" disabled>同步选中的会话</button>
+        </div>
+      </div>
+    </div>
+
     <script type="module" src="/app.js"></script>
   </body>
 </html>
