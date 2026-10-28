@@ -526,7 +526,16 @@ export function listAccounts(accountsDir, readDir = readdirSync) {
         savedAt = undefined
       }
     }
-    accounts.push({ name: item.name, complete: accountComplete(dir), savedAt, dir, ...insights })
+    // 带上账号 uuid：界面上"没读到邮箱"时用它做区分标识。
+    // 否则几个账号都显示本地字母名字，用户根本分不清哪个是哪个。
+    accounts.push({
+      name: item.name,
+      complete: accountComplete(dir),
+      savedAt,
+      dir,
+      uuid: readAccountUuid(dir),
+      ...insights,
+    })
   }
   return accounts.sort((a, b) => String(b.savedAt ?? '').localeCompare(String(a.savedAt ?? '')))
 }

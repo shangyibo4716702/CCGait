@@ -984,8 +984,14 @@ function renderAccounts(data) {
     row.tabIndex = 0
     row.setAttribute('role', 'button')
 
-    // 标题优先显示真实账号（IndexedDB 里的邮箱），本地名字退居第二行。
-    const label = account.email ?? account.name
+    // 标题优先显示真实账号（IndexedDB 里的邮箱）。
+    //
+    // 读不到邮箱时退到「uuid 前 8 位」而不是本地字母名字：Claude 把账户信息存在
+    // 服务端，本地只在特定时机缓存，所以有些存档就是没有邮箱（实测扫描 25 个存储
+    // 文件、两种编码，0 命中）。uuid 至少能唯一区分账号，字母名字只能看出"我们给它
+    // 起了什么名"，用户没法据此认出是谁。
+    const shortUuid = account.uuid ? account.uuid.slice(0, 8) : undefined
+    const label = account.email ?? (shortUuid ? `账号 ${shortUuid}` : account.name)
     if (account.fullName) row.title = account.fullName
 
     const head = el('div', 'account-head')
@@ -1009,14 +1015,11 @@ function renderAccounts(data) {
     const usage = account.usage
     const meta = el('span', 'account-meta')
     meta.textContent = [
-      label !== account.name ? account.name : undefined,
-      // 没登录时优先说"需要重新登录"，这比"未识别到账号"更接近用户要做的动作：
-      // 实测登录态失效后 IndexedDB 里就没有账户信息，两个症状是同一件事。
-      account.signedIn === false
-        ? '登录已失效，需重新登录'
-        : account.email
-          ? undefined
-          : '未识别到账号',
+      // 本地名字始终显示（用户自己起的标签，切换时要用它）
+      account.name,
+      // 登录态：windowSizeWasSignedIn=false 只说明"窗口尺寸不是在登录状态下保存的"，
+      // 不等于当前没登录 —— 之前我按"登录失效"显示是错的，这里只提示、不下结论。
+      account.signedIn === false ? '本窗口可能在登录前打开' : undefined,
       account.savedAt ? new Date(account.savedAt).toLocaleDateString() : undefined,
     ]
       .filter(Boolean)
