@@ -330,6 +330,44 @@ export const UNVERIFIABLE_REASON_IDS = new Set([
 ])
 
 /**
+ * 只有这些原因才值得**终止进程**：出口身份本身不符。
+ *
+ * 为什么把范围收得这么窄（实测教训）：
+ * DNS 解析路径（resolver-egress）、代理模式、IPv6/DNS 覆写开关这些，都不是
+ * "Claude 此刻正以错误身份发请求"，而是"环境里存在一条可能漏的路"。它们有两个
+ * 致命问题：
+ *
+ *  1. **会飘**。同一分钟密集采样，解析出口在境外隧道和国内递归解析器之间来回摆
+ *     （多网卡各带一份 DNS，Windows 随机挑）。按它杀进程就是随机扫射。
+ *  2. **测的不是 Claude 走的那条路**。用户拿 ippure 检测显示正常、我们却在杀进程，
+ *     差异就来自这里：浏览器走隧道，系统解析器走另一条。
+ *
+ * 而出口 IP / 国家 / ASN 是**在 Claude 实际使用的同一条路径上**测出来的，稳定且
+ * 直接对应"这条流量会以什么身份到达对方"。所以：出口身份不符 → 可以杀；
+ * 其余所有问题 → 只断网（fail-closed，不露馅），不动进程。
+ */
+export const KILL_WORTHY_REASON_IDS = new Set([
+  'egress-country',
+  'egress-ip',
+  'egress-cidr',
+  'egress-asn',
+  'egress-hosting',
+])
+
+/**
+ * 这些拦截项只断网、不终止进程（即便 severity 是 block）。
+ *
+ * 给日志和界面一句解释：为什么这一轮判了拦截却没杀进程。
+ */
+export function isNetworkOnlyViolation(verdict) {
+  const blocked = verdict?.blockedBy ?? []
+  if (blocked.length === 0) return false
+  return blocked.some(
+    (item) => !UNVERIFIABLE_REASON_IDS.has(item.id) && !KILL_WORTHY_REASON_IDS.has(item.id),
+  )
+}
+
+/**
  * 这一轮是不是「确认违规」。
  *
  * 关键区分：只有具体违约事实（出口国家/IP/ASN 不符、解析落到被禁地区、代理泄露…）
@@ -339,7 +377,10 @@ export const UNVERIFIABLE_REASON_IDS = new Set([
 export function isDefiniteViolation(verdict) {
   const blocked = verdict?.blockedBy ?? []
   if (blocked.length === 0) return false
-  return blocked.every((item) => !UNVERIFIABLE_REASON_IDS.has(item.id))
+  // 混着没测出来的原因 → 不杀
+  if (blocked.some((item) => UNVERIFIABLE_REASON_IDS.has(item.id))) return false
+  // 有任何一条不是出口身份类（DNS 路径 / 代理开关 / 字体时区…）→ 不杀，只断网
+  return blocked.every((item) => KILL_WORTHY_REASON_IDS.has(item.id))
 }
 
 /** 终止进程要求「同一个确认违规结论」连续出现的轮数。 */
@@ -478,6 +519,15 @@ export async function enforce(config, verdict, options = {}) {
       logger?.warn(
         `已确认违规，连续 ${KILL_CONFIRM_ROUNDS} 轮才终止进程`,
         `本轮为第 ${options.killStreak ?? 1} 轮同因确认。网络已封死不会外泄；同一个原因再确认到第 ${KILL_CONFIRM_ROUNDS} 轮才动 Claude 进程，避免把网络抖动当成违规。`,
+      )
+    } else if (isNetworkOnlyViolation(verdict)) {
+      // 明确区分"环境里有一条可能漏的路"和"Claude 正以错误身份发请求"。
+      // 前者只断网：DNS 解析路径这类信号会飘，按它杀进程就是把用户正在干的活反复杀掉。
+      logger?.warn(
+        '只断网，不终止进程',
+        `拦截原因是环境配置类问题（${(verdict.blockedBy ?? [])
+          .map((item) => item.title)
+          .join('；')}），不是出口身份不符。已封死网络防止外泄；进程保留，环境恢复正常后即可继续。`,
       )
     } else {
       logger?.warn(

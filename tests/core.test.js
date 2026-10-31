@@ -18,6 +18,8 @@ import {
   describeBlockReason,
   describeEgress,
   isDefiniteViolation,
+  isNetworkOnlyViolation,
+  KILL_WORTHY_REASON_IDS,
   KILL_CONFIRM_ROUNDS,
   nextKillStreak,
   UNVERIFIABLE_REASON_IDS,
@@ -812,5 +814,55 @@ describe('代理开关进入 verdict', () => {
     })
     assert.equal(verdict.blockedBy.some((item) => item.id.startsWith('proxy-')), false)
     assert.equal(verdict.allow, true)
+  })
+})
+
+describe('杀进程的边界：只有出口身份不符才杀', () => {
+  // 用户实测：DNS 解析路径会飘，按它杀进程等于随机扫射。ippure 显示正常而我们杀进程，
+  // 差异正来自"浏览器走隧道、系统解析器走另一条"。
+  const config = { enforcement: { killProcesses: true } }
+  const v = (ids) => ({ allow: false, blockedBy: ids.map((id) => ({ id, title: id })) })
+
+  it('纯出口身份不符才允许杀', () => {
+    for (const id of ['egress-country', 'egress-ip', 'egress-cidr', 'egress-asn', 'egress-hosting']) {
+      assert.equal(isDefiniteViolation(v([id])), true, `${id} 属于出口身份，应当可以杀`)
+    }
+  })
+
+  it('DNS 解析路径、代理开关一律不杀（只断网）', () => {
+    for (const id of [
+      'resolver-egress-denied',
+      'claude-dns-denied',
+      'proxy-mode-not-global',
+      'proxy-ipv6-enabled',
+      'proxy-dns-override-off',
+      'proxy-dns-ipv6-enabled',
+      'proxy-leak',
+      'timezone-domestic',
+    ]) {
+      assert.equal(isDefiniteViolation(v([id])), false, `${id} 不该杀进程`)
+      assert.equal(isNetworkOnlyViolation(v([id])), true, `${id} 应归为"只断网"`)
+    }
+  })
+
+  it('出口不符与 DNS 问题同时出现时也不杀', () => {
+    const verdict = v(['egress-country', 'resolver-egress-denied'])
+    assert.equal(isDefiniteViolation(verdict), false, '混着会飘的信号就不能动手')
+    assert.equal(isNetworkOnlyViolation(verdict), true)
+  })
+
+  it('全是"没测出来"时既不算确认违规也不算配置类问题', () => {
+    const verdict = v(['egress-unknown'])
+    assert.equal(isDefiniteViolation(verdict), false)
+    assert.equal(isNetworkOnlyViolation(verdict), false, '它属于证据不足，走另一条文案')
+  })
+
+  it('shouldKillProcesses 对 DNS 类原因始终为 false', () => {
+    assert.equal(
+      shouldKillProcesses(config, v(['resolver-egress-denied']), { confirmed: true }),
+      false,
+      '就算连续确认很多轮，DNS 路径问题也不该杀进程',
+    )
+    assert.equal(shouldKillProcesses(config, v(['egress-country']), { confirmed: true }), true)
   })
 })

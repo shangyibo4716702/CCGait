@@ -100,6 +100,7 @@ const checks = [
   ['src/guard.js', 'isDefiniteViolation', '只有"确认违规"才终止进程（抖动只断网）'],
   ['src/guard.js', 'violationSignature', '同一违规原因连续出现才累计（换原因清零）'],
   ['src/guard.js', 'KILL_CONFIRM_ROUNDS', '终止进程要求连续确认多轮'],
+  ['src/guard.js', 'KILL_WORTHY_REASON_IDS', '只有出口身份不符才杀进程（DNS/代理问题只断网）'],
   ['src/guard.js', 'Claude 未运行，浏览器暂不纳入管控', '浏览器只在 Claude 运行时才断网'],
   ['src/win/wfp.js', 'shouldReuseWfpHost', '宿主复用前核对浏览器管控状态'],
   ['src/sessions-sync.js', 'copySessions', '会话同步：只搬索引，正文留在共享区'],
