@@ -301,6 +301,9 @@ export function createUiServer({ session, logger, token = randomBytes(24).toStri
           case '/api/proxy/safe-rule':
             sendJson(response, 200, await session.setProxyMode('rule'))
             return
+          case '/api/dns/repair':
+            sendJson(response, 200, await session.ensureSystemDns())
+            return
           case '/api/proxy/mode': {
             const body = await readJsonBody(request)
             sendJson(response, 200, await session.setProxyMode(body?.mode))

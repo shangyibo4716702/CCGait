@@ -60,6 +60,7 @@ import {
   writeProxyMode,
 } from '../proxy-mode.js'
 import { verifyClaudeRouting } from '../proxy-connections.js'
+import { repairSystemDns } from '../win/system-dns.js'
 import { startupStatus } from '../startup.js'
 import { isWfpBlocking, listWfpHosts, readWfpPid, startWfpBlock, stopWfpBlock } from '../win/wfp.js'
 
@@ -561,6 +562,7 @@ function resolveAppUserModelId() {
     applyClaudeRules: options.deps?.applyClaudeRules ?? applyClaudeRules,
     writeProxyMode: options.deps?.writeProxyMode ?? writeProxyMode,
     verifyClaudeRouting: options.deps?.verifyClaudeRouting ?? verifyClaudeRouting,
+    repairSystemDns: options.deps?.repairSystemDns ?? repairSystemDns,
     restartProxyCore: options.deps?.restartProxyCore ?? restartProxyCore,
     accountsRoot: options.deps?.accountsRoot ?? accountsRoot,
     locateDesktopProfile: options.deps?.locateDesktopProfile ?? locateDesktopProfile,
@@ -1176,6 +1178,32 @@ function resolveAppUserModelId() {
       }
     })
 
+  /**
+   * 代理没开时自愈网卡 DNS。
+   *
+   * Clash 的 DNS 覆写会把网卡 DNS 设成 198.18.0.2；内核退出后这个地址没人应答，
+   * 表现是"国内国外全打不开"。这里在内核不在时把它换回国内公共解析器 ——
+   * 内核在跑时一概不动，不和代理客户端抢配置。
+   */
+  const ensureSystemDns = () =>
+    serialize(async () => {
+      if (process.platform !== 'win32') return { checked: false, repaired: [] }
+      let outcome
+      try {
+        outcome = deps.repairSystemDns()
+      } catch (error) {
+        return { checked: false, error: error instanceof Error ? error.message : String(error) }
+      }
+      if (outcome.repaired?.length > 0) {
+        pushLog(
+          'warn',
+          '代理内核没在跑，网卡 DNS 还指着它 —— 已恢复成国内解析器',
+          `网卡索引 ${outcome.repaired.join('、')} → 223.5.5.5、119.29.29.29`,
+        )
+      }
+      return outcome
+    })
+
   const getAccounts = () => serialize(async () => readAccountsState())
 
   /**
@@ -1539,6 +1567,7 @@ function resolveAppUserModelId() {
     getProxyFixState,
     fixClashSettings,
     setProxyMode,
+    ensureSystemDns,
     getAccounts,
     saveCurrentAccount,
     createEmptyAccountFor,

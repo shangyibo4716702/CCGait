@@ -532,6 +532,9 @@ async function commandUi(argv) {
   // 开始监视阻断状态的变化：阻断可能是安装版托盘的闸门建立的，那种变化不会触发
   // 本会话的事件，只能主动比对后广播，否则界面会显示过期状态。
   session.startWatching()
+  // 代理没开时把网卡 DNS 拉回国内解析器：Clash 退出后网卡还指着 198.18.0.2
+  // 的话，国内国外都会打不开。内核在跑时这一步什么都不做。
+  void session.ensureSystemDns?.().catch(() => {})
 
   let address
   try {
