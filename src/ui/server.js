@@ -251,6 +251,11 @@ export function createUiServer({ session, logger, token = randomBytes(24).toStri
         return
       }
 
+      if (path === '/api/proxy' && request.method === 'GET') {
+        sendJson(response, 200, await session.getProxyFixState())
+        return
+      }
+
       if (path === '/api/accounts' && request.method === 'GET') {
         sendJson(response, 200, await session.getAccounts())
         return
@@ -290,6 +295,9 @@ export function createUiServer({ session, logger, token = randomBytes(24).toStri
             sendJson(response, 200, await session.saveCurrentAccount(body.name))
             return
           }
+          case '/api/proxy/fix':
+            sendJson(response, 200, await session.fixClashSettings())
+            return
           case '/api/accounts/create-empty': {
             const body = await readJsonBody(request)
             sendJson(response, 200, await session.createEmptyAccountFor(body.name))

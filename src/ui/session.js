@@ -46,6 +46,15 @@ import {
   projectFolderFor,
   sessionBodyExists,
 } from '../sessions-sync.js'
+import {
+  CORE_PROCESS_NAMES,
+  applyClashFix,
+  judgeDnsUpstreams,
+  judgeProxySettings,
+  needsClashFix,
+  probeProxyMode,
+  readProxySettings,
+} from '../proxy-mode.js'
 import { startupStatus } from '../startup.js'
 import { isWfpBlocking, listWfpHosts, readWfpPid, startWfpBlock, stopWfpBlock } from '../win/wfp.js'
 
@@ -268,6 +277,83 @@ async function detectExternalGuard(stateDir) {
   return [...found]
 }
 
+/**
+ * 重启代理内核，让新写的 DNS 配置生效。
+ *
+ * 为什么不能直接 taskkill：本机实测内核（verge-mihomo）以 **SYSTEM** 身份由
+ * `clash_verge_service` 托管，管理员权限执行 taskkill 也会被拒（Access denied），
+ * 结果就是"配置改了但没生效"。正确做法是重启那个服务，由它重新拉起内核。
+ *
+ * 等不到新进程就返回 false —— 界面会提示用户手动重启，不谎报成功。
+ */
+async function restartProxyCore({ waitMs = 20_000 } = {}) {
+  if (process.platform !== 'win32') return false
+
+  const runPowerShell = (script, timeout = 25_000) =>
+    execFileSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      { windowsHide: true, timeout, encoding: 'utf8' },
+    )
+
+  const coreIds = () => {
+    try {
+      const out = runPowerShell(
+        `Get-Process -Name ${CORE_PROCESS_NAMES.join(',')} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id; exit 0`,
+        10_000,
+      )
+      return out
+        .split(/\r?\n/)
+        .map((line) => Number(line.trim()))
+        .filter((id) => Number.isInteger(id) && id > 0)
+    } catch {
+      return []
+    }
+  }
+
+  const before = coreIds()
+
+  // 优先重启托管服务；服务不存在时（如 FlClash 用别的方式托管）再退回杀进程。
+  let restartedService = false
+  try {
+    const services = runPowerShell(
+      "Get-Service | Where-Object { $_.Name -match 'clash.*service|verge.*service' -and $_.Status -eq 'Running' } | Select-Object -ExpandProperty Name; exit 0",
+      15_000,
+    )
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+    for (const name of services) {
+      try {
+        runPowerShell(`Restart-Service '${name}' -Force -ErrorAction Stop`, 30_000)
+        restartedService = true
+      } catch {
+        // 单个服务重启失败就继续试下一个
+      }
+    }
+  } catch {
+    restartedService = false
+  }
+
+  if (!restartedService) {
+    for (const pid of before) {
+      try {
+        execFileSync('taskkill.exe', ['/PID', String(pid), '/F'], { windowsHide: true, timeout: 10_000 })
+      } catch {
+        // 杀不掉（SYSTEM 进程）就走下面的等待，最终返回 false
+      }
+    }
+  }
+
+  const deadline = Date.now() + waitMs
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    const now = coreIds()
+    if (now.some((pid) => !before.includes(pid))) return true
+  }
+  return false
+}
+
 export function createUiSession(options = {}) {
   const configPath = options.configPath ?? CONFIG_PATH
   const logger = options.logger
@@ -459,6 +545,13 @@ function resolveAppUserModelId() {
     listClaudeProcesses: options.deps?.listClaudeProcesses ?? listClaudeProcesses,
     killAllClaudeProcesses: options.deps?.killAllClaudeProcesses ?? killAllClaudeProcesses,
     killClaudeProcessesByKind: options.deps?.killClaudeProcessesByKind ?? killClaudeProcessesByKind,
+    probeProxyMode: options.deps?.probeProxyMode ?? probeProxyMode,
+    readProxySettings: options.deps?.readProxySettings ?? readProxySettings,
+    judgeProxySettings: options.deps?.judgeProxySettings ?? judgeProxySettings,
+    judgeDnsUpstreams: options.deps?.judgeDnsUpstreams ?? judgeDnsUpstreams,
+    needsClashFix: options.deps?.needsClashFix ?? needsClashFix,
+    applyClashFix: options.deps?.applyClashFix ?? applyClashFix,
+    restartProxyCore: options.deps?.restartProxyCore ?? restartProxyCore,
     accountsRoot: options.deps?.accountsRoot ?? accountsRoot,
     locateDesktopProfile: options.deps?.locateDesktopProfile ?? locateDesktopProfile,
     claudeProjectsDir: options.deps?.claudeProjectsDir ?? claudeProjectsDir,
@@ -887,6 +980,76 @@ function resolveAppUserModelId() {
     }
   }
 
+  /**
+   * 代理设置现状：给「修正 Clash 设置」按钮上色用。
+   *
+   * 只读配置，不联网、不改系统。`needsFix` 为 true 时按钮显示红色。
+   */
+  const readProxyFixStateInternal = async () => {
+    const probe = await deps.probeProxyMode()
+    if (!probe.dir) return { found: false, needsFix: false, issues: [], mode: probe.mode }
+    const settings = deps.readProxySettings(probe.dir)
+    const issues = [
+      ...deps.judgeProxySettings(settings),
+      ...deps.judgeDnsUpstreams({ nameserver: settings.nameserver }),
+    ]
+    return {
+      found: true,
+      dir: probe.dir,
+      client: probe.client,
+      mode: probe.mode,
+      settings,
+      issues,
+      needsFix: deps.needsClashFix(settings),
+    }
+  }
+
+  const getProxyFixState = () => serialize(readProxyFixStateInternal)
+
+  /**
+   * 一键修正 Clash 设置：把 DNS 上游里的国内解析器去掉。
+   *
+   * 改完必须重启内核才生效（内核只在启动时读配置）。Verge GUI 常驻时会自动把内核
+   * 重新拉起 —— 实测如此；这里等新进程出现再返回，避免界面报"已修正"但实际没生效。
+   */
+  const fixClashSettings = () =>
+    serialize(async () => {
+      const probe = await deps.probeProxyMode()
+      if (!probe.dir) throw new Error('没找到受支持的代理客户端配置，无法自动修正')
+      const outcome = deps.applyClashFix(probe.dir)
+      const changedFiles = outcome.results.filter((item) => item.changed)
+      if (changedFiles.length === 0) {
+        pushLog(
+          'info',
+          '代理设置无需修正',
+          outcome.results
+            .map((item) => item.reason)
+            .filter(Boolean)
+            .join('；'),
+        )
+        emit({ type: 'status' })
+        return { changed: 0, restarted: false, ...(await readProxyFixStateInternal()) }
+      }
+      pushLog(
+        'info',
+        `已修正 ${changedFiles.length} 个配置文件`,
+        changedFiles
+          .map(
+            (item) =>
+              `${item.file.split(/[\\/]/).pop()}：${(item.before ?? []).join(',')} → ${(item.after ?? []).join(',')}`,
+          )
+          .join('；'),
+      )
+      const restarted = await deps.restartProxyCore()
+      if (restarted) {
+        pushLog('info', '已重启代理内核，新 DNS 配置生效', '重启期间网络会短暂中断几秒')
+      } else {
+        pushLog('warn', '配置文件已改，但没能重启内核', '请在代理客户端里手动重启内核让改动生效')
+      }
+      emit({ type: 'status' })
+      return { changed: changedFiles.length, restarted, ...(await readProxyFixStateInternal()) }
+    })
+
   const getAccounts = () => serialize(async () => readAccountsState())
 
   /**
@@ -1247,6 +1410,8 @@ function resolveAppUserModelId() {
     stopGuard,
     setFirewall,
     killProcesses,
+    getProxyFixState,
+    fixClashSettings,
     getAccounts,
     saveCurrentAccount,
     createEmptyAccountFor,

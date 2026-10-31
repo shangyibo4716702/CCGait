@@ -1755,3 +1755,73 @@ input[type='checkbox']:checked::after {
   background: var(--warn-bg);
   border-radius: 999px;
 }
+
+/* ---------------------------------------------------------------- 代理设置面板 */
+
+.proxy-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.proxy-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 12px;
+  border-left: 3px solid var(--danger-text);
+  border-radius: 8px;
+  background: var(--danger-bg);
+}
+
+.proxy-item-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--danger-text);
+}
+
+.proxy-item-detail {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.proxy-ok {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 12px;
+  font-size: 12.5px;
+  color: var(--ok-text);
+  background: var(--ok-bg);
+  border-radius: 8px;
+}
+
+/* 按钮两态：需要修正=红，已正确=绿 */
+.action.is-needs-fix {
+  color: #fff;
+  background: var(--danger-text);
+  border-color: var(--danger-text);
+}
+
+.action.is-needs-fix:hover:not(:disabled) {
+  background: #8f1c12;
+  border-color: #8f1c12;
+}
+
+.action.is-fixed {
+  color: #fff;
+  background: var(--ok-text);
+  border-color: var(--ok-text);
+  cursor: default;
+}
+
+/* 「设置正确」的绿按钮本身是禁用的，但不要被通用 disabled 规则压成半透明 ——
+   那会变成浅绿底+浅字，看不清。这里显式覆盖回实色。 */
+button.action.is-fixed:disabled {
+  opacity: 1;
+  color: #fff;
+  background: var(--ok-text);
+  border-color: var(--ok-text);
+  cursor: default;
+}

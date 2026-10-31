@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -420,3 +420,143 @@ export function judgeProxyMode({ checked, mode, requireGlobal = true }) {
   if (mode === 'global') return { block: false, warn: false }
   return { block: true, warn: false, mode }
 }
+
+/* ------------------------------------------------------------------ 一键修正 */
+
+/** 兜底用：一条都识别不出来时写这个（境外且稳定）。 */
+const SAFE_NAMESERVERS = ['8.8.8.8', 'https://dns.google/dns-query']
+
+/** 常见内核可执行名 → 用来判断该重启哪个进程。 */
+const CORE_PROCESS_NAMES = ['verge-mihomo', 'mihomo', 'clash-meta', 'FlClashCore', 'clash-win64']
+
+/**
+ * 找出内核实际使用的运行时配置。
+ *
+ * Clash Verge 把内核配置放在 ProgramData 下（服务模式下），和 AppData 里那份
+ * 不是同一个文件 —— 只改 AppData 的话内核读到的还是旧的，等于没改。
+ * 路径形如 `ProgramData/clash-verge-service/users/<hash>/runtime/config.yaml`。
+ */
+export function findRuntimeConfigs({
+  programData = process.env.ProgramData ?? 'C:\ProgramData',
+  exists = existsSync,
+  readDir = readdirSync,
+} = {}) {
+  const found = []
+  const usersDir = join(programData, 'clash-verge-service', 'users')
+  if (!exists(usersDir)) return found
+  let users
+  try {
+    users = readDir(usersDir)
+  } catch {
+    return found
+  }
+  for (const user of users) {
+    const path = join(usersDir, String(user), 'runtime', 'config.yaml')
+    if (exists(path)) found.push(path)
+  }
+  return found
+}
+
+/** 要在哪些文件上动手：Verge 的 DNS 覆写源 + 运行时副本 + 内核实际读取的那份。 */
+export function clashConfigTargets(dir, options = {}) {
+  const { exists = existsSync, programData } = options
+  const targets = []
+  for (const name of ['dns_config.yaml', 'clash-verge.yaml', 'config.yaml']) {
+    const path = join(dir, name)
+    if (exists(path)) targets.push(path)
+  }
+  // 只把需要的字段传下去：findRuntimeConfigs 还接受 exists/readDir，转手时别丢了。
+  for (const path of findRuntimeConfigs(programData ? { programData, exists } : options)) targets.push(path)
+  // 去重（config.yaml 可能同时出现在 dir 和 runtime 里）
+  return [...new Set(targets)]
+}
+
+/**
+ * 把一份配置里的 `dns.nameserver` 里的国内上游删掉。
+ *
+ * 只动这一个列表：`proxy-server-nameserver`（解析机场节点域名用）必须保留国内，
+ * 删了代理会连不上。返回改前/改后的列表，便于界面显示改了什么。
+ */
+export function rewriteNameserver(text) {
+  const lines = text.split('\n')
+  const dnsStart = lines.findIndex((line) => /^dns:\s*$/.test(line))
+  if (dnsStart < 0) return { changed: false, reason: '没有 dns 段' }
+
+  let target = -1
+  for (let i = dnsStart + 1; i < lines.length; i += 1) {
+    if (/^\S/.test(lines[i])) break
+    if (/^ {2}nameserver:\s*$/.test(lines[i])) {
+      target = i
+      break
+    }
+  }
+  if (target < 0) return { changed: false, reason: 'dns 段里没有 nameserver' }
+
+  let end = target + 1
+  while (end < lines.length && /^ {2}- /.test(lines[end])) end += 1
+
+  const before = lines.slice(target + 1, end).map((line) => line.replace(/^ {2}- /, '').trim())
+  const kept = before.filter((entry) => classifyDnsUpstream(entry) !== 'domestic')
+  const next = kept.length > 0 ? kept : SAFE_NAMESERVERS
+
+  if (before.length === next.length && before.every((entry, index) => entry === next[index])) {
+    return { changed: false, reason: '已经只有境外上游', before }
+  }
+
+  lines.splice(target + 1, end - target - 1, ...next.map((entry) => `  - ${entry}`))
+  return { changed: true, before, after: next, text: lines.join('\n') }
+}
+
+/**
+ * 执行修正：改所有目标文件，返回逐文件结果。
+ *
+ * 不在这里重启内核 —— 重启会短暂断网，交给调用方决定（界面会提示）。
+ */
+export function applyClashFix(
+  dir,
+  {
+    exists = existsSync,
+    readFile = (p) => readFileSync(p, 'utf8'),
+    writeFile = (p, t) => writeFileSync(p, t),
+    // 允许测试隔离：不指定时用真实 ProgramData，测试里传一个空目录就不会碰到本机配置。
+    programData = process.env.ProgramData ?? 'C:\\ProgramData',
+  } = {},
+) {
+  const results = []
+  for (const file of clashConfigTargets(dir, { exists, programData })) {
+    let text
+    try {
+      text = readFile(file)
+    } catch (error) {
+      results.push({ file, changed: false, reason: `读取失败：${error.code ?? error.message}` })
+      continue
+    }
+    const outcome = rewriteNameserver(text)
+    if (!outcome.changed) {
+      results.push({ file, changed: false, reason: outcome.reason, before: outcome.before })
+      continue
+    }
+    try {
+      writeFile(file, outcome.text)
+      results.push({ file, changed: true, before: outcome.before, after: outcome.after })
+    } catch (error) {
+      results.push({ file, changed: false, reason: `写入失败：${error.code ?? error.message}` })
+    }
+  }
+  return {
+    results,
+    changed: results.filter((item) => item.changed).length,
+    needsRestart: results.some((item) => item.changed),
+  }
+}
+
+/** 当前环境需不需要修正（给按钮上色用）。 */
+export function needsClashFix(settings) {
+  if (!settings) return false
+  const hasDomestic = (settings.nameserver ?? []).some(
+    (entry) => classifyDnsUpstream(entry) === 'domestic',
+  )
+  return hasDomestic || settings.ipv6 === true || settings.dnsOverride === false || settings.dnsIpv6 === true
+}
+
+export { CORE_PROCESS_NAMES, SAFE_NAMESERVERS }

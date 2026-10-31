@@ -124,7 +124,7 @@ async function refresh() {
   try {
     // 账号面板也一起刷：它在侧栏常驻，用户改完登录态/切完号回来看到的是屏幕上的旧值，
     // 必须关掉页面重开才更新（实测被投诉）。这里并行拉，互不阻塞。
-    const [next] = await Promise.all([api('/api/status'), refreshAccounts()])
+    const [next] = await Promise.all([api('/api/status'), refreshAccounts(), refreshProxyPanel()])
     status = next
     checkBuildMatch()
     render()
@@ -1310,6 +1310,101 @@ async function confirmSync() {
   }
 }
 
+/** -------------------------------------------------------------- 代理设置面板 */
+
+let proxyState = undefined
+
+/**
+ * 代理设置面板：按钮两态。
+ *  需要修正 → 红色，可点，点了自动改配置并重启内核
+ *  已经正确 → 绿色，禁用
+ */
+function renderProxyPanel(data) {
+  proxyState = data
+  const host = document.querySelector('#proxy-issues')
+  const sub = document.querySelector('#proxy-sub')
+  const button = document.querySelector('#proxy-fix')
+  if (!host || !sub || !button) return
+
+  button.classList.remove('is-needs-fix', 'is-fixed')
+  host.replaceChildren()
+
+  if (!data?.found) {
+    sub.textContent = '未检测到代理客户端'
+    button.disabled = true
+    button.textContent = '无从修正'
+    host.append(
+      el('div', 'side-hint', '没找到 Clash Verge / FlClash 等受支持的代理客户端配置。这一项只提示。'),
+    )
+    return
+  }
+
+  const issues = list(data.issues)
+  if (issues.length === 0) {
+    sub.textContent = data.client ?? '已就绪'
+    button.disabled = true
+    button.classList.add('is-fixed')
+    button.textContent = '设置正确'
+    host.append(el('div', 'proxy-ok', 'DNS 上游、IPv6、DNS 覆写都符合要求，解析出口稳定。'))
+    return
+  }
+
+  sub.textContent = `${issues.length} 项需要修正`
+  button.disabled = false
+  button.classList.add('is-needs-fix')
+  button.textContent = '修正 Clash 设置'
+
+  for (const issue of issues) {
+    const item = el('div', 'proxy-item')
+    item.append(el('div', 'proxy-item-title', issue.title), el('div', 'proxy-item-detail', issue.detail))
+    host.append(item)
+  }
+}
+
+async function refreshProxyPanel() {
+  try {
+    renderProxyPanel(await api('/api/proxy'))
+  } catch {
+    // 读不到就保持上一屏
+  }
+}
+
+async function fixClashSettings() {
+  const button = document.querySelector('#proxy-fix')
+  if (!button || button.disabled) return
+  const confirmed = window.confirm(
+    '修正代理设置？\n\n' +
+      '· 会把你代理配置里 DNS 上游的国内解析器删掉，只留境外\n' +
+      '· 机场节点用的那份名单（proxy-server-nameserver）保持不动\n' +
+      '· 改完会重启代理内核，网络会中断几秒\n\n' +
+      '继续吗？',
+  )
+  if (!confirmed) return
+
+  const original = button.textContent
+  button.disabled = true
+  button.textContent = '修正中…'
+  try {
+    const result = await api('/api/proxy/fix', { method: 'POST' })
+    if (result?.changed > 0) {
+      toast(
+        'ok',
+        `已修正 ${result.changed} 个配置文件`,
+        result.restarted ? '已重启代理内核，新配置生效' : '请手动重启代理内核让改动生效',
+      )
+    } else {
+      toast('info', '无需修正', '配置已经是正确状态')
+    }
+    renderProxyPanel(result)
+    void refresh()
+  } catch (error) {
+    toast('error', '修正失败', error instanceof Error ? error.message : String(error))
+  } finally {
+    button.disabled = false
+    button.textContent = original
+  }
+}
+
 async function refreshAccounts() {
   try {
     renderAccounts(await api('/api/accounts'))
@@ -1917,6 +2012,10 @@ document.querySelector('#launch-desktop')?.addEventListener('click', () => {
 
 document.querySelector('#account-save')?.addEventListener('click', () => {
   void saveCurrentAccount()
+})
+
+document.querySelector('#proxy-fix')?.addEventListener('click', () => {
+  void fixClashSettings()
 })
 
 document.querySelector('#account-create-empty')?.addEventListener('click', () => {

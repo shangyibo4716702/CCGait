@@ -1,6 +1,6 @@
 import { after, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -8,7 +8,10 @@ import {
   judgeProxyMode,
   normalizeController,
   probeProxyMode,
+  applyClashFix,
+  needsClashFix,
   proxyConfigDirs,
+  rewriteNameserver,
   judgeProxySettings,
   readProxySettings,
   classifyDnsUpstream,
@@ -393,5 +396,96 @@ describe('readProxySettings 带上 nameserver', () => {
     assert.deepEqual(settings.nameserver, ['8.8.8.8', 'https://dns.google/dns-query'])
     // 机场节点用的国内解析器不算问题
     assert.deepEqual(judgeDnsUpstreams({ nameserver: settings.nameserver }), [])
+  })
+})
+
+describe('一键修正：改写 nameserver', () => {
+  const build = (list) =>
+    ['dns:', '  enable: true', '  nameserver:'].concat(list.map((x) => `  - ${x}`)).concat(['  fallback: []']).join('\n')
+
+  it('删掉国内上游，保留境外', () => {
+    const outcome = rewriteNameserver(build(['8.8.8.8', 'https://doh.pub/dns-query', '223.5.5.5']))
+    assert.equal(outcome.changed, true)
+    assert.deepEqual(outcome.before, ['8.8.8.8', 'https://doh.pub/dns-query', '223.5.5.5'])
+    assert.deepEqual(outcome.after, ['8.8.8.8'])
+    assert.ok(!outcome.text.includes('doh.pub'))
+    assert.ok(outcome.text.includes('fallback: []'), '不能破坏后面的段')
+  })
+
+  it('全是国内时替换成安全默认值', () => {
+    const outcome = rewriteNameserver(build(['119.29.29.29', '223.5.5.5']))
+    assert.equal(outcome.changed, true)
+    assert.deepEqual(outcome.after, ['8.8.8.8', 'https://dns.google/dns-query'])
+  })
+
+  it('已经只有境外时不改动', () => {
+    const text = build(['8.8.8.8', 'https://dns.google/dns-query'])
+    const outcome = rewriteNameserver(text)
+    assert.equal(outcome.changed, false)
+    assert.equal(outcome.reason, '已经只有境外上游')
+    assert.equal(outcome.text, undefined, '不该产生新内容')
+  })
+
+  it('不碰 proxy-server-nameserver（机场节点解析用）', () => {
+    const text = [
+      'dns:',
+      '  nameserver:',
+      '  - 8.8.8.8',
+      '  - https://doh.pub/dns-query',
+      '  proxy-server-nameserver:',
+      '  - https://doh.pub/dns-query',
+    ].join('\n')
+    const outcome = rewriteNameserver(text)
+    assert.equal(outcome.changed, true)
+    // 第二处 doh.pub（proxy-server-nameserver 下）必须还在
+    assert.ok(outcome.text.includes('proxy-server-nameserver:\n  - https://doh.pub/dns-query'))
+  })
+
+  it('没有 dns 段或没有 nameserver 时明确说明原因', () => {
+    assert.equal(rewriteNameserver('mode: global').reason, '没有 dns 段')
+    assert.equal(rewriteNameserver('dns:\n  enable: true').reason, 'dns 段里没有 nameserver')
+  })
+})
+
+describe('修正计划与按钮状态', () => {
+  it('needsClashFix 覆盖四类问题', () => {
+    assert.equal(needsClashFix({ nameserver: ['8.8.8.8', 'doh.pub'] }), true)
+    assert.equal(needsClashFix({ nameserver: ['8.8.8.8'], ipv6: true }), true)
+    assert.equal(needsClashFix({ nameserver: ['8.8.8.8'], dnsOverride: false }), true)
+    assert.equal(needsClashFix({ nameserver: ['8.8.8.8'], dnsIpv6: true }), true)
+    assert.equal(needsClashFix({ nameserver: ['8.8.8.8'], ipv6: false, dnsOverride: true, dnsIpv6: false }), false)
+    assert.equal(needsClashFix(undefined), false)
+  })
+
+  it('applyClashFix 改多个文件并汇总结果', () => {
+    const root = tempDir()
+    const clientDir = join(root, 'client')
+    mkdirSync(clientDir, { recursive: true })
+    const bad = ['dns:', '  nameserver:', '  - 8.8.8.8', '  - https://doh.pub/dns-query'].join('\n')
+    writeFileSync(join(clientDir, 'dns_config.yaml'), bad)
+    writeFileSync(join(clientDir, 'clash-verge.yaml'), bad)
+
+    // findRuntimeConfigs 找 ProgramData，用不存在的 programData 让它返回空
+    const outcome = applyClashFix(clientDir, { programData: join(root, 'nope') })
+    assert.equal(outcome.changed, 2)
+    assert.equal(outcome.needsRestart, true)
+    for (const name of ['dns_config.yaml', 'clash-verge.yaml']) {
+      const text = readFileSync(join(clientDir, name), 'utf8')
+      assert.ok(!text.includes('doh.pub'), `${name} 里不该再有国内上游`)
+      assert.ok(text.includes('8.8.8.8'))
+    }
+  })
+
+  it('已经正确时不写文件、不要求重启', () => {
+    const root = tempDir()
+    const clientDir = join(root, 'client')
+    mkdirSync(clientDir, { recursive: true })
+    writeFileSync(
+      join(clientDir, 'dns_config.yaml'),
+      ['dns:', '  nameserver:', '  - 8.8.8.8'].join('\n'),
+    )
+    const outcome = applyClashFix(clientDir, { programData: join(root, 'nope') })
+    assert.equal(outcome.changed, 0)
+    assert.equal(outcome.needsRestart, false)
   })
 })
