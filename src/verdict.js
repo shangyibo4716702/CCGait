@@ -244,6 +244,48 @@ export function evaluateEnvironment(config, env) {
     )
   }
 
+  // 代理模式：规则模式下没命中规则的流量走直连，等于出口可能绕过代理。
+  //
+  // 为什么算硬门槛：和"系统代理开着但 CLI 不走它"是同一类问题 —— 出口路径本身
+  // 不可控。实测踩过：Clash Verge 在 rule 模式时，DNS 查询在隧道和 WLAN 的国内
+  // 解析器之间来回摆，闸门时拦时放，属于间歇性泄露。
+  //
+  // unknown 不拦：读不到配置通常说明本机没装受支持的代理客户端，当成违规就是误杀；
+  // 真正的把关交给出口 IP / 解析出口这些实测项。
+  if (env.proxyMode?.mode && env.proxyMode.mode !== 'unknown') {
+    if (env.proxyMode.mode !== 'global') {
+      const modeName = { rule: '规则模式', direct: '直连模式' }[env.proxyMode.mode] ?? env.proxyMode.mode
+      reasons.push(
+        reason(
+          'proxy-mode-not-global',
+          'block',
+          `代理不是全局模式：${modeName}`,
+          `检测到代理客户端（${env.proxyMode.client ?? '未知客户端'}）当前是 ${modeName}。这种模式下没有命中规则的流量会走直连 —— 同一个程序有时走代理、有时从物理网卡直接出去，属于间歇性泄露，比稳定泄露更难发现。请在代理客户端里切到「全局模式」，或确认 Claude 相关域名与 DNS 查询都被规则覆盖。`,
+        ),
+      )
+    }
+  } else if (env.proxyMode && env.proxyMode.mode === 'unknown') {
+    reasons.push(
+      reason(
+        'proxy-mode-unknown',
+        'warn',
+        '无法确认代理模式',
+        '没找到受支持的代理客户端配置（Clash Verge / FlClash 等），或配置里没有可读的模式字段。这一项只提示、不拦截。',
+      ),
+    )
+  }
+
+  // 代理的三个关键开关：IPv6 / DNS 覆写 / 覆写内的 IPv6。
+  //
+  // 它们共同决定"DNS 是不是被代理接管"。实测踩过的组合：IPv6 关了但 DNS 覆写里的
+  // IPv6 还开着，解析出口在境外隧道和国内递归解析器之间来回摆，闸门时拦时放。
+  // 只在检测到代理客户端时才判 —— 没装代理的环境不该被这项拦住。
+  if (env.proxySettings?.checked && env.proxySettings.issues?.length > 0) {
+    for (const issue of env.proxySettings.issues) {
+      reasons.push(reason(issue.id, 'block', issue.title, issue.detail))
+    }
+  }
+
   if (env.dnsServers?.domestic?.length > 0) {
     reasons.push(
       reason(
@@ -316,6 +358,8 @@ export function decide({ config, egress, dns, environment, deniedCountries = ['C
     'egress-proxy-fallback',
     // 判不出结果 ≠ 环境不对：这一条不该被提升成拦截。
     'resolver-egress-unknown',
+    // 同上：读不到代理配置，不等于它开着规则模式。
+    'proxy-mode-unknown',
   ])
   const severityOf = (id) => {
     if (WARN_ONLY_IDS.has(id)) return 'warn'
@@ -328,6 +372,8 @@ export function decide({ config, egress, dns, environment, deniedCountries = ['C
     if (id.startsWith('resolver-egress')) return checks.resolverEgress.severity
     if (id.startsWith('dns-servers')) return checks.dnsServers.severity
     if (id === 'proxy-leak') return checks.proxyEnvLeak.severity
+    if (id.startsWith('proxy-mode')) return checks.proxyMode.severity
+    if (id.startsWith('proxy-ipv6') || id.startsWith('proxy-dns')) return checks.proxySettings.severity
     return 'warn'
   }
 
@@ -341,6 +387,8 @@ export function decide({ config, egress, dns, environment, deniedCountries = ['C
     if (id.startsWith('resolver-egress')) return checks.resolverEgress.enabled
     if (id.startsWith('dns-servers')) return checks.dnsServers.enabled
     if (id === 'proxy-leak') return checks.proxyEnvLeak.enabled
+    if (id.startsWith('proxy-mode')) return checks.proxyMode.enabled
+    if (id.startsWith('proxy-ipv6') || id.startsWith('proxy-dns')) return checks.proxySettings.enabled
     return true
   }
 

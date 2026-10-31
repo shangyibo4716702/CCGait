@@ -394,3 +394,53 @@ export async function probeResolverEgress({ deniedCountries = ['CN'] } = {}) {
   const deniedHits = resolvers.filter((item) => item.country && deniedCountries.includes(item.country))
   return { resolvers, deniedHits, checked: true, error }
 }
+
+/**
+ * 采样式解析出口探测：抓"间歇性泄露"。
+ *
+ * 为什么一次不够：本机实测，Windows 解析器在多块网卡（TUN + 物理网卡）之间挑路，
+ * 一部分查询走代理、一部分漏到国内递归解析器（用户关掉代理 DNS 覆写的 IPv6 之前
+ * 就是这种状态）。单次探测可能恰好抽中安全路径而漏报 —— 泄露是间歇性的，检测也
+ * 必须按间歇性来设计。
+ *
+ * 策略：第一发干净就再补两发，任一发命中国内立即定罪（不必继续）。
+ * 全干净才通过，代价是干净时多花两次查询的时间（各约 1 秒）。
+ *
+ * 合并规则：resolvers 取并集（出现过的出口都展示）；deniedHits 取并集
+ * （任一采样命中即算）。
+ */
+export async function probeResolverEgressSampled({ deniedCountries = ['CN'], samples = 3 } = {}) {
+  const rounds = []
+  let firstError
+  for (let i = 0; i < Math.max(1, samples); i += 1) {
+    const round = await probeResolverEgress({ deniedCountries })
+    rounds.push(round)
+    if (!round.checked && firstError === undefined) firstError = round.error
+    // 命中即定罪，不用再抽。
+    if (round.deniedHits.length > 0) break
+    await new Promise((resolve) => setTimeout(resolve, 300))
+  }
+
+  const checkedRounds = rounds.filter((round) => round.checked)
+  if (checkedRounds.length === 0) {
+    return { resolvers: [], deniedHits: [], checked: false, error: firstError }
+  }
+
+  const byIp = new Map()
+  for (const round of checkedRounds) {
+    for (const resolver of round.resolvers) {
+      if (!byIp.has(resolver.ip)) byIp.set(resolver.ip, resolver)
+    }
+  }
+  const deniedIps = new Set()
+  for (const round of checkedRounds) {
+    for (const hit of round.deniedHits) deniedIps.add(hit.ip)
+  }
+
+  return {
+    resolvers: [...byIp.values()],
+    deniedHits: [...byIp.values()].filter((item) => deniedIps.has(item.ip)),
+    checked: true,
+    samples: checkedRounds.length,
+  }
+}

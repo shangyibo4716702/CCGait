@@ -43,6 +43,8 @@ const CHECK_LABELS = {
   resolverEgress: { name: '解析出口（实测）', scope: '谁在实际回答 DNS 查询' },
   dnsServers: { name: 'DNS 服务器位置', scope: '已连接网卡配置的公共解析器' },
   proxyEnvLeak: { name: '系统代理 / 分流覆盖', scope: 'CLI 是否直连' },
+  proxyMode: { name: '代理全局模式', scope: '规则模式下未命中规则会直连' },
+  proxySettings: { name: '代理 IPv6 / DNS 覆写', scope: 'IPv6 关、DNS 覆写开、覆写内 IPv6 关' },
 }
 
 /** 出口相关的判定 id：出口卡片的结论标签与分区徽章都从这一组里取。 */

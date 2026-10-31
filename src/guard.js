@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { probeClaudeDns, probeEgress, probeResolverEgress } from './providers.js'
+import { probeClaudeDns, probeEgress, probeResolverEgress, probeResolverEgressSampled } from './providers.js'
+import { judgeProxySettings, probeProxyMode, readProxySettings } from './proxy-mode.js'
 import {
   probeDnsServers,
   probeEmojiFont,
@@ -140,6 +141,8 @@ export async function runChecks(config) {
     dnsServers,
     resolverEgress,
     systemProxy,
+    proxyMode,
+    proxySettings,
   ] = await Promise.all([
       config.checks.egressIp.enabled
         ? probeEgress({ proxyUrl, proxyRequired }).catch((error) => ({
@@ -156,12 +159,28 @@ export async function runChecks(config) {
       config.checks.emojiFlags.enabled ? Promise.resolve(probeEmojiFont()) : Promise.resolve(undefined),
       config.checks.dnsServers.enabled ? probeDnsServers().catch(() => undefined) : Promise.resolve(undefined),
       config.checks.resolverEgress.enabled
-        ? probeResolverEgress({ deniedCountries }).catch(() => undefined)
+        ? probeResolverEgressSampled({ deniedCountries }).catch(() => undefined)
         : Promise.resolve(undefined),
       config.checks.proxyEnvLeak.enabled ? probeSystemProxy().catch(() => undefined) : Promise.resolve(undefined),
+      config.checks.proxyMode.enabled ? probeProxyMode().catch(() => ({ mode: 'unknown' })) : Promise.resolve(undefined),
+      // 代理设置（IPv6 / DNS 覆写）：复用同一次配置探测，配置只读一遍。
+      config.checks.proxySettings.enabled
+        ? probeProxyMode()
+            .then((probe) => {
+              if (!probe.dir) return { checked: false, issues: [] }
+              const settings = readProxySettings(probe.dir)
+              return {
+                checked: true,
+                client: probe.client,
+                settings,
+                issues: judgeProxySettings(settings),
+              }
+            })
+            .catch(() => ({ checked: false, issues: [] }))
+        : Promise.resolve(undefined),
     ])
 
-  const environment = { timezone, language, fonts, emojiFont, dnsServers, resolverEgress, systemProxy }
+  const environment = { timezone, language, fonts, emojiFont, dnsServers, resolverEgress, systemProxy, proxyMode, proxySettings }
   const verdict = decide({
     config,
     egress: egressResult,

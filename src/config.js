@@ -44,6 +44,11 @@ export const DEFAULT_SEVERITY = {
   // 配置口径（网卡上配了谁）：口径与实测对不齐，只提示。
   dnsServers: 'warn',
   proxyEnvLeak: 'block',
+  // 代理模式：规则模式下没命中规则的流量会走直连，等于出口可能绕过代理。
+  // 默认阻断（和系统代理泄露同一条理由：这是出口路径本身，不是设备特征）。
+  proxyMode: 'block',
+  // 代理的三个关键开关：IPv6 / DNS 覆写 / 覆写内的 IPv6。默认阻断。
+  proxySettings: 'block',
 }
 
 export const DEFAULT_CONFIG = {

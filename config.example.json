@@ -25,7 +25,11 @@
     "$comment4": "系统代理默认**阻断**：它不是设备特征，而是出口路径本身 —— 系统代理开着但 CLI 不走它（WinINET 代理只覆盖浏览器那类程序），等于这次请求直连物理网卡出口，和出口白名单是同一件事。如果你的代理本来就该直连（例如公司内网），把它改成 warn 或 enabled=false。",
     "$comment5": "本机 DNS 默认只**提示**、不拦截：这一项读的是「已连接网卡上配置了哪台解析器」，不是「实测的解析路径」（实测路径看上面的 resolverEgress）—— 配了国内解析器不等于解析真的走国内（实测：WLAN 上静态配着腾讯 DNS，而实际回答查询的是 IPv6 侧路由器转发的 ISP 解析器）。口径对不齐就有假阳性余地，所以按「多余的额外风险只提示」处理；确实想把它当硬门槛就改成 block。",
     "dnsServers": { "enabled": true, "severity": "warn" },
-    "proxyEnvLeak": { "enabled": true, "severity": "block" }
+    "proxyEnvLeak": { "enabled": true, "severity": "block" },
+    "": "代理模式：规则模式下没命中规则的流量会走直连，等于出口可能绕过代理，属于间歇性泄露。默认阻断（这里是出口路径本身，不是设备特征）。读不到代理配置时只提示、不拦截。",
+    "proxyMode": { "enabled": true, "severity": "block" },
+    "": "代理开关：IPv6 要关、DNS 覆写要开、覆写里的 IPv6 也要关。三项共同决定 DNS 是否被代理接管；关错任何一项都会让解析从物理网卡漏出去。默认阻断。",
+    "proxySettings": { "enabled": true, "severity": "block" }
   },
 
   "enforcement": {

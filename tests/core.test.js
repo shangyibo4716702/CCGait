@@ -688,3 +688,129 @@ describe('guard start/stop request files', () => {
     assert.equal(existsSync(guardStopRequestPath(dir)), false)
   })
 })
+
+describe('代理模式判定进入 verdict', () => {
+  const baseConfig = () => ({
+    whitelist: { ips: [], cidrs: [], countries: ['GB'], asns: [], requireResidential: false },
+    checks: {
+      egressIp: { enabled: true, severity: 'block' },
+      claudeDns: { enabled: false, severity: 'warn' },
+      timezone: { enabled: false, severity: 'warn' },
+      language: { enabled: false, severity: 'warn' },
+      fonts: { enabled: false, severity: 'warn' },
+      emojiFlags: { enabled: false, severity: 'warn' },
+      resolverEgress: { enabled: false, severity: 'block' },
+      dnsServers: { enabled: false, severity: 'warn' },
+      proxyEnvLeak: { enabled: false, severity: 'block' },
+      proxyMode: { enabled: true, severity: 'block' },
+    },
+    enforcement: { failClosed: false },
+  })
+  const egressGb = { ip: '31.94.16.201', country: 'GB', confident: true, hosting: false }
+
+  it('规则模式判为拦截，理由是"不是全局模式"', () => {
+    const verdict = decide({
+      config: baseConfig(),
+      egress: egressGb,
+      dns: { hosts: [], deniedHits: [], resolved: true },
+      environment: { proxyMode: { mode: 'rule', client: 'clash-verge.yaml' } },
+      deniedCountries: ['CN'],
+    })
+    const hit = verdict.blockedBy.find((item) => item.id === 'proxy-mode-not-global')
+    assert.ok(hit, '规则模式必须出现在拦截项里')
+    assert.match(hit.title, /规则模式/)
+    assert.equal(verdict.allow, false)
+  })
+
+  it('全局模式不产生这一项', () => {
+    const verdict = decide({
+      config: baseConfig(),
+      egress: egressGb,
+      dns: { hosts: [], deniedHits: [], resolved: true },
+      environment: { proxyMode: { mode: 'global' } },
+      deniedCountries: ['CN'],
+    })
+    assert.equal(verdict.blockedBy.some((item) => item.id.startsWith('proxy-mode')), false)
+    assert.equal(verdict.allow, true)
+  })
+
+  it('读不到模式只提示，不拦', () => {
+    const verdict = decide({
+      config: baseConfig(),
+      egress: egressGb,
+      dns: { hosts: [], deniedHits: [], resolved: true },
+      environment: { proxyMode: { mode: 'unknown' } },
+      deniedCountries: ['CN'],
+    })
+    assert.equal(verdict.blockedBy.some((item) => item.id.startsWith('proxy-mode')), false)
+    assert.equal(verdict.allow, true, '判不出来不等于环境有问题')
+    assert.ok(verdict.warnings.some((item) => item.id === 'proxy-mode-unknown'))
+  })
+})
+
+describe('代理开关进入 verdict', () => {
+  const cfg = () => ({
+    whitelist: { ips: [], cidrs: [], countries: ['GB'], asns: [], requireResidential: false },
+    checks: {
+      egressIp: { enabled: true, severity: 'block' },
+      claudeDns: { enabled: false, severity: 'warn' },
+      timezone: { enabled: false, severity: 'warn' },
+      language: { enabled: false, severity: 'warn' },
+      fonts: { enabled: false, severity: 'warn' },
+      emojiFlags: { enabled: false, severity: 'warn' },
+      resolverEgress: { enabled: false, severity: 'block' },
+      dnsServers: { enabled: false, severity: 'warn' },
+      proxyEnvLeak: { enabled: false, severity: 'block' },
+      proxyMode: { enabled: false, severity: 'block' },
+      proxySettings: { enabled: true, severity: 'block' },
+    },
+    enforcement: { failClosed: false },
+  })
+  const gb = { ip: '31.94.16.201', country: 'GB', confident: true, hosting: false }
+
+  it('IPv6 / DNS 覆写不合规时逐条拦截', () => {
+    const verdict = decide({
+      config: cfg(),
+      egress: gb,
+      dns: { hosts: [], deniedHits: [], resolved: true },
+      environment: {
+        proxySettings: {
+          checked: true,
+          issues: [
+            { id: 'proxy-ipv6-enabled', title: '代理的 IPv6 是开启状态', detail: 'd' },
+            { id: 'proxy-dns-ipv6-enabled', title: 'DNS 覆写里的 IPv6 是开启状态', detail: 'd' },
+          ],
+        },
+      },
+      deniedCountries: ['CN'],
+    })
+    assert.equal(verdict.allow, false)
+    assert.deepEqual(
+      verdict.blockedBy.filter((item) => item.id.startsWith('proxy-')).map((item) => item.id).sort(),
+      ['proxy-dns-ipv6-enabled', 'proxy-ipv6-enabled'],
+    )
+  })
+
+  it('三项合规时放行', () => {
+    const verdict = decide({
+      config: cfg(),
+      egress: gb,
+      dns: { hosts: [], deniedHits: [], resolved: true },
+      environment: { proxySettings: { checked: true, issues: [] } },
+      deniedCountries: ['CN'],
+    })
+    assert.equal(verdict.allow, true)
+  })
+
+  it('没检测到代理客户端时不产生任何代理开关项', () => {
+    const verdict = decide({
+      config: cfg(),
+      egress: gb,
+      dns: { hosts: [], deniedHits: [], resolved: true },
+      environment: { proxySettings: { checked: false, issues: [] } },
+      deniedCountries: ['CN'],
+    })
+    assert.equal(verdict.blockedBy.some((item) => item.id.startsWith('proxy-')), false)
+    assert.equal(verdict.allow, true)
+  })
+})
