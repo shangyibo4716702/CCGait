@@ -1826,6 +1826,22 @@ button.action.is-fixed:disabled {
   cursor: default;
 }
 
+/* 代理面板有三个按钮，横排会挤到标题下面换行。
+   改成状态一行、按钮一行，整块右对齐。 */
+.proxy-tools {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.proxy-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 /* UU 直连开关：可点的两态按钮。已符合=绿，不符合=红 —— 和「修正 Clash 设置」
    同一套配色，但这里两个状态都能点（点绿的是撤销）。 */
 button.action.is-uu-on {

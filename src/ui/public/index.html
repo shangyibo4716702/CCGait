@@ -124,11 +124,13 @@
               <h3>代理设置</h3>
               <p>DNS 上游里混入国内解析器时，解析出口会在国内外之间来回切换。</p>
             </div>
-            <div class="panel-tools">
+            <div class="panel-tools proxy-tools">
               <span class="panel-sub" id="proxy-sub">读取中</span>
-              <button class="action" id="proxy-uu" type="button" hidden>UU 远程直连</button>
-              <button class="action" id="proxy-rule" type="button" hidden>切到规则模式</button>
-              <button class="action" id="proxy-fix" type="button" disabled>读取中</button>
+              <div class="proxy-actions">
+                <button class="action" id="proxy-uu" type="button" hidden>UU 远程直连</button>
+                <button class="action" id="proxy-rule" type="button" hidden>切到规则模式</button>
+                <button class="action" id="proxy-fix" type="button" disabled>读取中</button>
+              </div>
             </div>
           </div>
           <div class="panel-body">
