@@ -49,10 +49,13 @@ import {
 import {
   CORE_PROCESS_NAMES,
   applyClashFix,
+  applyClaudeRules,
+  claudeRuleCoverage,
   judgeDnsUpstreams,
   judgeProxySettings,
   needsClashFix,
   probeProxyMode,
+  readClashRules,
   readProxySettings,
 } from '../proxy-mode.js'
 import { startupStatus } from '../startup.js'
@@ -551,6 +554,9 @@ function resolveAppUserModelId() {
     judgeDnsUpstreams: options.deps?.judgeDnsUpstreams ?? judgeDnsUpstreams,
     needsClashFix: options.deps?.needsClashFix ?? needsClashFix,
     applyClashFix: options.deps?.applyClashFix ?? applyClashFix,
+    readClashRules: options.deps?.readClashRules ?? readClashRules,
+    claudeRuleCoverage: options.deps?.claudeRuleCoverage ?? claudeRuleCoverage,
+    applyClaudeRules: options.deps?.applyClaudeRules ?? applyClaudeRules,
     restartProxyCore: options.deps?.restartProxyCore ?? restartProxyCore,
     accountsRoot: options.deps?.accountsRoot ?? accountsRoot,
     locateDesktopProfile: options.deps?.locateDesktopProfile ?? locateDesktopProfile,
@@ -993,14 +999,19 @@ function resolveAppUserModelId() {
       ...deps.judgeProxySettings(settings),
       ...deps.judgeDnsUpstreams({ nameserver: settings.nameserver }),
     ]
+    // 规则模式下，DNS 修好了也不够：Claude 的域名没被规则覆盖，照样会直连。
+    const coverage =
+      probe.mode === 'rule' ? deps.claudeRuleCoverage(deps.readClashRules(probe.dir)) : null
+    if (coverage && !coverage.ok) issues.push(...coverage.issues)
     return {
       found: true,
       dir: probe.dir,
       client: probe.client,
       mode: probe.mode,
       settings,
+      coverage,
       issues,
-      needsFix: deps.needsClashFix(settings),
+      needsFix: deps.needsClashFix(settings) || Boolean(coverage && !coverage.ok),
     }
   }
 
@@ -1018,17 +1029,25 @@ function resolveAppUserModelId() {
       if (!probe.dir) throw new Error('没找到受支持的代理客户端配置，无法自动修正')
       const outcome = deps.applyClashFix(probe.dir)
       const changedFiles = outcome.results.filter((item) => item.changed)
-      if (changedFiles.length === 0) {
+      // 规则模式下再补一手：把 Claude 的域名写进规则增强文件（订阅更新不会覆盖）。
+      const ruleFix = probe.mode === 'rule' ? deps.applyClaudeRules(probe.dir) : { changed: false }
+      if (changedFiles.length === 0 && ruleFix.changed !== true) {
         pushLog(
           'info',
           '代理设置无需修正',
-          outcome.results
-            .map((item) => item.reason)
+          [...outcome.results.map((item) => item.reason), ruleFix.reason]
             .filter(Boolean)
             .join('；'),
         )
         emit({ type: 'status' })
         return { changed: 0, restarted: false, ...(await readProxyFixStateInternal()) }
+      }
+      if (ruleFix.changed === true) {
+        pushLog(
+          'info',
+          '已把 Claude 规则写进规则增强文件',
+          `${ruleFix.file?.split(/[\\/]/).pop() ?? ''}：${(ruleFix.after ?? []).join(', ')}`,
+        )
       }
       pushLog(
         'info',
@@ -1047,7 +1066,11 @@ function resolveAppUserModelId() {
         pushLog('warn', '配置文件已改，但没能重启内核', '请在代理客户端里手动重启内核让改动生效')
       }
       emit({ type: 'status' })
-      return { changed: changedFiles.length, restarted, ...(await readProxyFixStateInternal()) }
+      return {
+        changed: changedFiles.length + (ruleFix.changed === true ? 1 : 0),
+        restarted,
+        ...(await readProxyFixStateInternal()),
+      }
     })
 
   const getAccounts = () => serialize(async () => readAccountsState())

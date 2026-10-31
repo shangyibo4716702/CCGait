@@ -1345,7 +1345,15 @@ function renderProxyPanel(data) {
     button.disabled = true
     button.classList.add('is-fixed')
     button.textContent = '设置正确'
-    host.append(el('div', 'proxy-ok', 'DNS 上游、IPv6、DNS 覆写都符合要求，解析出口稳定。'))
+    host.append(
+      el(
+        'div',
+        'proxy-ok',
+        data.mode === 'rule'
+          ? 'DNS 上游、IPv6、DNS 覆写都符合要求，Claude 的域名也已被规则覆盖（排在 CN 分流之前）。'
+          : 'DNS 上游、IPv6、DNS 覆写都符合要求，解析出口稳定。',
+      ),
+    )
     return
   }
 
@@ -1372,10 +1380,14 @@ async function refreshProxyPanel() {
 async function fixClashSettings() {
   const button = document.querySelector('#proxy-fix')
   if (!button || button.disabled) return
+  const ruleMode = proxyState?.mode === 'rule'
   const confirmed = window.confirm(
     '修正代理设置？\n\n' +
       '· 会把你代理配置里 DNS 上游的国内解析器删掉，只留境外\n' +
       '· 机场节点用的那份名单（proxy-server-nameserver）保持不动\n' +
+      (ruleMode
+        ? '· 规则模式下会把 Claude / Anthropic 的域名写进规则增强文件，排在 CN 分流之前（订阅更新不会覆盖）\n'
+        : '') +
       '· 改完会重启代理内核，网络会中断几秒\n\n' +
       '继续吗？',
   )

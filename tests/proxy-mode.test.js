@@ -20,6 +20,16 @@ import {
   readYamlList,
   readYamlBool,
   readYamlScalar,
+  parseRules,
+  ruleTarget,
+  claudeRuleCoverage,
+  claudeRuleBlock,
+  claudeRuleGroup,
+  insertPrependRules,
+  applyClaudeRules,
+  parseProfilesIndex,
+  ruleEnhancementPath,
+  readClashRules,
 } from '../src/proxy-mode.js'
 
 const tempDirs = []
@@ -147,7 +157,13 @@ describe('代理模式探测', () => {
 
 describe('代理模式判定', () => {
   it('非全局模式一律阻断，并回报当前模式', () => {
-    assert.deepEqual(judgeProxyMode({ checked: true, mode: 'rule' }), { block: true, warn: false, mode: 'rule' })
+    assert.deepEqual(judgeProxyMode({ checked: true, mode: 'rule' }), {
+      block: true,
+      warn: false,
+      mode: 'rule',
+      coverage: null,
+      reason: 'claude-rules-missing',
+    })
     assert.deepEqual(judgeProxyMode({ checked: true, mode: 'direct' }), {
       block: true,
       warn: false,
@@ -487,5 +503,198 @@ describe('修正计划与按钮状态', () => {
     const outcome = applyClashFix(clientDir, { programData: join(root, 'nope') })
     assert.equal(outcome.changed, 0)
     assert.equal(outcome.needsRestart, false)
+  })
+})
+
+describe('规则模式：Claude 规则覆盖', () => {
+  const baseRules = [
+    'GEOSITE,category-ads-all,REJECT',
+    'GEOSITE,CN,DIRECT',
+    'GEOIP,CN,DIRECT',
+    'MATCH,IPEqual',
+  ]
+
+  it('解析 rules 段：按第一条的缩进走，遇到下一个顶层键就停', () => {
+    const text = [
+      'mode: rule',
+      'rules:',
+      '- DOMAIN-SUFFIX,a.com,PROXY',
+      '- MATCH,DIRECT',
+      'proxy-groups:',
+      '  - name: PROXY',
+    ].join('\n')
+    assert.deepEqual(parseRules(text), ['DOMAIN-SUFFIX,a.com,PROXY', 'MATCH,DIRECT'])
+  })
+
+  it('订阅里缩进两格的 rules 也能读', () => {
+    const text = ['rules:', '  - DOMAIN-SUFFIX,a.com,PROXY', '  - MATCH,PROXY'].join('\n')
+    assert.deepEqual(parseRules(text), ['DOMAIN-SUFFIX,a.com,PROXY', 'MATCH,PROXY'])
+  })
+
+  it('规则目标跳过 no-resolve', () => {
+    assert.equal(ruleTarget('GEOIP,PRIVATE,DIRECT,no-resolve'), 'DIRECT')
+  })
+
+  it('没有 Claude 规则 → 不覆盖', () => {
+    const coverage = claudeRuleCoverage(baseRules)
+    assert.equal(coverage.ok, false)
+    assert.equal(coverage.issues[0].id, 'claude-rules-missing')
+  })
+
+  it('Claude 规则排在 CN 分流之后 → 不覆盖', () => {
+    const coverage = claudeRuleCoverage([
+      'GEOSITE,CN,DIRECT',
+      'DOMAIN-SUFFIX,anthropic.com,IPEqual',
+      'MATCH,IPEqual',
+    ])
+    assert.equal(coverage.ok, false)
+    assert.equal(coverage.issues[0].id, 'claude-rules-after-cn')
+  })
+
+  it('Claude 规则指向 DIRECT → 不覆盖', () => {
+    const coverage = claudeRuleCoverage([
+      'DOMAIN-SUFFIX,anthropic.com,DIRECT',
+      'GEOSITE,CN,DIRECT',
+      'MATCH,PROXY',
+    ])
+    assert.equal(coverage.ok, false)
+    assert.equal(coverage.issues[0].id, 'claude-rules-direct')
+  })
+
+  it('Claude 规则在前面且指向代理组 → 覆盖', () => {
+    const coverage = claudeRuleCoverage([
+      'DOMAIN-SUFFIX,anthropic.com,IPEqual',
+      'GEOSITE,CN,DIRECT',
+      'MATCH,IPEqual',
+    ])
+    assert.equal(coverage.ok, true)
+    assert.equal(coverage.group, 'IPEqual')
+  })
+
+  it('生成的规则覆盖所有 Anthropic 域名，并带一条进程规则', () => {
+    const block = claudeRuleBlock('IPEqual')
+    for (const domain of ['anthropic.com', 'claude.ai', 'claudeusercontent.com']) {
+      assert.ok(block.some((rule) => rule === `DOMAIN-SUFFIX,${domain},IPEqual`), domain)
+    }
+    assert.ok(block.some((rule) => rule.startsWith('PROCESS-PATH-REGEX,')))
+    // 生成的这组规则本身必须被判定为"已覆盖"
+    assert.equal(claudeRuleCoverage([...block, 'GEOSITE,CN,DIRECT', 'MATCH,IPEqual']).ok, true)
+  })
+
+  it('目标组取 MATCH 的去处', () => {
+    assert.equal(claudeRuleGroup(['GEOSITE,CN,DIRECT', 'MATCH,IPEqual']), 'IPEqual')
+    assert.equal(claudeRuleGroup(['GEOSITE,CN,DIRECT', 'MATCH,DIRECT']), 'PROXY')
+  })
+
+  it('judgeProxyMode：规则模式已覆盖就放过，没覆盖照旧拦', () => {
+    assert.equal(judgeProxyMode({ checked: true, mode: 'rule' }).block, true)
+    assert.equal(
+      judgeProxyMode({
+        checked: true,
+        mode: 'rule',
+        coverage: claudeRuleCoverage(['DOMAIN-SUFFIX,anthropic.com,IPEqual', 'MATCH,IPEqual']),
+      }).block,
+      false,
+    )
+    assert.equal(judgeProxyMode({ checked: true, mode: 'global' }).block, false)
+    assert.equal(judgeProxyMode({ checked: true, mode: 'direct' }).block, true)
+  })
+})
+
+describe('规则增强文件写入', () => {
+  it('prepend: [] 换成带条目的列表', () => {
+    const text = ['# 模板', '', 'prepend: []', '', 'append: []'].join('\n')
+    const next = insertPrependRules(text, ['DOMAIN-SUFFIX,a.com,PROXY'])
+    assert.ok(next.includes('prepend:\n  - DOMAIN-SUFFIX,a.com,PROXY'))
+    assert.ok(next.includes('append: []'))
+  })
+
+  it('已有 prepend 条目时追加在后面', () => {
+    const text = ['prepend:', '  - OLD,1', 'append: []'].join('\n')
+    const next = insertPrependRules(text, ['NEW,2'])
+    assert.ok(next.indexOf('OLD,1') < next.indexOf('NEW,2'))
+  })
+
+  it('没有 prepend 段就补一个', () => {
+    const next = insertPrependRules('# 空文件', ['NEW,1'])
+    assert.ok(next.trim().endsWith('prepend:\n  - NEW,1'))
+  })
+
+  it('从 profiles.yaml 找到当前订阅挂的规则增强文件', () => {
+    const root = tempDir()
+    const profilesDir = join(root, 'profiles')
+    mkdirSync(profilesDir, { recursive: true })
+    writeFileSync(
+      join(root, 'profiles.yaml'),
+      [
+        'current: SUB',
+        'items:',
+        '- uid: RULES',
+        '  type: rules',
+        '  file: RULES.yaml',
+        '- uid: SUB',
+        '  type: remote',
+        '  file: SUB.yaml',
+        '  option:',
+        '    rules: RULES',
+      ].join('\n'),
+    )
+    writeFileSync(join(profilesDir, 'RULES.yaml'), 'prepend: []\n')
+    const index = parseProfilesIndex(readFileSync(join(root, 'profiles.yaml'), 'utf8'))
+    assert.equal(index.current, 'SUB')
+    assert.equal(index.items.get('SUB').rulesUid, 'RULES')
+    assert.equal(ruleEnhancementPath(root), join(profilesDir, 'RULES.yaml'))
+  })
+
+  it('写入 Claude 规则，且二次调用不再重复写', () => {
+    const root = tempDir()
+    const profilesDir = join(root, 'profiles')
+    mkdirSync(profilesDir, { recursive: true })
+    writeFileSync(
+      join(root, 'profiles.yaml'),
+      [
+        'current: SUB',
+        'items:',
+        '- uid: RULES',
+        '  type: rules',
+        '  file: RULES.yaml',
+        '- uid: SUB',
+        '  type: remote',
+        '  file: SUB.yaml',
+        '  option:',
+        '    rules: RULES',
+      ].join('\n'),
+    )
+    writeFileSync(join(profilesDir, 'RULES.yaml'), 'prepend: []\n')
+    // 生效配置（订阅本体）里没有 Claude 规则
+    writeFileSync(
+      join(root, 'clash-verge.yaml'),
+      ['mode: rule', 'rules:', '- GEOSITE,CN,DIRECT', '- MATCH,IPEqual'].join('\n'),
+    )
+
+    const first = applyClaudeRules(root)
+    assert.equal(first.changed, true)
+    const written = readFileSync(join(profilesDir, 'RULES.yaml'), 'utf8')
+    assert.ok(written.includes('DOMAIN-SUFFIX,anthropic.com,IPEqual'))
+    assert.ok(written.includes('DOMAIN-SUFFIX,claude.ai,IPEqual'))
+
+    // 真实场景：增强文件会并进生效配置，这里手动模拟合并后再判
+    const merged = [
+      'mode: rule',
+      'rules:',
+      ...claudeRuleBlock('IPEqual').map((rule) => `- ${rule}`),
+      '- GEOSITE,CN,DIRECT',
+      '- MATCH,IPEqual',
+    ]
+    writeFileSync(join(root, 'clash-verge.yaml'), merged.join('\n'))
+    assert.equal(claudeRuleCoverage(readClashRules(root)).ok, true)
+  })
+
+  it('找不到规则增强文件时不动任何东西', () => {
+    const root = tempDir()
+    writeFileSync(join(root, 'clash-verge.yaml'), 'rules:\n- MATCH,DIRECT\n')
+    const outcome = applyClaudeRules(root)
+    assert.equal(outcome.changed, false)
+    assert.match(outcome.reason, /规则增强文件/)
   })
 })

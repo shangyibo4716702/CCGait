@@ -414,10 +414,16 @@ export function judgeProxySettings(settings, { enabled = true } = {}) {
  * `unknown` 不拦：拿不到配置说明本机可能根本没装代理客户端（用户走的是别的分流方式），
  * 把它当成违规就是误杀。真正的把关交给出口 IP / 解析出口这些"实测"项。
  */
-export function judgeProxyMode({ checked, mode, requireGlobal = true }) {
+export function judgeProxyMode({ checked, mode, requireGlobal = true, coverage = null }) {
   if (!checked || mode === 'unknown') return { block: false, warn: false }
   if (!requireGlobal) return { block: false, warn: false }
   if (mode === 'global') return { block: false, warn: false }
+  // 规则模式可以放过，但必须先证明 Claude 的域名有专属规则、且排在 CN 分流之前。
+  // 证明不了就照旧拦 —— "配置里看着像对的"不算证明。
+  if (mode === 'rule') {
+    if (coverage?.ok) return { block: false, warn: false, mode, coverage }
+    return { block: true, warn: false, mode, coverage, reason: 'claude-rules-missing' }
+  }
   return { block: true, warn: false, mode }
 }
 
@@ -557,6 +563,251 @@ export function needsClashFix(settings) {
     (entry) => classifyDnsUpstream(entry) === 'domestic',
   )
   return hasDomestic || settings.ipv6 === true || settings.dnsOverride === false || settings.dnsIpv6 === true
+}
+
+/* ------------------------------------------------- 规则模式下的 Claude 覆盖 */
+
+/**
+ * 规则模式能用的前提：Claude 的域名有专属规则，且排在 CN 分流之前。
+ *
+ * 为什么不能只信 `MATCH,代理组` 兜底：订阅更新、机场换模板、手滑加一条
+ * `FINAL,DIRECT`，兜底就没了，而规则模式的泄露是**静默**的 —— 不像全局模式，
+ * 漏了不会有任何信号。所以要么显式覆盖，要么别用规则模式。
+ *
+ * 域名按实际客户端抓的来：Desktop 与 CLI 都打 api.anthropic.com / claude.ai，
+ * 登录走 Google OAuth（GEOSITE,GOOGLE 已覆盖），功能开关走 statsig。
+ */
+export const CLAUDE_DOMAIN_SUFFIXES = [
+  'anthropic.com',
+  'claude.ai',
+  'claude.com',
+  'claudeusercontent.com',
+  'statsig.com',
+  'featuregates.org',
+]
+
+/** 这些目标等于"没走代理"，规则写在这儿不算覆盖。 */
+const NOT_PROXY_TARGETS = new Set(['DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE'])
+
+/**
+ * 从一份内核配置里取出顶层 `rules:` 的规则数组。
+ *
+ * 缩进按第一条 `- ` 定，遇到下一个顶层键就停 —— 和 readYamlList 踩过的坑一样：
+ * 不定缩进会把别的结构的列表一起吞进来。
+ */
+export function parseRules(text) {
+  const lines = String(text ?? '').split(/\r?\n/)
+  const start = lines.findIndex((line) => /^rules:\s*$/.test(line))
+  if (start < 0) return []
+
+  const rules = []
+  let indent = null
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const line = lines[i]
+    if (!line.trim()) continue
+    const match = line.match(/^(\s*)- (.+)$/)
+    if (!match) {
+      if (/^\S/.test(line)) break
+      continue
+    }
+    if (indent === null) indent = match[1].length
+    if (match[1].length !== indent) break
+    rules.push(match[2].trim())
+  }
+  return rules
+}
+
+/** 规则的目标（最后一段）；`GEOIP,...,no-resolve` 这种带参数的要往前挪一格。 */
+export function ruleTarget(rule) {
+  const parts = String(rule ?? '').split(',')
+  while (parts.length > 1 && /^(no-resolve|src)$/i.test(parts[parts.length - 1].trim())) parts.pop()
+  return (parts[parts.length - 1] ?? '').trim()
+}
+
+/**
+ * Claude 的规则覆盖够不够。
+ *
+ * 返回 `{ ok, issues, group }`。`group` 是那条 Claude 规则指向的代理组，
+ * 修的时候沿用它，不另造新组名。
+ */
+export function claudeRuleCoverage(rules = []) {
+  const list = rules.map((rule) => String(rule ?? '').trim()).filter(Boolean)
+  const isClaudeRule = (rule) => /anthropic|claude/i.test(rule)
+  const claudeIndex = list.findIndex(isClaudeRule)
+  const cnIndex = list.findIndex((rule) => /^(GEOSITE,CN|GEOIP,CN)\b/i.test(rule))
+  const issues = []
+
+  if (claudeIndex < 0) {
+    issues.push({
+      id: 'claude-rules-missing',
+      title: '规则里没有 Claude / Anthropic 的专属规则',
+      detail:
+        '当前是规则模式，但分流规则里找不到任何 Claude / Anthropic 的条目。规则模式下没命中规则的流量会走直连 —— Claude 的域名一旦不在规则里，就会从物理网卡直接出去，出口和隧道出口不是同一个。请把 Claude 的域名加进规则（排在 CN 分流之前）。',
+    })
+    return { ok: false, issues, group: null }
+  }
+
+  const target = ruleTarget(list[claudeIndex])
+  if (NOT_PROXY_TARGETS.has(target.toUpperCase())) {
+    issues.push({
+      id: 'claude-rules-direct',
+      title: `Claude 的规则指向 ${target}`,
+      detail: `规则里有一条 Claude 的条目，但目标是 ${target}，等于明着直连。请改成指向代理组。`,
+    })
+    return { ok: false, issues, group: null }
+  }
+
+  if (cnIndex >= 0 && claudeIndex > cnIndex) {
+    issues.push({
+      id: 'claude-rules-after-cn',
+      title: 'Claude 的规则排在 CN 分流之后',
+      detail:
+        'Claude 的规则排在 GEOSITE,CN / GEOIP,CN 后面。这两条会先把一部分流量判成直连，Claude 的域名一旦被它们先命中（GeoIP 依赖解析结果，上游被换回国内就会命中），后面那条规则就永远不会执行。请把 Claude 的规则移到 CN 分流之前。',
+    })
+    return { ok: false, issues, group: null }
+  }
+
+  return { ok: true, issues, group: target }
+}
+
+/** 按配置里的实际代理组生成一组 Claude 规则（给一键修正用）。 */
+export function claudeRuleBlock(group = 'PROXY') {
+  const rules = CLAUDE_DOMAIN_SUFFIXES.map((suffix) => `DOMAIN-SUFFIX,${suffix},${group}`)
+  // Desktop 与它内置的 claude-code 都是 claude.exe；npm 装的 CLI 跑在 node.exe 里，
+  // 抓不到进程，只能靠上面的域名规则。
+  rules.push(`PROCESS-PATH-REGEX,(?i).*\\\\claude\\\\.exe,${group}`)
+  return rules
+}
+
+/** 规则该指向哪个组：直接用 MATCH 的目标，它就是这个配置里"其余流量"的去处。 */
+export function claudeRuleGroup(rules = []) {
+  const list = rules.map((rule) => String(rule ?? '').trim()).filter(Boolean)
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    if (!/^MATCH,/i.test(list[i])) continue
+    const target = ruleTarget(list[i])
+    if (target && !NOT_PROXY_TARGETS.has(target.toUpperCase())) return target
+    break
+  }
+  for (const rule of list) {
+    const target = ruleTarget(rule)
+    if (target && !NOT_PROXY_TARGETS.has(target.toUpperCase()) && !/^(DIRECT|REJECT)/i.test(rule)) return target
+  }
+  return 'PROXY'
+}
+
+/* --------------------------------------------- 规则增强文件（订阅更新不覆盖） */
+
+/**
+ * 解析 profiles.yaml：当前订阅是谁、它挂的规则增强文件是哪个。
+ *
+ * Clash Verge 每次更新订阅都会重写 clash-verge.yaml，直接往里写规则等于白写；
+ * 真正不会被覆盖的是 profiles/<option.rules>.yaml 这份增强文件。
+ */
+export function parseProfilesIndex(text) {
+  const current = (String(text ?? '').match(/^current:\s*(\S+)/m) ?? [])[1] ?? null
+  const items = new Map()
+  for (const block of String(text ?? '').split(/\n(?=- uid: )/)) {
+    const uid = (block.match(/^- uid:\s*(\S+)/) ?? [])[1]
+    if (!uid) continue
+    items.set(uid, {
+      uid,
+      file: (block.match(/^\s+file:\s*(\S+)/m) ?? [])[1] ?? null,
+      type: (block.match(/^\s+type:\s*(\S+)/m) ?? [])[1] ?? null,
+      rulesUid: (block.match(/^\s+rules:\s*(\S+)/m) ?? [])[1] ?? null,
+    })
+  }
+  return { current, items }
+}
+
+/** 当前订阅的规则增强文件路径；找不到返回 null（不瞎猜路径）。 */
+export function ruleEnhancementPath(dir, options = {}) {
+  const { exists = existsSync, readFile = (p) => readFileSync(p, 'utf8') } = options
+  const indexPath = join(dir, 'profiles.yaml')
+  if (!exists(indexPath)) return null
+  let index
+  try {
+    index = parseProfilesIndex(readFile(indexPath))
+  } catch {
+    return null
+  }
+  const profile = index.items.get(index.current)
+  const file = profile?.rulesUid ? index.items.get(profile.rulesUid)?.file : null
+  if (!file) return null
+  const path = join(dir, 'profiles', file)
+  return exists(path) ? path : null
+}
+
+/** 把规则插进增强文件的 `prepend:` 段（Clash Verge 会把这些规则排在订阅规则最前面）。 */
+export function insertPrependRules(text, rules) {
+  const lines = String(text ?? '').split(/\r?\n/)
+  const additions = rules.map((rule) => `  - ${rule}`)
+  const empty = lines.findIndex((line) => /^prepend:\s*\[\s*\]\s*$/.test(line))
+  if (empty >= 0) {
+    lines.splice(empty, 1, 'prepend:', ...additions)
+    return lines.join('\n')
+  }
+  const head = lines.findIndex((line) => /^prepend:\s*$/.test(line))
+  if (head >= 0) {
+    let end = head + 1
+    while (end < lines.length && /^\s+- /.test(lines[end])) end += 1
+    lines.splice(end, 0, ...additions)
+    return lines.join('\n')
+  }
+  const trimmed = String(text ?? '').replace(/\s*$/, '')
+  return `${trimmed ? `${trimmed}\n` : ''}prepend:\n${additions.join('\n')}\n`
+}
+
+/**
+ * 规则模式下补齐 Claude 的规则。已经是覆盖状态就什么都不写。
+ *
+ * 只动增强文件，不碰订阅本体 —— 订阅更新会把本体重写，写那儿等于白写。
+ */
+export function applyClaudeRules(dir, options = {}) {
+  const {
+    exists = existsSync,
+    readFile = (p) => readFileSync(p, 'utf8'),
+    writeFile = (p, t) => writeFileSync(p, t),
+    group,
+  } = options
+
+  const path = ruleEnhancementPath(dir, { exists, readFile })
+  if (!path) return { changed: false, reason: '没找到规则增强文件（profiles.yaml 里没有 rules 项）' }
+
+  let text
+  try {
+    text = readFile(path)
+  } catch (error) {
+    return { changed: false, reason: `读取失败：${error.code ?? error.message}` }
+  }
+
+  // 覆盖判定用生效配置（订阅 + 增强合并后的结果），不是这份文件本身。
+  const effective = readClashRules(dir, { exists, readFile })
+  if (claudeRuleCoverage(effective).ok) return { changed: false, reason: 'Claude 规则已覆盖' }
+
+  const target = claudeRuleBlock(group ?? claudeRuleGroup(effective))
+  const next = insertPrependRules(text, target)
+  try {
+    writeFile(path, next)
+  } catch (error) {
+    return { changed: false, reason: `写入失败：${error.code ?? error.message}` }
+  }
+  return { changed: true, file: path, after: target }
+}
+
+/** 读出生效配置里的规则（就是用户当前真正在跑的这套）。 */
+export function readClashRules(dir, options = {}) {
+  const { exists = existsSync, readFile = (p) => readFileSync(p, 'utf8') } = options
+  for (const name of ['clash-verge.yaml', 'config.yaml', 'clash.yaml']) {
+    const path = join(dir, name)
+    if (!exists(path)) continue
+    try {
+      const rules = parseRules(readFile(path))
+      if (rules.length > 0) return rules
+    } catch {
+      // 换下一个
+    }
+  }
+  return []
 }
 
 export { CORE_PROCESS_NAMES, SAFE_NAMESERVERS }

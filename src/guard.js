@@ -1,7 +1,14 @@
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { probeClaudeDns, probeEgress, probeResolverEgress, probeResolverEgressSampled } from './providers.js'
-import { judgeDnsUpstreams, judgeProxySettings, probeProxyMode, readProxySettings } from './proxy-mode.js'
+import {
+  claudeRuleCoverage,
+  judgeDnsUpstreams,
+  judgeProxySettings,
+  probeProxyMode,
+  readClashRules,
+  readProxySettings,
+} from './proxy-mode.js'
 import {
   probeDnsServers,
   probeEmojiFont,
@@ -131,6 +138,12 @@ export async function runChecks(config) {
   const proxyRequired = config.network.proxy.required === true
   const deniedCountries = config.checks.claudeDns.deniedCountries
 
+  // 两个检查读同一份代理配置：只探一次，别为了两项开关把磁盘扫两遍。
+  const proxyProbe =
+    config.checks.proxyMode.enabled || config.checks.proxySettings.enabled
+      ? probeProxyMode().catch(() => ({ mode: 'unknown' }))
+      : null
+
   const [
     egressResult,
     dnsResult,
@@ -162,10 +175,17 @@ export async function runChecks(config) {
         ? probeResolverEgressSampled({ deniedCountries }).catch(() => undefined)
         : Promise.resolve(undefined),
       config.checks.proxyEnvLeak.enabled ? probeSystemProxy().catch(() => undefined) : Promise.resolve(undefined),
-      config.checks.proxyMode.enabled ? probeProxyMode().catch(() => ({ mode: 'unknown' })) : Promise.resolve(undefined),
+      config.checks.proxyMode.enabled
+        ? proxyProbe.then((probe) => {
+            if (probe.mode !== 'rule') return probe
+            // 规则模式要额外证明 Claude 的域名被规则覆盖，证明不了就照旧拦。
+            const coverage = probe.dir ? claudeRuleCoverage(readClashRules(probe.dir)) : null
+            return { ...probe, coverage }
+          })
+        : Promise.resolve(undefined),
       // 代理设置（IPv6 / DNS 覆写）：复用同一次配置探测，配置只读一遍。
       config.checks.proxySettings.enabled
-        ? probeProxyMode()
+        ? proxyProbe
             .then((probe) => {
               if (!probe.dir) return { checked: false, issues: [] }
               const settings = readProxySettings(probe.dir)

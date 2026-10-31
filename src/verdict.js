@@ -253,15 +253,19 @@ export function evaluateEnvironment(config, env) {
   // unknown 不拦：读不到配置通常说明本机没装受支持的代理客户端，当成违规就是误杀；
   // 真正的把关交给出口 IP / 解析出口这些实测项。
   if (env.proxyMode?.mode && env.proxyMode.mode !== 'unknown') {
-    if (env.proxyMode.mode !== 'global') {
-      const modeName = { rule: '规则模式', direct: '直连模式' }[env.proxyMode.mode] ?? env.proxyMode.mode
+    const mode = env.proxyMode.mode
+    const coverage = env.proxyMode.coverage
+    // 规则模式：Claude 的域名有专属规则、且排在 CN 分流之前 —— 这时等价于全局，
+    // 只把非 Claude 的流量放直连，省流量。证明不了就照旧拦。
+    const covered = mode === 'rule' && coverage?.ok === true
+    if (mode !== 'global' && !covered) {
+      const modeName = { rule: '规则模式', direct: '直连模式' }[mode] ?? mode
+      const detail =
+        mode === 'rule'
+          ? `检测到代理客户端（${env.proxyMode.client ?? '未知客户端'}）当前是规则模式，但规则里没有可用的 Claude / Anthropic 条目。规则模式下没命中规则的流量走直连 —— Claude 的域名一旦不被规则覆盖，就会从物理网卡直接出去，和隧道出口不是同一个，属于间歇性泄露。请把 Claude 的域名加进规则并排在 CN 分流之前（面板上的「修正 Clash 设置」可以直接写进去），或者切回全局模式。`
+          : `检测到代理客户端（${env.proxyMode.client ?? '未知客户端'}）当前是 ${modeName}。这种模式下没有命中规则的流量会走直连 —— 同一个程序有时走代理、有时从物理网卡直接出去，属于间歇性泄露，比稳定泄露更难发现。请在代理客户端里切到「全局模式」，或确认 Claude 相关域名与 DNS 查询都被规则覆盖。`
       reasons.push(
-        reason(
-          'proxy-mode-not-global',
-          'block',
-          `代理不是全局模式：${modeName}`,
-          `检测到代理客户端（${env.proxyMode.client ?? '未知客户端'}）当前是 ${modeName}。这种模式下没有命中规则的流量会走直连 —— 同一个程序有时走代理、有时从物理网卡直接出去，属于间歇性泄露，比稳定泄露更难发现。请在代理客户端里切到「全局模式」，或确认 Claude 相关域名与 DNS 查询都被规则覆盖。`,
-        ),
+        reason('proxy-mode-not-global', 'block', `代理不是全局模式：${modeName}`, detail),
       )
     }
   } else if (env.proxyMode && env.proxyMode.mode === 'unknown') {
