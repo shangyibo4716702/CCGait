@@ -1326,6 +1326,14 @@ function renderProxyPanel(data) {
   const button = document.querySelector('#proxy-fix')
   if (!host || !sub || !button) return
 
+  // 「切到规则模式」只在当前是全局模式时出现：已经在规则模式里就没什么可切的。
+  const ruleButton = document.querySelector('#proxy-rule')
+  if (ruleButton) {
+    ruleButton.hidden = !data?.found || data?.mode !== 'global'
+    ruleButton.disabled = false
+    ruleButton.textContent = '切到规则模式'
+  }
+
   button.classList.remove('is-needs-fix', 'is-fixed')
   host.replaceChildren()
 
@@ -1411,6 +1419,46 @@ async function fixClashSettings() {
     void refresh()
   } catch (error) {
     toast('error', '修正失败', error instanceof Error ? error.message : String(error))
+  } finally {
+    button.disabled = false
+    button.textContent = original
+  }
+}
+
+/**
+ * 无风险切规则模式。
+ *
+ * 后端会先写规则、切模式、重启内核，再让内核自己开隧道读 `/connections` 自证；
+ * 任何一条 Claude 的链路走直连就自动回滚。所以这里只报结果，不替它下判断。
+ */
+async function switchToRuleMode() {
+  const button = document.querySelector('#proxy-rule')
+  if (!button || button.disabled) return
+  const confirmed = window.confirm(
+    '切到规则模式（省流量）？\n\n' +
+      '· 先补齐 Claude / Anthropic 的规则，写进订阅的规则增强文件（订阅更新不会覆盖）\n' +
+      '· 再把代理切成规则模式并重启内核，网络会中断几秒\n' +
+      '· 切完让内核实测 claude.ai / api.anthropic.com 走哪条链路\n' +
+      '· 只要有一条是直连，自动回滚到全局模式\n\n' +
+      '继续吗？',
+  )
+  if (!confirmed) return
+
+  const original = button.textContent
+  button.disabled = true
+  button.textContent = '切换中…'
+  try {
+    const result = await api('/api/proxy/safe-rule', { method: 'POST' })
+    const detail = list(result?.verify?.results)
+      .filter((item) => !item.error)
+      .map((item) => `${item.host} → ${(item.chains ?? []).join('>')}`)
+      .join('\n')
+    toast('ok', '已切到规则模式，内核自证通过', detail || 'Claude 的域名已走代理')
+    renderProxyPanel(result)
+    void refresh()
+  } catch (error) {
+    toast('error', '没有切过去', error instanceof Error ? error.message : String(error))
+    void refreshProxyPanel()
   } finally {
     button.disabled = false
     button.textContent = original
@@ -2028,6 +2076,10 @@ document.querySelector('#account-save')?.addEventListener('click', () => {
 
 document.querySelector('#proxy-fix')?.addEventListener('click', () => {
   void fixClashSettings()
+})
+
+document.querySelector('#proxy-rule')?.addEventListener('click', () => {
+  void switchToRuleMode()
 })
 
 document.querySelector('#account-create-empty')?.addEventListener('click', () => {

@@ -298,6 +298,9 @@ export function createUiServer({ session, logger, token = randomBytes(24).toStri
           case '/api/proxy/fix':
             sendJson(response, 200, await session.fixClashSettings())
             return
+          case '/api/proxy/safe-rule':
+            sendJson(response, 200, await session.switchToRuleMode())
+            return
           case '/api/accounts/create-empty': {
             const body = await readJsonBody(request)
             sendJson(response, 200, await session.createEmptyAccountFor(body.name))

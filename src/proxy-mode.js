@@ -556,6 +556,50 @@ export function applyClashFix(
   }
 }
 
+/**
+ * 把内核配置里的 `mode` 改成指定值。
+ *
+ * 和 DNS 一样要写到运行时那份：服务模式下内核读的是 ProgramData 下的副本，
+ * 只改 AppData 里的 clash-verge.yaml 等于没改。
+ */
+export function writeProxyMode(
+  dir,
+  mode,
+  {
+    exists = existsSync,
+    readFile = (p) => readFileSync(p, 'utf8'),
+    writeFile = (p, t) => writeFileSync(p, t),
+    programData = process.env.ProgramData ?? 'C:\\ProgramData',
+  } = {},
+) {
+  const results = []
+  for (const file of clashConfigTargets(dir, { exists, programData })) {
+    let text
+    try {
+      text = readFile(file)
+    } catch (error) {
+      results.push({ file, changed: false, reason: `读取失败：${error.code ?? error.message}` })
+      continue
+    }
+    const current = (text.match(/^mode:\s*(\S+)/m) ?? [])[1]
+    if (!current) {
+      results.push({ file, changed: false, reason: '没有 mode 字段' })
+      continue
+    }
+    if (current === mode) {
+      results.push({ file, changed: false, reason: `已经是 ${mode}` })
+      continue
+    }
+    try {
+      writeFile(file, text.replace(/^mode:\s*\S+\s*$/m, `mode: ${mode}`))
+      results.push({ file, changed: true, before: current, after: mode })
+    } catch (error) {
+      results.push({ file, changed: false, reason: `写入失败：${error.code ?? error.message}` })
+    }
+  }
+  return { results, changed: results.filter((item) => item.changed).length }
+}
+
 /** 当前环境需不需要修正（给按钮上色用）。 */
 export function needsClashFix(settings) {
   if (!settings) return false
@@ -757,10 +801,33 @@ export function insertPrependRules(text, rules) {
   return `${trimmed ? `${trimmed}\n` : ''}prepend:\n${additions.join('\n')}\n`
 }
 
+/** 把规则插到配置 `rules:` 段的最前面（两份配置都要，见 applyClaudeRules）。 */
+export function prependRulesToConfig(text, rules) {
+  const lines = String(text ?? '').split(/\r?\n/)
+  const start = lines.findIndex((line) => /^rules:\s*$/.test(line))
+  if (start < 0) return { changed: false, reason: '没有 rules 段' }
+
+  let pad = ''
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const match = lines[i].match(/^(\s*)- /)
+    if (match) {
+      pad = match[1]
+      break
+    }
+    if (/^\S/.test(lines[i])) break
+  }
+
+  lines.splice(start + 1, 0, ...rules.map((rule) => `${pad}- ${rule}`))
+  return { changed: true, text: lines.join('\n') }
+}
+
 /**
  * 规则模式下补齐 Claude 的规则。已经是覆盖状态就什么都不写。
  *
- * 只动增强文件，不碰订阅本体 —— 订阅更新会把本体重写，写那儿等于白写。
+ * 写两处，各管一件事：
+ *  - 增强文件 `profiles/<option.rules>.yaml`：长期，订阅更新不会覆盖；
+ *  - 生效配置（clash-verge.yaml + 运行时副本）：立刻生效 —— 服务模式重启内核
+ *    未必会重新合并 profile，只写增强文件会出现"配置看着对、内核里没这条规则"。
  */
 export function applyClaudeRules(dir, options = {}) {
   const {
@@ -768,30 +835,61 @@ export function applyClaudeRules(dir, options = {}) {
     readFile = (p) => readFileSync(p, 'utf8'),
     writeFile = (p, t) => writeFileSync(p, t),
     group,
+    programData = process.env.ProgramData ?? 'C:\\ProgramData',
   } = options
 
-  const path = ruleEnhancementPath(dir, { exists, readFile })
-  if (!path) return { changed: false, reason: '没找到规则增强文件（profiles.yaml 里没有 rules 项）' }
-
-  let text
-  try {
-    text = readFile(path)
-  } catch (error) {
-    return { changed: false, reason: `读取失败：${error.code ?? error.message}` }
-  }
-
-  // 覆盖判定用生效配置（订阅 + 增强合并后的结果），不是这份文件本身。
+  // 覆盖判定用生效配置（订阅 + 增强合并后的结果），不是增强文件本身。
   const effective = readClashRules(dir, { exists, readFile })
   if (claudeRuleCoverage(effective).ok) return { changed: false, reason: 'Claude 规则已覆盖' }
 
   const target = claudeRuleBlock(group ?? claudeRuleGroup(effective))
-  const next = insertPrependRules(text, target)
-  try {
-    writeFile(path, next)
-  } catch (error) {
-    return { changed: false, reason: `写入失败：${error.code ?? error.message}` }
+  const results = []
+
+  const path = ruleEnhancementPath(dir, { exists, readFile })
+  if (path) {
+    try {
+      writeFile(path, insertPrependRules(readFile(path), target))
+      results.push({ file: path, changed: true })
+    } catch (error) {
+      results.push({ file: path, changed: false, reason: `写入失败：${error.code ?? error.message}` })
+    }
   }
-  return { changed: true, file: path, after: target }
+
+  for (const file of clashConfigTargets(dir, { exists, programData })) {
+    if (file === path) continue
+    let text
+    try {
+      text = readFile(file)
+    } catch (error) {
+      results.push({ file, changed: false, reason: `读取失败：${error.code ?? error.message}` })
+      continue
+    }
+    const outcome = prependRulesToConfig(text, target)
+    if (!outcome.changed) {
+      results.push({ file, changed: false, reason: outcome.reason })
+      continue
+    }
+    try {
+      writeFile(file, outcome.text)
+      results.push({ file, changed: true })
+    } catch (error) {
+      results.push({ file, changed: false, reason: `写入失败：${error.code ?? error.message}` })
+    }
+  }
+
+  const changed = results.filter((item) => item.changed)
+  if (changed.length === 0) {
+    return { changed: false, reason: results.map((item) => item.reason).filter(Boolean).join('；') || '没有可写的文件' }
+  }
+  return {
+    changed: true,
+    files: changed.map((item) => item.file),
+    // 没写进增强文件就意味着订阅更新会冲掉，界面要提示。
+    durable: Boolean(path),
+    path,
+    after: target,
+    results,
+  }
 }
 
 /** 读出生效配置里的规则（就是用户当前真正在跑的这套）。 */

@@ -30,6 +30,8 @@ import {
   parseProfilesIndex,
   ruleEnhancementPath,
   readClashRules,
+  writeProxyMode,
+  prependRulesToConfig,
 } from '../src/proxy-mode.js'
 
 const tempDirs = []
@@ -690,11 +692,69 @@ describe('规则增强文件写入', () => {
     assert.equal(claudeRuleCoverage(readClashRules(root)).ok, true)
   })
 
-  it('找不到规则增强文件时不动任何东西', () => {
+  it('找不到规则增强文件时仍然写生效配置，但标记为不持久', () => {
     const root = tempDir()
     writeFileSync(join(root, 'clash-verge.yaml'), 'rules:\n- MATCH,DIRECT\n')
-    const outcome = applyClaudeRules(root)
-    assert.equal(outcome.changed, false)
-    assert.match(outcome.reason, /规则增强文件/)
+    const outcome = applyClaudeRules(root, { programData: join(root, 'nope') })
+    // 先让当前这套跑起来；durable=false 提醒"订阅更新会冲掉"。
+    assert.equal(outcome.changed, true)
+    assert.equal(outcome.durable, false)
+    assert.ok(readFileSync(join(root, 'clash-verge.yaml'), 'utf8').includes('anthropic.com'))
+  })
+})
+
+describe('切模式与规则前置', () => {
+  it('writeProxyMode 同时改生效配置和运行时副本', () => {
+    const root = tempDir()
+    const clientDir = join(root, 'client')
+    const runtime = join(root, 'runtime')
+    mkdirSync(clientDir, { recursive: true })
+    mkdirSync(runtime, { recursive: true })
+    const body = ['mode: global', 'mixed-port: 7897', 'rules:', '- MATCH,PROXY'].join('\n')
+    writeFileSync(join(clientDir, 'clash-verge.yaml'), body)
+    // 运行时副本走 ProgramData 约定路径
+    const programData = join(root, 'pd')
+    const runtimeDir = join(programData, 'clash-verge-service', 'users', 'h1', 'runtime')
+    mkdirSync(runtimeDir, { recursive: true })
+    writeFileSync(join(runtimeDir, 'config.yaml'), body)
+
+    const outcome = writeProxyMode(clientDir, 'rule', { programData })
+    assert.equal(outcome.changed, 2)
+    assert.ok(readFileSync(join(clientDir, 'clash-verge.yaml'), 'utf8').startsWith('mode: rule'))
+    assert.ok(readFileSync(join(runtimeDir, 'config.yaml'), 'utf8').startsWith('mode: rule'))
+  })
+
+  it('已经是目标模式时不写', () => {
+    const root = tempDir()
+    const clientDir = join(root, 'client')
+    mkdirSync(clientDir, { recursive: true })
+    writeFileSync(join(clientDir, 'clash-verge.yaml'), 'mode: rule\nrules:\n- MATCH,PROXY\n')
+    const outcome = writeProxyMode(clientDir, 'rule', { programData: join(root, 'nope') })
+    assert.equal(outcome.changed, 0)
+  })
+
+  it('prependRulesToConfig 插在 rules 段最前面，保持缩进', () => {
+    const text = ['rules:', '  - GEOSITE,CN,DIRECT', '  - MATCH,PROXY'].join('\n')
+    const outcome = prependRulesToConfig(text, ['DOMAIN-SUFFIX,claude.ai,PROXY'])
+    assert.equal(outcome.changed, true)
+    const lines = outcome.text.split('\n')
+    assert.equal(lines[1], '  - DOMAIN-SUFFIX,claude.ai,PROXY')
+  })
+
+  it('applyClaudeRules 同时写增强文件和生效配置', () => {
+    const root = tempDir()
+    const profilesDir = join(root, 'profiles')
+    mkdirSync(profilesDir, { recursive: true })
+    writeFileSync(
+      join(root, 'profiles.yaml'),
+      ['current: SUB', 'items:', '- uid: RULES', '  type: rules', '  file: RULES.yaml', '- uid: SUB', '  type: remote', '  file: SUB.yaml', '  option:', '    rules: RULES'].join('\n'),
+    )
+    writeFileSync(join(profilesDir, 'RULES.yaml'), 'prepend: []\n')
+    writeFileSync(join(root, 'clash-verge.yaml'), ['mode: rule', 'rules:', '- GEOSITE,CN,DIRECT', '- MATCH,IPEqual'].join('\n'))
+
+    const outcome = applyClaudeRules(root, { programData: join(root, 'nope') })
+    assert.equal(outcome.changed, true)
+    assert.ok(readFileSync(join(profilesDir, 'RULES.yaml'), 'utf8').includes('anthropic.com'))
+    assert.ok(readFileSync(join(root, 'clash-verge.yaml'), 'utf8').includes('DOMAIN-SUFFIX,anthropic.com,IPEqual'))
   })
 })
