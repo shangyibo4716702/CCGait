@@ -51,12 +51,14 @@ import {
   applyClashFix,
   applyClaudeRules,
   claudeRuleCoverage,
+  hasUuDirectRules,
   judgeDnsUpstreams,
   judgeProxySettings,
   needsClashFix,
   probeProxyMode,
   readClashRules,
   readProxySettings,
+  setUuDirectRules,
   writeProxyMode,
 } from '../proxy-mode.js'
 import { verifyClaudeRouting } from '../proxy-connections.js'
@@ -563,6 +565,8 @@ function resolveAppUserModelId() {
     writeProxyMode: options.deps?.writeProxyMode ?? writeProxyMode,
     verifyClaudeRouting: options.deps?.verifyClaudeRouting ?? verifyClaudeRouting,
     repairSystemDns: options.deps?.repairSystemDns ?? repairSystemDns,
+    setUuDirectRules: options.deps?.setUuDirectRules ?? setUuDirectRules,
+    hasUuDirectRules: options.deps?.hasUuDirectRules ?? hasUuDirectRules,
     restartProxyCore: options.deps?.restartProxyCore ?? restartProxyCore,
     accountsRoot: options.deps?.accountsRoot ?? accountsRoot,
     locateDesktopProfile: options.deps?.locateDesktopProfile ?? locateDesktopProfile,
@@ -1016,6 +1020,7 @@ function resolveAppUserModelId() {
       mode: probe.mode,
       settings,
       coverage,
+      uuDirect: deps.hasUuDirectRules(deps.readClashRules(probe.dir)),
       issues,
       needsFix: deps.needsClashFix(settings) || Boolean(coverage && !coverage.ok),
     }
@@ -1089,8 +1094,9 @@ function resolveAppUserModelId() {
    * 切规则模式失败会回滚到原模式；切全局失败不回滚（它本身就是安全侧），
    * 只如实报告内核没确认。
    */
-  const setProxyMode = (target) =>
-    serialize(async () => {
+  // 注意：这里不直接 serialize —— UU 直连在同一个操作里也要切模式，
+  // 再包一层会排进自己后面，死等。对外入口 setProxyMode 才加队列。
+  const runProxyModeSwitch = async (target) => {
       const want = target === 'rule' ? 'rule' : 'global'
       const label = want === 'rule' ? '规则模式' : '全局模式'
       const probe = await deps.probeProxyMode()
@@ -1174,6 +1180,51 @@ function resolveAppUserModelId() {
         verify,
         restarted,
         summary,
+        ...(await readProxyFixStateInternal()),
+      }
+  }
+
+  const setProxyMode = (target) => serialize(() => runProxyModeSwitch(target))
+
+  /**
+   * UU 远程直连：写规则，必要时切到规则模式。
+   *
+   * 全局模式下规则根本不生效，所以只写规则不够 —— 写了不切成规则模式，
+   * UU 该被塞进代理还是被塞进去。这里两步一起做，切模式仍然走自证。
+   */
+  const setUuDirect = (enable) =>
+    serialize(async () => {
+      const probe = await deps.probeProxyMode()
+      if (!probe.dir) throw new Error('没找到受支持的代理客户端配置，无法写入直连规则')
+
+      const outcome = deps.setUuDirectRules(probe.dir, enable !== false)
+      if (!outcome.changed) {
+        return { ok: true, unchanged: true, enabled: outcome.enabled, reason: outcome.reason, ...(await readProxyFixStateInternal()) }
+      }
+
+      // 撤销时不动模式：原来的模式是用户自己选的。
+      if (enable === false) {
+        pushLog('info', '已撤销 UU 远程直连规则', '规则模式下内网与 UU 仍会由 GEOIP,PRIVATE 与 CN 分流直连')
+        emit({ type: 'status' })
+        return { ok: true, enabled: false, ...(await readProxyFixStateInternal()) }
+      }
+
+      // 全局模式忽略规则，必须切到规则模式才生效。
+      const switchResult = probe.mode === 'rule' ? null : await runProxyModeSwitch('rule')
+      pushLog(
+        'info',
+        '已写入 UU 远程直连规则',
+        [
+          '本机 UU 进程、局域网网段、UU 域名一律直连',
+          switchResult ? '已同时切到规则模式（全局模式忽略规则）' : '当前已是规则模式',
+        ].join('；'),
+      )
+      emit({ type: 'status' })
+      return {
+        ok: true,
+        enabled: true,
+        switched: Boolean(switchResult),
+        switch: switchResult,
         ...(await readProxyFixStateInternal()),
       }
     })
@@ -1567,6 +1618,7 @@ function resolveAppUserModelId() {
     getProxyFixState,
     fixClashSettings,
     setProxyMode,
+    setUuDirect,
     ensureSystemDns,
     getAccounts,
     saveCurrentAccount,

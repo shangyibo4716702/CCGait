@@ -32,6 +32,10 @@ import {
   readClashRules,
   writeProxyMode,
   prependRulesToConfig,
+  UU_DIRECT_RULES,
+  hasUuDirectRules,
+  removeRulesFromConfig,
+  setUuDirectRules,
 } from '../src/proxy-mode.js'
 
 const tempDirs = []
@@ -756,5 +760,66 @@ describe('切模式与规则前置', () => {
     assert.equal(outcome.changed, true)
     assert.ok(readFileSync(join(profilesDir, 'RULES.yaml'), 'utf8').includes('anthropic.com'))
     assert.ok(readFileSync(join(root, 'clash-verge.yaml'), 'utf8').includes('DOMAIN-SUFFIX,anthropic.com,IPEqual'))
+  })
+})
+
+describe('UU 远程直连规则', () => {
+  it('规则覆盖进程、域名、内网网段', () => {
+    const block = UU_DIRECT_RULES
+    assert.ok(block.some((rule) => rule.startsWith('PROCESS-NAME-REGEX')))
+    assert.ok(block.some((rule) => rule.startsWith('PROCESS-PATH-REGEX')))
+    assert.ok(block.some((rule) => rule === 'DOMAIN-SUFFIX,uu.163.com,DIRECT'))
+    for (const cidr of ['192.168.0.0/16', '10.0.0.0/8', '172.16.0.0/12']) {
+      assert.ok(block.includes(`IP-CIDR,${cidr},DIRECT,no-resolve`), cidr)
+    }
+  })
+
+  it('命中判定按整条规则比对，不做模糊匹配', () => {
+    assert.equal(hasUuDirectRules(UU_DIRECT_RULES), true)
+    assert.equal(hasUuDirectRules(['DOMAIN-SUFFIX,uu.163.com,PROXY']), false)
+    assert.equal(hasUuDirectRules([]), false)
+  })
+
+  it('删除时只删这组规则，别的原样保留', () => {
+    const text = [
+      'rules:',
+      `- ${UU_DIRECT_RULES[0]}`,
+      '- GEOSITE,CN,DIRECT',
+      `- ${UU_DIRECT_RULES[6]}`,
+      '- MATCH,IPEqual',
+    ].join('\n')
+    const outcome = removeRulesFromConfig(text, UU_DIRECT_RULES)
+    assert.equal(outcome.changed, true)
+    assert.equal(outcome.removed, 2)
+    assert.ok(!outcome.text.includes(UU_DIRECT_RULES[0]))
+    assert.ok(outcome.text.includes('GEOSITE,CN,DIRECT'))
+    assert.ok(outcome.text.includes('MATCH,IPEqual'))
+  })
+
+  it('写一次再撤一次，配置回到原样', () => {
+    const root = tempDir()
+    const profilesDir = join(root, 'profiles')
+    mkdirSync(profilesDir, { recursive: true })
+    writeFileSync(
+      join(root, 'profiles.yaml'),
+      ['current: SUB', 'items:', '- uid: RULES', '  type: rules', '  file: RULES.yaml', '- uid: SUB', '  type: remote', '  file: SUB.yaml', '  option:', '    rules: RULES'].join('\n'),
+    )
+    writeFileSync(join(profilesDir, 'RULES.yaml'), 'prepend: []\n')
+    const original = ['mode: rule', 'rules:', '- GEOSITE,CN,DIRECT', '- MATCH,IPEqual'].join('\n')
+    writeFileSync(join(root, 'clash-verge.yaml'), original)
+
+    const on = setUuDirectRules(root, true, { programData: join(root, 'nope') })
+    assert.equal(on.changed, true)
+    assert.equal(on.enabled, true)
+    assert.equal(hasUuDirectRules(readClashRules(root)), true)
+    assert.ok(readFileSync(join(profilesDir, 'RULES.yaml'), 'utf8').includes('uu.163.com'))
+
+    const again = setUuDirectRules(root, true, { programData: join(root, 'nope') })
+    assert.equal(again.changed, false)
+
+    const off = setUuDirectRules(root, false, { programData: join(root, 'nope') })
+    assert.equal(off.changed, true)
+    assert.equal(hasUuDirectRules(readClashRules(root)), false)
+    assert.equal(readFileSync(join(root, 'clash-verge.yaml'), 'utf8'), original)
   })
 })

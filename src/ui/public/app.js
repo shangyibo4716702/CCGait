@@ -1326,6 +1326,15 @@ function renderProxyPanel(data) {
   const button = document.querySelector('#proxy-fix')
   if (!host || !sub || !button) return
 
+  // UU 远程直连：一个开关，写了规则就显示「撤销」。
+  const uuButton = document.querySelector('#proxy-uu')
+  if (uuButton) {
+    const available = Boolean(data?.found)
+    uuButton.hidden = !available
+    uuButton.disabled = false
+    uuButton.textContent = data?.uuDirect ? '撤销 UU 直连' : 'UU 远程直连'
+  }
+
   // 模式按钮是双向的：全局 → 规则、规则 → 全局。直连/未知时不出现。
   const ruleButton = document.querySelector('#proxy-rule')
   if (ruleButton) {
@@ -1479,6 +1488,62 @@ async function switchProxyMode() {
     void refresh()
   } catch (error) {
     toast('error', `没有切到${target === 'rule' ? '规则模式' : '全局模式'}`, error instanceof Error ? error.message : String(error))
+    void refreshProxyPanel()
+  } finally {
+    button.disabled = false
+    button.textContent = original
+  }
+}
+
+/**
+ * UU 远程直连开关。
+ *
+ * 开启时不只是写规则：全局模式会忽略所有规则，所以后端会顺手切到规则模式
+ * （同样走内核自证）。这里把这一点明说，避免用户以为点了没反应。
+ */
+async function toggleUuDirect() {
+  const button = document.querySelector('#proxy-uu')
+  if (!button || button.disabled) return
+  const enable = !proxyState?.uuDirect
+  const confirmed = window.confirm(
+    enable
+      ? '开启 UU 远程直连？\n\n' +
+          '· 本机 UU 进程、局域网网段（192.168/10/172.16）、UU 域名一律直连\n' +
+          '· 当前是全局模式的话会同时切到规则模式 —— 全局模式忽略规则，不切等于没写\n' +
+          '· 切模式会重启代理内核，网络中断几秒，并让内核自证 Claude 仍走代理\n\n' +
+          '继续吗？'
+      : '撤销 UU 远程直连？\n\n' +
+          '· 会把刚写入的那组直连规则删掉，不改当前模式\n\n' +
+          '继续吗？',
+  )
+  if (!confirmed) return
+
+  const original = button.textContent
+  button.disabled = true
+  button.textContent = enable ? '写入中…' : '撤销中…'
+  try {
+    const result = await api('/api/proxy/uu', { method: 'POST', body: { enable } })
+    if (result?.ok) {
+      toast(
+        'ok',
+        enable
+          ? result.switched
+            ? '已开启 UU 直连，并切到规则模式'
+            : '已开启 UU 直连'
+          : '已撤销 UU 直连',
+        enable
+          ? result.switched
+            ? '全局模式会忽略规则，所以一并切了；内核自证通过'
+            : '当前已是规则模式，规则立即生效'
+          : '当前模式未改动',
+      )
+    } else {
+      toast('error', enable ? '没有开启' : '没有撤销', result?.reason ?? '未知原因')
+    }
+    renderProxyPanel(result)
+    void refresh()
+  } catch (error) {
+    toast('error', enable ? '没有开启 UU 直连' : '没有撤销', error instanceof Error ? error.message : String(error))
     void refreshProxyPanel()
   } finally {
     button.disabled = false
@@ -2101,6 +2166,10 @@ document.querySelector('#proxy-fix')?.addEventListener('click', () => {
 
 document.querySelector('#proxy-rule')?.addEventListener('click', () => {
   void switchProxyMode()
+})
+
+document.querySelector('#proxy-uu')?.addEventListener('click', () => {
+  void toggleUuDirect()
 })
 
 document.querySelector('#account-create-empty')?.addEventListener('click', () => {

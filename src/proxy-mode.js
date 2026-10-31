@@ -801,6 +801,122 @@ export function insertPrependRules(text, rules) {
   return `${trimmed ? `${trimmed}\n` : ''}prepend:\n${additions.join('\n')}\n`
 }
 
+/* ------------------------------------------------------- UU 远程直连 */
+
+/**
+ * UU 远程 / 内网一律直连。
+ *
+ * 为什么需要专门的规则：全局模式下规则不生效，连 192.168.x.x 都会被塞进代理；
+ * 而 UU 这类远程工具靠 UDP 打洞，绕一圈代理后 NAT 类型变了，打洞基本失败。
+ * 这条规则把"本机进程 + 局域网 + UU 域名"整段摘出来直连。
+ *
+ * 进程用正则而不是精确名：不同版本的 UU 客户端 exe 叫 uu.exe / UUClient.exe /
+ * uu_remote.exe 不等，`^uu` 一把罩住。已用 `mihomo -t` 验证过内核认这两个规则类型。
+ */
+export const UU_DIRECT_RULES = [
+  'PROCESS-NAME-REGEX,(?i)^uu,DIRECT',
+  'PROCESS-PATH-REGEX,(?i).*\\\\uu[^\\\\]*\\\\.exe,DIRECT',
+  'DOMAIN-SUFFIX,uu.163.com,DIRECT',
+  'DOMAIN-SUFFIX,uu.netease.com,DIRECT',
+  'DOMAIN-SUFFIX,uu.126.net,DIRECT',
+  'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve',
+  'IP-CIDR,10.0.0.0/8,DIRECT,no-resolve',
+  'IP-CIDR,172.16.0.0/12,DIRECT,no-resolve',
+  'IP-CIDR,100.64.0.0/10,DIRECT,no-resolve',
+]
+
+/** 当前生效规则里有没有 UU 直连那一组。 */
+export function hasUuDirectRules(rules = []) {
+  const list = rules.map((rule) => String(rule ?? '').trim())
+  return UU_DIRECT_RULES.some((rule) => list.includes(rule))
+}
+
+/** 从配置里删掉指定规则（U 撤销直连用）。 */
+export function removeRulesFromConfig(text, rules) {
+  const set = new Set(rules.map((rule) => String(rule).trim()))
+  const lines = String(text ?? '').split(/\r?\n/)
+  const kept = []
+  let removed = 0
+  for (const line of lines) {
+    const match = line.match(/^\s*- (.+)$/)
+    if (match && set.has(match[1].trim())) {
+      removed += 1
+      continue
+    }
+    kept.push(line)
+  }
+  if (removed === 0) return { changed: false, removed: 0 }
+  return { changed: true, removed, text: kept.join('\n') }
+}
+
+/**
+ * 写入 / 撤销 UU 直连规则。
+ *
+ * 和 Claude 规则同一个落点：规则增强文件（订阅更新不覆盖）+ 生效配置（立刻生效）。
+ */
+export function setUuDirectRules(
+  dir,
+  enable,
+  {
+    exists = existsSync,
+    readFile = (p) => readFileSync(p, 'utf8'),
+    writeFile = (p, t) => writeFileSync(p, t),
+    programData = process.env.ProgramData ?? 'C:\\ProgramData',
+  } = {},
+) {
+  const effective = readClashRules(dir, { exists, readFile })
+  const present = hasUuDirectRules(effective)
+  if (enable === present) {
+    return { changed: false, enabled: present, reason: enable ? '已经写入过了' : '本来就没有' }
+  }
+
+  const results = []
+  const targets = []
+  const path = ruleEnhancementPath(dir, { exists, readFile })
+  if (path) targets.push(path)
+  for (const file of clashConfigTargets(dir, { exists, programData })) {
+    if (file !== path) targets.push(file)
+  }
+
+  for (const file of targets) {
+    let text
+    try {
+      text = readFile(file)
+    } catch (error) {
+      results.push({ file, changed: false, reason: `读取失败：${error.code ?? error.message}` })
+      continue
+    }
+    // 三种改写函数的返回形状不一样，先归一成 { changed, text, reason }。
+    let outcome
+    if (enable && file === path) {
+      outcome = { changed: true, text: insertPrependRules(text, UU_DIRECT_RULES) }
+    } else if (enable) {
+      outcome = prependRulesToConfig(text, UU_DIRECT_RULES)
+    } else {
+      outcome = removeRulesFromConfig(text, UU_DIRECT_RULES)
+    }
+    if (!outcome.changed) {
+      results.push({ file, changed: false, reason: outcome.reason ?? '没有匹配的规则' })
+      continue
+    }
+    try {
+      writeFile(file, outcome.text)
+      results.push({ file, changed: true })
+    } catch (error) {
+      results.push({ file, changed: false, reason: `写入失败：${error.code ?? error.message}` })
+    }
+  }
+
+  const changedFiles = results.filter((item) => item.changed)
+  return {
+    changed: changedFiles.length > 0,
+    enabled: enable,
+    durable: Boolean(path),
+    files: changedFiles.map((item) => item.file),
+    results,
+  }
+}
+
 /** 把规则插到配置 `rules:` 段的最前面（两份配置都要，见 applyClaudeRules）。 */
 export function prependRulesToConfig(text, rules) {
   const lines = String(text ?? '').split(/\r?\n/)
