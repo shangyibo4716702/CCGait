@@ -108,6 +108,8 @@ const checks = [
   ['src/proxy-mode.js', 'judgeProxyMode', '代理模式判定（unknown 不拦，避免误杀）'],
   ['src/proxy-mode.js', 'readProxySettings', '代理 IPv6 / DNS 覆写开关读取'],
   ['src/proxy-mode.js', 'judgeProxySettings', '代理开关三项判定'],
+  ['src/proxy-mode.js', 'judgeDnsUpstreams', 'DNS 上游混入国内解析器检测（解析出口会飘）'],
+  ['src/proxy-mode.js', 'readYamlList', 'YAML 列表解析（只读同缩进项）'],
   ['src/providers.js', 'probeResolverEgressSampled', '解析出口采样探测（抓间歇性泄露）'],
   ['src/sessions-sync.js', 'listSessionGroups', '会话同步：按账号/组织定位索引目录'],
   ['src/ui/public/index.html', 'sync-modal', '界面：会话同步弹层（手动勾选）'],

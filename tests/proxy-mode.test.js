@@ -11,7 +11,10 @@ import {
   proxyConfigDirs,
   judgeProxySettings,
   readProxySettings,
+  classifyDnsUpstream,
+  judgeDnsUpstreams,
   readYamlBlock,
+  readYamlList,
   readYamlBool,
   readYamlScalar,
 } from '../src/proxy-mode.js'
@@ -283,5 +286,112 @@ describe('代理开关读取', () => {
     writeFileSync(join(dir, 'clash-verge.yaml'), 'mode: global\n')
     writeFileSync(join(dir, 'dns_config.yaml'), 'dns:\n  enable: true\n  ipv6: true\n')
     assert.equal(readProxySettings(dir).dnsIpv6, true)
+  })
+})
+
+describe('YAML 列表解析', () => {
+  it('只读同一缩进的列表项，不吃进后面的子结构', () => {
+    const text = [
+      'dns:',
+      '  nameserver:',
+      '  - 8.8.8.8',
+      '  - https://doh.pub/dns-query',
+      '  fallback-filter:',
+      '    domain:',
+      '    - +.google.com',
+      '    - +.facebook.com',
+    ].join('\n')
+    const dns = readYamlBlock(text, 'dns')
+    assert.deepEqual(readYamlList(dns, 'nameserver'), ['8.8.8.8', 'https://doh.pub/dns-query'])
+  })
+
+  it('空列表返回空数组', () => {
+    assert.deepEqual(readYamlList('  nameserver:\n  fallback: []', 'nameserver'), [])
+  })
+
+  it('键不存在返回空数组', () => {
+    assert.deepEqual(readYamlList('  fallback: []', 'nameserver'), [])
+  })
+
+  it('去掉引号与行尾注释', () => {
+    const text = ['nameserver:', "  - '1.1.1.1'", '  - 8.8.8.8 # 谷歌'].join('\n')
+    assert.deepEqual(readYamlList(text, 'nameserver'), ['1.1.1.1', '8.8.8.8'])
+  })
+})
+
+describe('DNS 上游分类', () => {
+  it('识别国内与境外解析器', () => {
+    assert.equal(classifyDnsUpstream('https://doh.pub/dns-query'), 'domestic')
+    assert.equal(classifyDnsUpstream('https://dns.alidns.com/dns-query'), 'domestic')
+    assert.equal(classifyDnsUpstream('119.29.29.29'), 'domestic')
+    assert.equal(classifyDnsUpstream('223.5.5.5'), 'domestic')
+    assert.equal(classifyDnsUpstream('8.8.8.8'), 'overseas')
+    assert.equal(classifyDnsUpstream('https://dns.google/dns-query'), 'overseas')
+    assert.equal(classifyDnsUpstream('1.1.1.1'), 'overseas')
+    assert.equal(classifyDnsUpstream('https://custom.example/dns'), 'unknown')
+  })
+
+  it('以 .cn 结尾的按国内算', () => {
+    assert.equal(classifyDnsUpstream('https://dns.example.cn/dns-query'), 'domestic')
+  })
+})
+
+describe('DNS 上游判定', () => {
+  it('国内+国外混着 → 报"混入国内"（实测就是这种会飘）', () => {
+    const issues = judgeDnsUpstreams({ nameserver: ['8.8.8.8', 'https://doh.pub/dns-query'] })
+    assert.equal(issues.length, 1)
+    assert.equal(issues[0].id, 'proxy-dns-upstream-domestic')
+    assert.match(issues[0].title, /混入/)
+    assert.match(issues[0].detail, /谁先答用谁|并发/)
+  })
+
+  it('全是国内 → 报"全是国内"', () => {
+    const issues = judgeDnsUpstreams({ nameserver: ['119.29.29.29', '223.5.5.5'] })
+    assert.equal(issues.length, 1)
+    assert.match(issues[0].title, /全是国内/)
+  })
+
+  it('只有境外 → 不报', () => {
+    assert.deepEqual(judgeDnsUpstreams({ nameserver: ['8.8.8.8', 'https://dns.google/dns-query'] }), [])
+  })
+
+  it('空列表或没读到 → 不报（不瞎猜）', () => {
+    assert.deepEqual(judgeDnsUpstreams({ nameserver: [] }), [])
+    assert.deepEqual(judgeDnsUpstreams({}), [])
+    assert.deepEqual(judgeDnsUpstreams(undefined), [])
+  })
+
+  it('关掉检查项就不报', () => {
+    assert.deepEqual(
+      judgeDnsUpstreams({ nameserver: ['8.8.8.8', 'doh.pub'] }, { enabled: false }),
+      [],
+    )
+  })
+})
+
+describe('readProxySettings 带上 nameserver', () => {
+  it('读出 dns 段里的 nameserver，同时不影响 proxy-server-nameserver', () => {
+    const appData = tempDir()
+    const dir = join(appData, 'io.github.clash-verge-rev.clash-verge-rev')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(
+      join(dir, 'clash-verge.yaml'),
+      [
+        'mode: global',
+        'ipv6: false',
+        'dns:',
+        '  enable: true',
+        '  ipv6: false',
+        '  nameserver:',
+        '  - 8.8.8.8',
+        '  - https://dns.google/dns-query',
+        '  proxy-server-nameserver:',
+        '  - https://doh.pub/dns-query',
+      ].join('\n'),
+    )
+    const settings = readProxySettings(dir)
+    assert.deepEqual(settings.nameserver, ['8.8.8.8', 'https://dns.google/dns-query'])
+    // 机场节点用的国内解析器不算问题
+    assert.deepEqual(judgeDnsUpstreams({ nameserver: settings.nameserver }), [])
   })
 })

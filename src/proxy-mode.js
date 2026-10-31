@@ -164,6 +164,122 @@ export function readYamlBlock(text, section) {
   return collected.length > 0 ? collected.join('\n') : undefined
 }
 
+/**
+ * 读一个 YAML 列表（`key:` 后面跟若干 `- item` 行）。
+ *
+ * 只处理这种最常见的列表形态 —— 代理配置里的 `nameserver` 就是它。
+ * 引号会被去掉，行尾注释会被切掉。
+ */
+export function readYamlList(text, key) {
+  const lines = text.split(/\r?\n/)
+  const pattern = new RegExp('^' + '[ \\t]*' + key + '[ \\t]*:' + '[ \\t]*$')
+  const start = lines.findIndex((line) => pattern.test(line))
+  if (start < 0) return []
+
+  // 以**第一个列表项的缩进**为基准。同一缩进的 `- x` 才算这个列表的成员；
+  // 缩进退回去（出现新的键）或变成更深缩进（进了子结构）就结束。
+  // 早先只判断"是不是列表项"，结果把后面 fallback-filter 的 `- +.google.com`
+  // 也吃进来了 —— 那会让判定看到一堆根本不存在的上游。
+  let baseIndent = undefined
+  const items = []
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const line = lines[i]
+    if (line.trim().length === 0) continue
+    const match = /^([ \t]*)-[ \t]*(.+?)\s*$/.exec(line)
+    if (!match) break
+    const indent = match[1].length
+    if (baseIndent === undefined) baseIndent = indent
+    if (indent !== baseIndent) break
+
+    let value = match[2].trim()
+    if (!value.startsWith('"') && !value.startsWith("'")) {
+      const hash = value.indexOf(' #')
+      if (hash >= 0) value = value.slice(0, hash).trim()
+    }
+    value = value.replace(/^['"]|['"]$/g, '').trim()
+    if (value.length > 0) items.push(value)
+  }
+  return items
+}
+
+/** 国内解析器的特征（用于识别"混进去会飘"的上游）。 */
+const DOMESTIC_DNS_MARKERS = [
+  'doh.pub',
+  'alidns',
+  'dnspod',
+  '223.5.5.5',
+  '223.6.6.6',
+  '119.29.29.29',
+  '182.254.116.116',
+  '114.114.114.114',
+  '114.114.115.115',
+  '180.76.76.76',
+  '1.2.4.8',
+  '117.50.10.10',
+  '101.226.4.6',
+  'dns.qq.com',
+  'dns.baidu.com',
+]
+
+/** 境外解析器的特征。 */
+const OVERSEAS_DNS_MARKERS = [
+  '8.8.8.8',
+  '8.8.4.4',
+  '1.1.1.1',
+  '1.0.0.1',
+  '9.9.9.9',
+  '149.112.112.112',
+  '208.67.222.222',
+  '208.67.220.220',
+  'dns.google',
+  'cloudflare-dns.com',
+  'dns.quad9.net',
+  'opendns.com',
+]
+
+/** 把一个上游条目分类成 domestic / overseas / unknown。 */
+export function classifyDnsUpstream(entry) {
+  const lower = String(entry ?? '').toLowerCase()
+  if (!lower) return 'unknown'
+  if (DOMESTIC_DNS_MARKERS.some((marker) => lower.includes(marker))) return 'domestic'
+  if (OVERSEAS_DNS_MARKERS.some((marker) => lower.includes(marker))) return 'overseas'
+  // 以 .cn 结尾的域名一律按国内算
+  if (/\.cn(\/|$|:)/.test(lower) || lower.endsWith('.cn')) return 'domestic'
+  return 'unknown'
+}
+
+/**
+ * 判 DNS 上游列表：混入国内解析器就会让解析出口"飘"。
+ *
+ * 实测机制（本机）：`nameserver` 同时写了 8.8.8.8（经代理出国）和
+ * doh.pub / dns.alidns.com（国内 DoH）。Clash 对这些上游**并发查询、谁先答用谁**，
+ * 国内 DoH 通常更快，于是多数时候解析出口是国内的 112.28.209.x（中国移动），
+ * 偶尔 8.8.8.8 抢先就变成海外 IP。因为不是每查询都随机，表现为"一段时间稳定在国内、
+ * 过一会儿稳定在海外" —— 看起来像飘，实际是上游选路在切换。
+ *
+ * 后果：解析出口这个信号变得不可信，既不能当硬门槛也会误报。
+ */
+export function judgeDnsUpstreams({ nameserver } = {}, { enabled = true } = {}) {
+  if (!enabled) return []
+  const list = Array.isArray(nameserver) ? nameserver : []
+  if (list.length === 0) return []
+
+  const domestic = list.filter((entry) => classifyDnsUpstream(entry) === 'domestic')
+  const overseas = list.filter((entry) => classifyDnsUpstream(entry) === 'overseas')
+  if (domestic.length === 0) return []
+
+  const mixed = overseas.length > 0
+  return [
+    {
+      id: 'proxy-dns-upstream-domestic',
+      title: mixed ? 'DNS 上游混入了国内解析器' : 'DNS 上游全是国内解析器',
+      detail: mixed
+        ? `代理的 DNS 上游同时包含国内（${domestic.join('、')}）与国外（${overseas.join('、')}）解析器。Clash 对这些上游并发查询、谁先答用谁，国内通常更快，于是解析出口会在"国内递归解析器"和"境外出口"之间来回切换 —— 表现就是解析出口时好时坏。请把国内那几条从 nameserver 里删掉，只留国外；解析机场节点域名用的 proxy-server-nameserver 可以保留国内。`
+        : `代理的 DNS 上游只有国内解析器（${domestic.join('、')}），解析出口必然落在国内，与出口白名单不一致。请改成国外解析器（如 8.8.8.8 / https://dns.google/dns-query）。`,
+    },
+  ]
+}
+
 /** 从块里读布尔；读不到返回 undefined（不要默认成 false 或 true）。 */
 export function readYamlBool(text, key) {
   const value = readYamlScalar(text, key)
@@ -220,6 +336,10 @@ export function readProxySettings(dir, { exists = existsSync, readFile = (p) => 
     if (ipv6 !== undefined) settings.ipv6 = ipv6
 
     const dnsBlock = readYamlBlock(text, 'dns')
+    if (dnsBlock) {
+      const upstreams = readYamlList(dnsBlock, 'nameserver')
+      if (upstreams.length > 0) settings.nameserver = upstreams
+    }
     if (dnsBlock) {
       const dnsEnabled = readYamlBool(dnsBlock, 'enable')
       const dnsIpv6 = readYamlBool(dnsBlock, 'ipv6')

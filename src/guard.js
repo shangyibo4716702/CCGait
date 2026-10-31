@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { probeClaudeDns, probeEgress, probeResolverEgress, probeResolverEgressSampled } from './providers.js'
-import { judgeProxySettings, probeProxyMode, readProxySettings } from './proxy-mode.js'
+import { judgeDnsUpstreams, judgeProxySettings, probeProxyMode, readProxySettings } from './proxy-mode.js'
 import {
   probeDnsServers,
   probeEmojiFont,
@@ -173,7 +173,8 @@ export async function runChecks(config) {
                 checked: true,
                 client: probe.client,
                 settings,
-                issues: judgeProxySettings(settings),
+                // 两组问题合并：开关类（IPv6 / DNS 覆写）+ 上游类（混入国内解析器）。
+                issues: [...judgeProxySettings(settings), ...judgeDnsUpstreams({ nameserver: settings.nameserver })],
               }
             })
             .catch(() => ({ checked: false, issues: [] }))
