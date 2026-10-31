@@ -1326,13 +1326,16 @@ function renderProxyPanel(data) {
   const button = document.querySelector('#proxy-fix')
   if (!host || !sub || !button) return
 
-  // UU 远程直连：一个开关，写了规则就显示「撤销」。
+  // UU 远程直连：已符合=绿（点它是撤销），不符合=红（点它是写入）。
   const uuButton = document.querySelector('#proxy-uu')
   if (uuButton) {
     const available = Boolean(data?.found)
+    const on = Boolean(data?.uuDirect)
     uuButton.hidden = !available
     uuButton.disabled = false
-    uuButton.textContent = data?.uuDirect ? '撤销 UU 直连' : 'UU 远程直连'
+    uuButton.textContent = on ? 'UU 直连已开启' : 'UU 远程直连'
+    uuButton.classList.toggle('is-uu-on', on)
+    uuButton.classList.toggle('is-uu-off', available && !on)
   }
 
   // 模式按钮是双向的：全局 → 规则、规则 → 全局。直连/未知时不出现。

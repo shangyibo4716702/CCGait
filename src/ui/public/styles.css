@@ -1825,3 +1825,27 @@ button.action.is-fixed:disabled {
   border-color: var(--ok-text);
   cursor: default;
 }
+
+/* UU 直连开关：可点的两态按钮。已符合=绿，不符合=红 —— 和「修正 Clash 设置」
+   同一套配色，但这里两个状态都能点（点绿的是撤销）。 */
+button.action.is-uu-on {
+  color: #fff;
+  background: var(--ok-text);
+  border-color: var(--ok-text);
+}
+
+button.action.is-uu-on:hover:not(:disabled) {
+  background: #15693f;
+  border-color: #15693f;
+}
+
+button.action.is-uu-off {
+  color: #fff;
+  background: var(--danger-text);
+  border-color: var(--danger-text);
+}
+
+button.action.is-uu-off:hover:not(:disabled) {
+  background: #8f1c12;
+  border-color: #8f1c12;
+}
