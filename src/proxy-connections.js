@@ -278,7 +278,10 @@ export async function verifyClaudeRouting({
   delayMs = 1200,
   findPipe = findControlPipe,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  // 期望的模式：切规则模式时等 rule，切回全局时等 global。
+  expectMode = 'rule',
 } = {}) {
+  const wanted = String(expectMode).toLowerCase()
   let lastError = null
   for (let i = 0; i < attempts; i += 1) {
     const pipe = findPipe() ?? controllerPipeFromConfig(dir, { readFile })
@@ -286,7 +289,7 @@ export async function verifyClaudeRouting({
       const secret = controllerSecret(dir, { readFile })
       try {
         const configs = await getOverPipe(pipe, '/configs', { secret })
-        if (String(configs?.mode).toLowerCase() === 'rule') {
+        if (String(configs?.mode).toLowerCase() === wanted) {
           const probe = await probeClaudeRouting({
             pipe,
             secret,

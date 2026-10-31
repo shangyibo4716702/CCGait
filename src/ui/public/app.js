@@ -1326,12 +1326,14 @@ function renderProxyPanel(data) {
   const button = document.querySelector('#proxy-fix')
   if (!host || !sub || !button) return
 
-  // 「切到规则模式」只在当前是全局模式时出现：已经在规则模式里就没什么可切的。
+  // 模式按钮是双向的：全局 → 规则、规则 → 全局。直连/未知时不出现。
   const ruleButton = document.querySelector('#proxy-rule')
   if (ruleButton) {
-    ruleButton.hidden = !data?.found || data?.mode !== 'global'
+    const mode = data?.mode
+    const togglable = Boolean(data?.found) && (mode === 'global' || mode === 'rule')
+    ruleButton.hidden = !togglable
     ruleButton.disabled = false
-    ruleButton.textContent = '切到规则模式'
+    ruleButton.textContent = mode === 'rule' ? '切回全局模式' : '切到规则模式'
   }
 
   button.classList.remove('is-needs-fix', 'is-fixed')
@@ -1349,7 +1351,8 @@ function renderProxyPanel(data) {
 
   const issues = list(data.issues)
   if (issues.length === 0) {
-    sub.textContent = data.client ?? '已就绪'
+    const modeLabel = data.mode === 'rule' ? '规则模式' : data.mode === 'global' ? '全局模式' : ''
+    sub.textContent = [data.client, modeLabel].filter(Boolean).join(' · ') || '已就绪'
     button.disabled = true
     button.classList.add('is-fixed')
     button.textContent = '设置正确'
@@ -1426,38 +1429,56 @@ async function fixClashSettings() {
 }
 
 /**
- * 无风险切规则模式。
+ * 双向切换代理模式，切换完必须让内核自证才报成功。
  *
- * 后端会先写规则、切模式、重启内核，再让内核自己开隧道读 `/connections` 自证；
- * 任何一条 Claude 的链路走直连就自动回滚。所以这里只报结果，不替它下判断。
+ * 后端负责写规则、改模式、重启内核、读 `/connections` 实测；
+ * 这里只把"成功/失败 + 每条域名走了哪条链路"如实摆出来。
  */
-async function switchToRuleMode() {
+async function switchProxyMode() {
   const button = document.querySelector('#proxy-rule')
   if (!button || button.disabled) return
+  const current = proxyState?.mode
+  const target = current === 'rule' ? 'global' : 'rule'
+  const toRule = target === 'rule'
+
   const confirmed = window.confirm(
-    '切到规则模式（省流量）？\n\n' +
-      '· 先补齐 Claude / Anthropic 的规则，写进订阅的规则增强文件（订阅更新不会覆盖）\n' +
-      '· 再把代理切成规则模式并重启内核，网络会中断几秒\n' +
-      '· 切完让内核实测 claude.ai / api.anthropic.com 走哪条链路\n' +
-      '· 只要有一条是直连，自动回滚到全局模式\n\n' +
-      '继续吗？',
+    toRule
+      ? '切到规则模式（省流量）？\n\n' +
+          '· 先补齐 Claude / Anthropic 的规则，写进订阅的规则增强文件（订阅更新不会覆盖）\n' +
+          '· 再把代理切成规则模式并重启内核，网络会中断几秒\n' +
+          '· 切完让内核实测 claude.ai / api.anthropic.com 走哪条链路\n' +
+          '· 只要有一条是直连，自动回滚到全局模式\n\n' +
+          '继续吗？'
+      : '切回全局模式？\n\n' +
+          '· 会把代理模式改成全局并重启内核，网络会中断几秒\n' +
+          '· 切完同样实测 Claude 的链路，确认走的是代理节点\n\n' +
+          '继续吗？',
   )
   if (!confirmed) return
 
   const original = button.textContent
   button.disabled = true
-  button.textContent = '切换中…'
+  button.textContent = toRule ? '切换中…' : '切换中…'
   try {
-    const result = await api('/api/proxy/safe-rule', { method: 'POST' })
+    const result = await api('/api/proxy/mode', { method: 'POST', body: { mode: target } })
     const detail = list(result?.verify?.results)
       .filter((item) => !item.error)
       .map((item) => `${item.host} → ${(item.chains ?? []).join('>')}`)
       .join('\n')
-    toast('ok', '已切到规则模式，内核自证通过', detail || 'Claude 的域名已走代理')
+    const label = target === 'rule' ? '规则模式' : '全局模式'
+    if (result?.ok) {
+      toast(
+        'ok',
+        result.unchanged ? `已经是${label}` : `已切换到${label}`,
+        detail || 'Claude 的域名已走代理',
+      )
+    } else {
+      toast('error', `没有切到${label}`, detail || '内核没能确认切换结果')
+    }
     renderProxyPanel(result)
     void refresh()
   } catch (error) {
-    toast('error', '没有切过去', error instanceof Error ? error.message : String(error))
+    toast('error', `没有切到${target === 'rule' ? '规则模式' : '全局模式'}`, error instanceof Error ? error.message : String(error))
     void refreshProxyPanel()
   } finally {
     button.disabled = false
@@ -2079,7 +2100,7 @@ document.querySelector('#proxy-fix')?.addEventListener('click', () => {
 })
 
 document.querySelector('#proxy-rule')?.addEventListener('click', () => {
-  void switchToRuleMode()
+  void switchProxyMode()
 })
 
 document.querySelector('#account-create-empty')?.addEventListener('click', () => {

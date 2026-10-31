@@ -1078,14 +1078,19 @@ function resolveAppUserModelId() {
     })
 
   /**
-   * 无风险切规则模式：写规则 → 切模式 → 重启内核 → **让内核自证** → 证明不了就回滚。
+   * 双向切换代理模式，并且**切换后必须自证**才报成功。
    *
    * 为什么要自证而不是只看配置：配置只说明"规则怎么写的"，不说明"这次连接怎么走的"。
    * 这里让内核开一条到 claude.ai / api.anthropic.com 的隧道，再读它的 `/connections`，
-   * 看 `chains` 里是代理节点还是 DIRECT —— 那是运行时事实。测不出来算失败，照样回滚。
+   * 看 `chains` 里是代理节点还是 DIRECT —— 那是运行时事实。测不出来算失败。
+   *
+   * 切规则模式失败会回滚到原模式；切全局失败不回滚（它本身就是安全侧），
+   * 只如实报告内核没确认。
    */
-  const switchToRuleMode = () =>
+  const setProxyMode = (target) =>
     serialize(async () => {
+      const want = target === 'rule' ? 'rule' : 'global'
+      const label = want === 'rule' ? '规则模式' : '全局模式'
       const probe = await deps.probeProxyMode()
       if (!probe.dir) throw new Error('没找到受支持的代理客户端配置，无法自动切换')
       if (probe.mode === 'direct') throw new Error('当前是直连模式，请先在代理客户端里切回全局模式再操作')
@@ -1093,47 +1098,82 @@ function resolveAppUserModelId() {
       const originalMode = probe.mode === 'unknown' ? 'global' : probe.mode
       const steps = []
 
-      // 1) 规则：没有就补，补不上就不切（不赌）。
-      if (!deps.claudeRuleCoverage(deps.readClashRules(probe.dir)).ok) {
+      if (probe.mode === want) {
+        // 已经是目标模式：不重启内核，只实测一次，如实告诉用户现状。
+        const verify = await deps.verifyClaudeRouting({ dir: probe.dir, expectMode: want })
+        const summary = (verify.results ?? [])
+          .filter((item) => !item.error)
+          .map((item) => `${item.host} → ${(item.chains ?? []).join('>')}`)
+          .join('；')
+        return {
+          ok: verify.ok,
+          unchanged: true,
+          mode: want,
+          steps: [`已经是${label}，没有改动`],
+          verify,
+          restarted: false,
+          summary,
+          ...(await readProxyFixStateInternal()),
+        }
+      }
+
+      // 1) 规则模式要先有覆盖：没有就补，补不上就不切（不赌）。
+      if (want === 'rule' && !deps.claudeRuleCoverage(deps.readClashRules(probe.dir)).ok) {
         const fixed = deps.applyClaudeRules(probe.dir)
         if (!fixed.changed) throw new Error(`写入 Claude 规则失败：${fixed.reason ?? '未知原因'}`)
-        steps.push(`已写入 ${fixed.after?.length ?? 0} 条 Claude 规则`)
-      } else {
-        steps.push('Claude 规则已就位')
+        steps.push(`已写入 ${fixed.after?.length ?? 0} 条 Claude 规则${fixed.durable ? '' : '（未写入规则增强文件，订阅更新会丢）'}`)
       }
 
       // 2) 模式：写到生效配置 + 运行时副本。
-      const modeOutcome = deps.writeProxyMode(probe.dir, 'rule')
+      const modeOutcome = deps.writeProxyMode(probe.dir, want)
       if (modeOutcome.changed === 0) {
-        throw new Error(`没能把配置改成规则模式：${modeOutcome.results.map((r) => r.reason).filter(Boolean).join('；')}`)
+        throw new Error(`没能把配置改成${label}：${modeOutcome.results.map((item) => item.reason).filter(Boolean).join('；')}`)
       }
-      steps.push('配置已改为规则模式')
+      steps.push(`配置已改为${label}`)
 
       // 3) 重启内核，让新配置真正被读进去。
       const restarted = await deps.restartProxyCore()
       if (!restarted) {
-        deps.writeProxyMode(probe.dir, originalMode)
-        throw new Error('内核没能重启，配置没有生效，已回滚')
+        if (want === 'rule') deps.writeProxyMode(probe.dir, originalMode)
+        throw new Error(
+          want === 'rule'
+            ? '内核没能重启，配置没有生效，已回滚'
+            : '配置已改为全局模式，但内核没能重启 —— 实际仍可能是原来的模式，请手动重启代理客户端',
+        )
       }
 
-      // 4) 自证：模式是 rule，且 Claude 的域名走代理。
-      const verify = await deps.verifyClaudeRouting({ dir: probe.dir })
-      if (!verify.ok) {
-        deps.writeProxyMode(probe.dir, originalMode)
-        await deps.restartProxyCore()
-        const why = verify.leaks?.length
-          ? verify.leaks.map((item) => `${item.host} → ${(item.chains ?? []).join('>') || '直连'}`).join('，')
-          : (verify.error ?? '测不出 Claude 的链路')
-        throw new Error(`切到规则模式后没能证明 Claude 走代理（${why}），已回滚到${originalMode === 'global' ? '全局' : originalMode}模式`)
-      }
-
+      // 4) 自证：内核报告的是目标模式，且 Claude 的域名确实走了代理。
+      const verify = await deps.verifyClaudeRouting({ dir: probe.dir, expectMode: want })
       const summary = (verify.results ?? [])
         .filter((item) => !item.error)
         .map((item) => `${item.host} → ${(item.chains ?? []).join('>')}`)
         .join('；')
-      pushLog('info', '已切到规则模式，内核自证通过', summary || steps.join('；'))
+
+      if (!verify.ok) {
+        const why = verify.leaks?.length
+          ? verify.leaks.map((item) => `${item.host} → ${(item.chains ?? []).join('>') || '直连'}`).join('，')
+          : (verify.error ?? '测不出 Claude 的链路')
+        if (want === 'rule') {
+          deps.writeProxyMode(probe.dir, originalMode)
+          await deps.restartProxyCore()
+          throw new Error(
+            `切到规则模式后没能证明 Claude 走代理（${why}），已回滚到${originalMode === 'global' ? '全局' : originalMode}模式`,
+          )
+        }
+        throw new Error(`已写入全局模式，但内核没确认（${why}），请手动重启代理客户端后重试`)
+      }
+
+      pushLog('info', `已切换到${label}，内核自证通过`, summary || steps.join('；'))
       emit({ type: 'status' })
-      return { ok: true, mode: 'rule', steps, verify, restarted, ...(await readProxyFixStateInternal()) }
+      return {
+        ok: true,
+        mode: want,
+        steps,
+        verify,
+        restarted,
+        summary,
+        ...(await readProxyFixStateInternal()),
+      }
     })
 
   const getAccounts = () => serialize(async () => readAccountsState())
@@ -1498,7 +1538,7 @@ function resolveAppUserModelId() {
     killProcesses,
     getProxyFixState,
     fixClashSettings,
-    switchToRuleMode,
+    setProxyMode,
     getAccounts,
     saveCurrentAccount,
     createEmptyAccountFor,
