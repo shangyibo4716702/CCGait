@@ -599,6 +599,9 @@ function resolveAppUserModelId() {
   let guardStartedAt = undefined
   // 界面自己跑过检测时用自己那份；没跑过就用闸门写下的判定兜底（可能是另一个进程里的闸门）。
   let lastCheck = null
+  // 判定结果的时间戳（毫秒）。闸门每轮都会重新判定，这里跟着更新，
+  // 切号/启动就不必再等一次 10 秒的完整探测。
+  let lastCheckAt = 0
   let lastEnforcement = null
   let lastError = undefined
   let queue = Promise.resolve()
@@ -792,6 +795,7 @@ function resolveAppUserModelId() {
         dns: result.dns,
         environment: result.environment,
       }
+      lastCheckAt = Date.now()
       lastError = undefined
       pushLog(
         result.verdict.allow ? 'ok' : 'block',
@@ -808,6 +812,25 @@ function resolveAppUserModelId() {
   }
 
   const checkNow = () => serialize(checkInternal)
+
+  /**
+   * 拿一份"够新"的判定：最近 maxAgeMs 内有过结果就直接用，否则重跑一次完整检测。
+   *
+   * 为什么可以复用：闸门在跑的时候每 10 秒就判定一轮，结果和现场一致；
+   * 每次切号再等一遍完整探测，纯粹是把 10 秒的等待重做一遍。
+   * 闸门没在跑、或结果过期，就照旧老老实实测。
+   */
+  const ensureFreshCheck = async (maxAgeMs = 30_000) => {
+    if (lastCheck && Date.now() - lastCheckAt <= maxAgeMs) {
+      pushLog(
+        'info',
+        '复用最近的检测结果',
+        `${Math.max(0, Math.round((Date.now() - lastCheckAt) / 1000))} 秒前判定：${lastCheck.allow ? '放行' : '拦截'}`,
+      )
+      return lastCheck
+    }
+    return checkInternal()
+  }
 
   /**
    * 闸门启停有两层：Internal 是真正的动作，外层 serialize 负责排队。
@@ -827,7 +850,27 @@ function resolveAppUserModelId() {
           info: (m, d) => pushLog('info', m, d),
           error: (m, d) => pushLog('error', m, d),
         },
-        onState: (state) => emit({ type: 'guard', state }),
+        onState: (state) => {
+          // 闸门每轮（默认 10 秒）都会带着判定结果回来。把它同步成"最近一次判定"，
+          // 切号与门控启动就能直接复用，不必再跑一遍十几秒的网络探测。
+          if (state && typeof state.allow === 'boolean') {
+            lastCheck = {
+              at: state.updatedAt ?? nowIso(),
+              allow: state.allow,
+              failedClosed: state.failedClosed,
+              blocked: state.blocked ?? [],
+              warnings: state.warnings ?? [],
+              // 白名单原文只有完整检测才有；沿用上一份，别把界面上的比对信息抹掉。
+              whitelist: lastCheck?.whitelist,
+              egress: state.egress,
+              dns: state.dns,
+              environment: lastCheck?.environment,
+              fromGuard: true,
+            }
+            lastCheckAt = Date.now()
+          }
+          emit({ type: 'guard', state })
+        },
         // 外部停止请求（托盘/CLI 的 guard-stop 写的就是这个请求文件）必须真的走一遍收尾：
         // 不接这个回调的话，闸门会停掉执法循环、但 pid 文件不清、guard 变量不为 null，
         // 界面就一直显示"运行中"而实际什么都没拦 —— 说的和做的不一致，最难发现。
@@ -1450,7 +1493,7 @@ function resolveAppUserModelId() {
       // 环境不合规时切过去，结果是新号一启动就被断网、甚至被终止 —— 用户会以为切号坏了，
       // 实际是两个机制各干各的。所以这里和门控启动用同一条判定，不通过就**不动现场**：
       // 不杀进程、不存档，把原因直接返回。
-      const check = await checkInternal()
+      const check = await ensureFreshCheck()
       if (!check.allow) {
         const reasons = (check.blocked ?? []).map((item) => item.title)
         const reason =
@@ -1502,7 +1545,7 @@ function resolveAppUserModelId() {
     serialize(async () => {
       const config = getConfig()
       // 必须用 Internal：本函数已在串行队列里，再走 checkNow 会等自己占用的队列（死锁）。
-      const check = await checkInternal()
+      const check = await ensureFreshCheck()
       if (!check.allow) {
         const reasons = (check.blocked ?? []).map((item) => item.title)
         const reason =

@@ -570,3 +570,54 @@ describe('从空白账号切走', () => {
     assert.equal(isEmptyAccount(join(accounts, 'BLANK')), false, '不再是空白')
   })
 })
+
+describe('整目录一次复制（robocopy 分支）', () => {
+  it('身份条目照拷，排除项一个都不带', () => {
+    const root = tempDir()
+    const profile = join(root, 'profile')
+    mkdirSync(join(profile, 'Network'), { recursive: true })
+    mkdirSync(join(profile, 'IndexedDB'), { recursive: true })
+    mkdirSync(join(profile, 'Code Cache', 'js'), { recursive: true })
+    mkdirSync(join(profile, 'claude-code', 'bin'), { recursive: true })
+    writeFileSync(join(profile, 'Network', 'Cookies'), 'cookies')
+    writeFileSync(join(profile, 'IndexedDB', 'data.ldb'), 'idb')
+    writeFileSync(join(profile, 'Preferences'), '{}')
+    writeFileSync(join(profile, 'lockfile'), 'locked')
+    writeFileSync(join(profile, 'Code Cache', 'js', 'x.js'), 'cache')
+    writeFileSync(join(profile, 'claude-code', 'bin', 'claude.exe'), 'binary')
+
+    const accounts = join(root, 'accounts')
+    mkdirSync(accounts, { recursive: true })
+    const result = saveAccount({ name: 'A', profileDir: profile, accountsDir: accounts })
+    assert.equal(result.name, 'A')
+
+    const saved = join(accounts, 'A')
+    assert.equal(readFileSync(join(saved, 'Network', 'Cookies'), 'utf8'), 'cookies')
+    assert.equal(readFileSync(join(saved, 'IndexedDB', 'data.ldb'), 'utf8'), 'idb')
+    assert.ok(existsSync(join(saved, 'Preferences')))
+    // 排除项必须一个都不出现 —— 尤其 claude-code（本机实测 568MB）
+    assert.equal(existsSync(join(saved, 'Code Cache')), false)
+    assert.equal(existsSync(join(saved, 'claude-code')), false)
+    assert.equal(existsSync(join(saved, 'lockfile')), false)
+  })
+
+  it('切回去之后 profile 里是目标账号的身份条目，缓存目录原样留着', async () => {
+    const root = tempDir()
+    const profile = join(root, 'profile')
+    const accounts = join(root, 'accounts')
+    mkdirSync(join(profile, 'Network'), { recursive: true })
+    writeFileSync(join(profile, 'Network', 'Cookies'), 'a')
+    writeFileSync(join(profile, 'Preferences'), 'a-pref')
+    mkdirSync(join(accounts, 'B', 'Network'), { recursive: true })
+    writeFileSync(join(accounts, 'B', 'Network', 'Cookies'), 'b')
+    writeFileSync(join(accounts, 'B', 'Preferences'), 'b-pref')
+    mkdirSync(join(profile, 'Code Cache'), { recursive: true })
+    writeFileSync(join(profile, 'Code Cache', 'x'), 'cache')
+
+    await switchAccount({ name: 'B', profileDir: profile, accountsDir: accounts, current: 'A' })
+    assert.equal(readFileSync(join(profile, 'Network', 'Cookies'), 'utf8'), 'b')
+    assert.equal(readFileSync(join(profile, 'Preferences'), 'utf8'), 'b-pref')
+    // 缓存目录不属于身份条目：既不被存档，也不该被搬走
+    assert.equal(readFileSync(join(profile, 'Code Cache', 'x'), 'utf8'), 'cache')
+  })
+})

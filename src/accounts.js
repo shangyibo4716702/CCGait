@@ -393,6 +393,35 @@ function rmrf(path) {
  */
 function copyEntries({ from, to, entries, runRobocopy }) {
   mkdirSync(to, { recursive: true })
+
+  // 一次 robocopy 拷完整份，用 /XD /XF 排掉非身份条目。
+  //
+  // 为什么不再逐条目 spawn：本机实测 32 个条目逐条复制要 1.6 秒，其中大半是
+  // 进程启动开销（数据才 20MB 左右）。切号要复制两次（存档一次、载入一次），
+  // 光启动开销就吃掉三秒。整目录一次复制把这段压到零点几秒。
+  if (runRobocopy && entries.length > 1) {
+    const keep = new Set(entries)
+    const excludeDirs = []
+    const excludeFiles = []
+    for (const item of readdirSync(from, { withFileTypes: true })) {
+      if (keep.has(item.name)) continue
+      // `.ccgait-account.json` 这类元数据也不能被当成身份条目复制进去。
+      if (item.isDirectory()) excludeDirs.push(item.name)
+      else excludeFiles.push(item.name)
+    }
+    const args = [from, to, '/E', '/NFL', '/NDL', '/NJH', '/NJS', '/R:1', '/W:1', '/MT:8']
+    if (excludeDirs.length > 0) args.push('/XD', ...excludeDirs)
+    if (excludeFiles.length > 0) args.push('/XF', ...excludeFiles)
+    let code = 0
+    try {
+      execFileSync('robocopy.exe', args, { stdio: 'ignore' })
+    } catch (error) {
+      code = typeof error.status === 'number' ? error.status : 8
+    }
+    if (code >= 8) throw new Error(`复制失败（robocopy 退出码 ${code}）`)
+    return
+  }
+
   for (const entry of entries) {
     const source = join(from, entry)
     if (!existsSync(source)) continue
