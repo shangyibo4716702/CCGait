@@ -1756,6 +1756,35 @@ input[type='checkbox']:checked::after {
   border-radius: 999px;
 }
 
+/* 顺序标签：#1 = 最近一次切过去的账号。 */
+.account-badge.is-recent {
+  color: #fff;
+  background: var(--accent, #2f6feb);
+}
+
+/* 切换历史：侧栏底部的小块，只读，不参与任何操作。 */
+.switch-history {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line, #e5e5e5);
+}
+
+.switch-history-title {
+  margin-bottom: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted-text, #6b6b6b);
+}
+
+.switch-history-row {
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--muted-text, #6b6b6b);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* ---------------------------------------------------------------- 代理设置面板 */
 
 .proxy-list {

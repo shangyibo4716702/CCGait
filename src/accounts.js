@@ -138,6 +138,56 @@ export function readCurrentAccount(accountsDir, readFile = (p) => readFileSync(p
 }
 
 /**
+ * 切号历史：谁切到谁、什么时候。
+ *
+ * 存在 `accounts/switch-history.json`，新的在前。只追加、固定上限，
+ * 不参与任何判定 —— 纯粹是给界面回答"我刚切过哪个号、上一个是哪个"。
+ */
+const SWITCH_HISTORY_FILE = 'switch-history.json'
+const SWITCH_HISTORY_LIMIT = 50
+
+export function switchHistoryPath(accountsDir) {
+  return join(accountsDir, SWITCH_HISTORY_FILE)
+}
+
+export function readSwitchHistory(accountsDir, readFile = (p) => readFileSync(p, 'utf8')) {
+  try {
+    const raw = JSON.parse(readFile(switchHistoryPath(accountsDir)))
+    if (!Array.isArray(raw)) return []
+    return raw.filter(
+      (item) => item && typeof item.to === 'string' && item.to.length > 0 && typeof item.at === 'string',
+    )
+  } catch {
+    return []
+  }
+}
+
+export function appendSwitchHistory(
+  accountsDir,
+  entry,
+  {
+    readFile = (p) => readFileSync(p, 'utf8'),
+    writeFile = (p, text) => writeFileSync(p, text, 'utf8'),
+    limit = SWITCH_HISTORY_LIMIT,
+  } = {},
+) {
+  if (!entry || typeof entry.to !== 'string' || entry.to.length === 0) return []
+  const record = {
+    from: typeof entry.from === 'string' && entry.from.length > 0 ? entry.from : undefined,
+    to: entry.to,
+    at: typeof entry.at === 'string' ? entry.at : new Date().toISOString(),
+  }
+  const next = [record, ...readSwitchHistory(accountsDir, readFile)].slice(0, Math.max(1, limit))
+  try {
+    mkdirSync(accountsDir, { recursive: true })
+    writeFile(switchHistoryPath(accountsDir), `${JSON.stringify(next, null, 2)}\n`)
+  } catch {
+    // 历史写失败不影响切号本身。
+  }
+  return next
+}
+
+/**
  * 删除账号存档。
  *
  * 两条安全线：

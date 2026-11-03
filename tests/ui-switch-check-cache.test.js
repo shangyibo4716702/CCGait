@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, describe, it } from 'node:test'
@@ -91,6 +91,16 @@ describe('切号前的合规判定复用', () => {
     const result = await session.switchAccountTo('B')
     assert.equal(result.switched, true)
     assert.equal(checks(), 1)
+  })
+
+  it('切号成功后写一条历史', async () => {
+    const { session, accounts } = makeSession()
+    await session.switchAccountTo('B')
+    const file = join(accounts, 'switch-history.json')
+    assert.ok(existsSync(file), '历史文件应该被创建')
+    const history = JSON.parse(readFileSync(file, 'utf8'))
+    assert.equal(history[0].to, 'B')
+    assert.equal(history[0].from, 'A')
   })
 
   it('最近判定是拦截 → 仍然拒绝切号，且不动现场', async () => {

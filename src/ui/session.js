@@ -29,6 +29,8 @@ import {
   readAccountUuid,
   matchLiveAccount,
   readCurrentAccount,
+  readSwitchHistory,
+  appendSwitchHistory,
   assertAccountName,
   recoverInterruptedSwitch,
   removeAccount,
@@ -1035,6 +1037,8 @@ function resolveAppUserModelId() {
       accountsDir: accountsBase,
       current: liveName ?? recorded,
       liveMatched,
+      // 切号历史（新的在前）：界面用它给账号打顺序标签、列出最近几次切换。
+      history: readSwitchHistory(accountsBase),
       accounts,
     }
   }
@@ -1518,6 +1522,8 @@ function resolveAppUserModelId() {
         },
       })
       writeCurrentAccount(accountsBase, name)
+      // 记一笔切号历史：谁 → 谁、什么时候。界面据此打顺序标签。
+      appendSwitchHistory(accountsBase, { from: current ?? undefined, to: name })
       pushLog(
         'info',
         `已切换到账号 ${name}`,

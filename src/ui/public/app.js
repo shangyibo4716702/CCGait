@@ -973,6 +973,15 @@ function renderAccounts(data) {
   }
 
   const accounts = list(data.accounts)
+  // 切换顺序：按历史里"最近一次作为目标出现"的先后给账号编号，1 = 刚切过的那个。
+  const history = list(data.history)
+  const orderByAccount = new Map()
+  const lastSwitchAt = new Map()
+  for (const item of history) {
+    if (!item?.to) continue
+    if (!lastSwitchAt.has(item.to)) lastSwitchAt.set(item.to, item.at)
+    if (!orderByAccount.has(item.to)) orderByAccount.set(item.to, orderByAccount.size + 1)
+  }
   sub.textContent = data.current ? `当前 ${data.current}` : '未记录'
   host.replaceChildren()
 
@@ -1017,6 +1026,19 @@ function renderAccounts(data) {
           : '存档不完整',
     )
     head.append(name, status)
+
+    // 顺序标签：#1 是最近一次切过去的账号，往后按时间倒推。
+    const order = orderByAccount.get(account.name)
+    if (order) {
+      const badge = el('span', order === 1 ? 'account-badge is-recent' : 'account-badge', `#${order}`)
+      const at = lastSwitchAt.get(account.name)
+      const when = at ? new Date(at) : null
+      badge.title =
+        order === 1
+          ? `最近一次切到的账号${when && !Number.isNaN(when.getTime()) ? `：${when.toLocaleString()}` : ''}`
+          : `第 ${order} 近切到过${when && !Number.isNaN(when.getTime()) ? `：${when.toLocaleString()}` : ''}`
+      head.append(badge)
+    }
 
     // 同一个 Claude 账号存了多份：标出来，否则会被当成几个不同账号。
     if (list(account.sameAccountAs).length > 0) {
@@ -1116,6 +1138,20 @@ function renderAccounts(data) {
     })
 
     host.append(row)
+  }
+
+  // 切换历史：谁 → 谁、什么时候。新的在前，只列最近几条，避免侧栏被撑长。
+  if (history.length > 0) {
+    const block = el('div', 'switch-history')
+    block.append(el('div', 'switch-history-title', '切换历史'))
+    for (const item of history.slice(0, 6)) {
+      const when = new Date(item.at)
+      const time = Number.isNaN(when.getTime()) ? '' : when.toLocaleString()
+      block.append(
+        el('div', 'switch-history-row', `${item.from ?? '—'} → ${item.to}${time ? ` · ${time}` : ''}`),
+      )
+    }
+    host.append(block)
   }
 }
 

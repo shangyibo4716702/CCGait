@@ -22,6 +22,9 @@ import {
   recoverInterruptedSwitch,
   saveAccount,
   switchAccount,
+  readSwitchHistory,
+  appendSwitchHistory,
+  switchHistoryPath,
 } from '../src/accounts.js'
 
 const tempDirs = []
@@ -619,5 +622,39 @@ describe('整目录一次复制（robocopy 分支）', () => {
     assert.equal(readFileSync(join(profile, 'Preferences'), 'utf8'), 'b-pref')
     // 缓存目录不属于身份条目：既不被存档，也不该被搬走
     assert.equal(readFileSync(join(profile, 'Code Cache', 'x'), 'utf8'), 'cache')
+  })
+})
+
+describe('切号历史', () => {
+  it('新的在前，缺 from 也能记', () => {
+    const root = tempDir()
+    const dir = join(root, 'accounts')
+    appendSwitchHistory(dir, { from: 'A', to: 'B', at: '2026-11-02T10:00:00.000Z' })
+    appendSwitchHistory(dir, { to: 'C', at: '2026-11-02T11:00:00.000Z' })
+    const history = readSwitchHistory(dir)
+    assert.equal(history.length, 2)
+    assert.equal(history[0].to, 'C')
+    assert.equal(history[0].from, undefined)
+    assert.equal(history[1].to, 'B')
+  })
+
+  it('超过上限就截断，不无限增长', () => {
+    const root = tempDir()
+    const dir = join(root, 'accounts')
+    for (let i = 0; i < 8; i += 1) appendSwitchHistory(dir, { to: `A${i}` }, { limit: 5 })
+    const history = readSwitchHistory(dir)
+    assert.equal(history.length, 5)
+    assert.equal(history[0].to, 'A7')
+  })
+
+  it('文件坏掉或不存在时返回空数组，不抛错', () => {
+    const root = tempDir()
+    const dir = join(root, 'accounts')
+    mkdirSync(dir, { recursive: true })
+    assert.deepEqual(readSwitchHistory(dir), [])
+    writeFileSync(switchHistoryPath(dir), '{not json')
+    assert.deepEqual(readSwitchHistory(dir), [])
+    writeFileSync(switchHistoryPath(dir), JSON.stringify([{ to: '' }, { to: 'B', at: 'x' }, null]))
+    assert.deepEqual(readSwitchHistory(dir).map((item) => item.to), ['B'])
   })
 })
