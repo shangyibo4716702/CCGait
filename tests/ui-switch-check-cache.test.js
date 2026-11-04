@@ -61,7 +61,7 @@ function makeSession({ allow = true } = {}) {
         environment: {},
       }
     },
-    killClaudeProcessesByKind: async () => 0,
+    killClaudeProcessesByKind: async () => [],
     listClaudeProcesses: async () => [],
     accountsRoot: () => accounts,
     readGuardCheck: () => null,

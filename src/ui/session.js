@@ -789,7 +789,7 @@ function resolveAppUserModelId() {
    * 再调 checkNow 就会等一个由自己占用的队列 —— 直接死锁（实测：点按钮后界面一直
    * 停在"检测中…"，进程永不返回）。所有"在队列里还要检测"的场景都必须走 Internal。
    */
-  const checkInternal = async () => {
+  const checkInternal = async ({ silent = false } = {}) => {
     try {
       const result = await deps.runChecks(getConfig())
       lastCheck = {
@@ -807,12 +807,14 @@ function resolveAppUserModelId() {
       }
       lastCheckAt = Date.now()
       lastError = undefined
-      pushLog(
-        result.verdict.allow ? 'ok' : 'block',
-        result.verdict.allow ? '检测通过：环境命中白名单' : '检测未通过',
-        result.verdict.blockedBy.map((item) => item.title).join('；') || undefined,
-      )
-      emit({ type: 'check', check: lastCheck })
+      if (!silent) {
+        pushLog(
+          result.verdict.allow ? 'ok' : 'block',
+          result.verdict.allow ? '检测通过：环境命中白名单' : '检测未通过',
+          result.verdict.blockedBy.map((item) => item.title).join('；') || undefined,
+        )
+        emit({ type: 'check', check: lastCheck })
+      }
       return lastCheck
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error)
@@ -822,6 +824,25 @@ function resolveAppUserModelId() {
   }
 
   const checkNow = () => serialize(checkInternal)
+
+  /**
+   * 后台预热判定（不写日志、不推事件）。
+   *
+   * 账号面板每 8 秒轮询一次 /api/accounts，顺手在这里保证"最近判定"不超过 30 秒。
+   * 这样切号时手里永远有一份够新的结论 —— 闸门开着时本来就每 10 秒更新一次，
+   * 闸门没开时也能把 10 秒的等待挪到后台，用户点下去就是秒切。
+   */
+  let warmPromise = null
+  const warmCheck = () => {
+    if (warmPromise) return warmPromise
+    if (lastCheck && Date.now() - lastCheckAt <= 30_000) return Promise.resolve(lastCheck)
+    warmPromise = checkInternal({ silent: true })
+      .catch(() => null)
+      .finally(() => {
+        warmPromise = null
+      })
+    return warmPromise
+  }
 
   /**
    * 拿一份"够新"的判定：最近 maxAgeMs 内有过结果就直接用，否则重跑一次完整检测。
@@ -838,6 +859,11 @@ function resolveAppUserModelId() {
         `${Math.max(0, Math.round((Date.now() - lastCheckAt) / 1000))} 秒前判定：${lastCheck.allow ? '放行' : '拦截'}`,
       )
       return lastCheck
+    }
+    // 后台已经在预热了：等它，不要并发再跑一遍完整探测。
+    if (warmPromise) {
+      const warmed = await warmPromise
+      if (warmed) return warmed
     }
     return checkInternal()
   }
@@ -984,6 +1010,8 @@ function resolveAppUserModelId() {
   const resolveProfile = () => deps.locateDesktopProfile()
 
   const readAccountsState = () => {
+    // 面板每次轮询都顺手把判定预热掉，切号时就不用现等 10 秒。
+    warmCheck()
     const profile = resolveProfile()
     const recorded = readCurrentAccount(accountsBase)
     const accounts = listAccounts(accountsBase)
@@ -1430,11 +1458,22 @@ function resolveAppUserModelId() {
       return { ...result, ...readAccountsState() }
     })
 
-  const waitForDesktopExit = async () => {
-    for (let i = 0; i < 40; i += 1) {
+  /**
+   * 等 Desktop 真正退干净。
+   *
+   * 已知 pid 时不再反复跑进程枚举（本机实测一次 1.1 秒，轮询几次就是好几秒），
+   * 直接把 `process.kill(pid, 0)` 打在已知 pid 上，50ms 一轮，几乎是实时的。
+   */
+  const waitForDesktopExit = async (pids = []) => {
+    const known = (Array.isArray(pids) ? pids : []).filter((pid) => Number.isInteger(pid) && pid > 0)
+    if (known.length === 0) {
+      // 没有已知 pid：说明杀之前就没在跑，确认一次就够。
       const still = (await deps.listClaudeProcesses()).filter((item) => item.kind === 'desktop')
-      if (still.length === 0) return true
-      await new Promise((resolve) => setTimeout(resolve, 250))
+      return still.length === 0
+    }
+    for (let i = 0; i < 200; i += 1) {
+      if (known.every((pid) => !processAlive(pid))) return true
+      await new Promise((resolve) => setTimeout(resolve, 50))
     }
     return false
   }
@@ -1604,7 +1643,7 @@ function resolveAppUserModelId() {
         // 用户明确选择"直接结束进程"：切号必须独占 profile 里的文件。
         killProcesses: async () => {
           const killed = await deps.killClaudeProcessesByKind('desktop')
-          const exited = await waitForDesktopExit()
+          const exited = await waitForDesktopExit(killed.map((item) => item.pid))
           return { killed, exited }
         },
       })
