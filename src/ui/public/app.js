@@ -1005,8 +1005,7 @@ function renderAccounts(data) {
     // 服务端，本地只在特定时机缓存，所以有些存档就是没有邮箱（实测扫描 25 个存储
     // 文件、两种编码，0 命中）。uuid 至少能唯一区分账号，字母名字只能看出"我们给它
     // 起了什么名"，用户没法据此认出是谁。
-    const shortUuid = account.uuid ? account.uuid.slice(0, 8) : undefined
-    const label = account.email ?? (shortUuid ? `账号 ${shortUuid}` : account.name)
+    const label = accountDisplayLabel(account)
     if (account.fullName) row.title = account.fullName
 
     const head = el('div', 'account-head')
@@ -1141,18 +1140,30 @@ function renderAccounts(data) {
   }
 
   // 切换历史：谁 → 谁、什么时候。新的在前，只列最近几条，避免侧栏被撑长。
+  //
+  // 历史里存的是本地标签（A/B/C 这种自动起的名字），直接显示用户根本认不出是谁 ——
+  // 这里换成账号行用的同一套显示名：邮箱优先，其次 uuid 前 8 位，最后才退回标签。
   if (history.length > 0) {
+    const labelByName = new Map()
+    for (const account of accounts) labelByName.set(account.name, accountDisplayLabel(account))
     const block = el('div', 'switch-history')
     block.append(el('div', 'switch-history-title', '切换历史'))
     for (const item of history.slice(0, 6)) {
       const when = new Date(item.at)
       const time = Number.isNaN(when.getTime()) ? '' : when.toLocaleString()
-      block.append(
-        el('div', 'switch-history-row', `${item.from ?? '—'} → ${item.to}${time ? ` · ${time}` : ''}`),
-      )
+      const from = item.from ? (labelByName.get(item.from) ?? item.from) : '—'
+      const to = labelByName.get(item.to) ?? item.to
+      block.append(el('div', 'switch-history-row', `${from} → ${to}${time ? ` · ${time}` : ''}`))
     }
     host.append(block)
   }
+}
+
+/** 账号的显示名：邮箱 > uuid 前 8 位 > 本地标签。列表和切换历史共用一套。 */
+function accountDisplayLabel(account) {
+  if (account?.email) return account.email
+  if (account?.uuid) return `账号 ${account.uuid.slice(0, 8)}`
+  return account?.name ?? ''
 }
 
 /** 细进度条：标签 + 3px 轨道 + 百分比。≥80% 变红提示快到顶。 */
