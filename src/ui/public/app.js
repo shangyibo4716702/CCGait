@@ -1011,7 +1011,8 @@ function renderAccounts(data) {
     // 文件、两种编码，0 命中）。uuid 至少能唯一区分账号，字母名字只能看出"我们给它
     // 起了什么名"，用户没法据此认出是谁。
     const label = accountDisplayLabel(account)
-    if (account.fullName) row.title = account.fullName
+    // 侧栏窄，邮箱会被截断：整行都挂上完整信息，悬停能看全。
+    row.title = [account.fullName, label, account.name].filter(Boolean).join(' · ')
 
     const head = el('div', 'account-head')
     // 空白账号没有邮箱也没有 uuid，用本地名字当标题就够了。
@@ -1158,7 +1159,11 @@ function renderAccounts(data) {
       const time = Number.isNaN(when.getTime()) ? '' : when.toLocaleString()
       const from = item.from ? (labelByName.get(item.from) ?? item.from) : '—'
       const to = labelByName.get(item.to) ?? item.to
-      block.append(el('div', 'switch-history-row', `${from} → ${to}${time ? ` · ${time}` : ''}`))
+      const text = `${from} → ${to}${time ? ` · ${time}` : ''}`
+      const row = el('div', 'switch-history-row', text)
+      // 侧栏窄，长邮箱会被省略号截断：整行文字挂到 title 上，悬停即可看全。
+      row.title = text
+      block.append(row)
     }
     host.append(block)
   }
@@ -1625,7 +1630,9 @@ function renderQuota(data) {
   for (const row of rows) {
     const item = el('div', 'quota-item')
     const head = el('div', 'quota-head')
-    head.append(el('span', 'quota-name', row.label || row.name))
+    const nameNode = el('span', 'quota-name', row.label || row.name)
+    nameNode.title = row.label || row.name
+    head.append(nameNode)
     if (row.current) head.append(el('span', 'account-badge is-recent', '当前'))
     item.append(head)
 
@@ -1677,13 +1684,10 @@ function renderQuota(data) {
       const result = entry.resetAt
         ? `重置 ${new Date(entry.resetAt).toLocaleTimeString()}（${entry.confidence === 'high' ? '±10 分钟内' : '粗估'}）`
         : '无结论'
-      details.append(
-        el(
-          'div',
-          'quota-audit-row',
-          `${time} · ${entry.account} · ${result} · ${safe} · ${entry.queried ? '已请求' : '本地推算，未发请求'}`,
-        ),
-      )
+      const text = `${time} · ${entry.account} · ${result} · ${safe} · ${entry.queried ? '已请求' : '本地推算，未发请求'}`
+      const row = el('div', 'quota-audit-row', text)
+      row.title = text
+      details.append(row)
     }
     host.append(details)
   }
