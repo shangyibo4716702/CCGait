@@ -1894,3 +1894,79 @@ button.action.is-uu-off:hover:not(:disabled) {
   background: #8f1c12;
   border-color: #8f1c12;
 }
+
+/* ---------------------------------------------------------------- 额度面板 */
+
+.quota-list {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line, #e5e5e5);
+}
+
+.quota-title {
+  margin-bottom: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted-text, #6b6b6b);
+}
+
+.quota-item {
+  margin-bottom: 8px;
+}
+
+.quota-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.quota-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quota-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted-text, #6b6b6b);
+}
+
+.quota-countdown {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--text, #111);
+}
+
+.quota-tag.is-unknown {
+  color: var(--danger-text);
+}
+
+.quota-tag.is-idle {
+  color: var(--ok-text);
+}
+
+.quota-meta {
+  font-size: 10px;
+  color: var(--muted-text, #6b6b6b);
+}
+
+.quota-audit {
+  margin-top: 6px;
+  font-size: 11px;
+}
+
+.quota-audit-title {
+  cursor: pointer;
+  color: var(--muted-text, #6b6b6b);
+}
+
+.quota-audit-row {
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--muted-text, #6b6b6b);
+}

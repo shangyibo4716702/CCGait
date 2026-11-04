@@ -124,7 +124,12 @@ async function refresh() {
   try {
     // 账号面板也一起刷：它在侧栏常驻，用户改完登录态/切完号回来看到的是屏幕上的旧值，
     // 必须关掉页面重开才更新（实测被投诉）。这里并行拉，互不阻塞。
-    const [next] = await Promise.all([api('/api/status'), refreshAccounts(), refreshProxyPanel()])
+    const [next] = await Promise.all([
+      api('/api/status'),
+      refreshAccounts(),
+      refreshProxyPanel(),
+      refreshQuota(),
+    ])
     status = next
     checkBuildMatch()
     render()
@@ -1601,6 +1606,112 @@ async function toggleUuDirect() {
   }
 }
 
+/**
+ * 5 小时额度面板。
+ *
+ * 数据全部来自本地采样（plan-usage-history.json），不发起任何网络请求：
+ * 查准要用 Claude 的登录态，那是动它自身。所以这里把"推算 + 误差"写清楚，
+ * 不让界面看起来像实测。
+ */
+function renderQuota(data) {
+  const host = document.querySelector('#quota-list')
+  if (!host) return
+  host.replaceChildren()
+
+  const rows = list(data?.accounts)
+  if (rows.length === 0) return
+  host.append(el('div', 'quota-title', '5 小时额度'))
+
+  for (const row of rows) {
+    const item = el('div', 'quota-item')
+    const head = el('div', 'quota-head')
+    head.append(el('span', 'quota-name', row.label || row.name))
+    if (row.current) head.append(el('span', 'account-badge is-recent', '当前'))
+    item.append(head)
+
+    const line = el('div', 'quota-line')
+    if (row.active && row.resetAt) {
+      const countdown = el('span', 'quota-countdown')
+      countdown.dataset.resetAt = row.resetAt
+      countdown.textContent = formatRemaining(Date.parse(row.resetAt) - Date.now())
+      line.append(el('span', 'quota-tag', '重置'), countdown)
+      if (typeof row.weeklyPercent === 'number') {
+        line.append(el('span', 'quota-week', `周 ${row.weeklyPercent}%`))
+      }
+    } else if (row.confidence === 'unknown') {
+      line.append(el('span', 'quota-tag is-unknown', '重置时间无法推算'))
+    } else {
+      line.append(el('span', 'quota-tag is-idle', '窗口未开始（可随时计时）'))
+    }
+    item.append(line)
+
+    const notes = []
+    if (row.active) {
+      if (row.confidence === 'high') notes.push('推算 ±10 分钟内')
+      else if (row.confidence === 'estimate') notes.push(`推算 ±${Math.round((row.uncertaintyMs ?? 0) / 60000)} 分钟`)
+      else notes.push('采样不足')
+    }
+    if (row.stale) notes.push('采样已过期')
+    if (row.sampledAt) notes.push(`采样 ${new Date(row.sampledAt).toLocaleTimeString()}`)
+    if (notes.length > 0) item.append(el('div', 'quota-meta', notes.join(' · ')))
+
+    host.append(item)
+  }
+
+  const audit = list(data?.audit)
+  if (audit.length > 0) {
+    const details = el('details', 'quota-audit')
+    const summary = el('summary', 'quota-audit-title', `额度记录（${audit.length}）`)
+    details.append(summary)
+    for (const entry of audit.slice(0, 8)) {
+      const when = new Date(entry.at)
+      const time = Number.isNaN(when.getTime()) ? '' : when.toLocaleString()
+      const safe =
+        entry.environmentSafe === true ? '环境安全' : entry.environmentSafe === false ? '环境不安全' : '环境未知'
+      const result = entry.resetAt
+        ? `重置 ${new Date(entry.resetAt).toLocaleTimeString()}（${entry.confidence === 'high' ? '±10 分钟内' : '粗估'}）`
+        : '无结论'
+      details.append(
+        el(
+          'div',
+          'quota-audit-row',
+          `${time} · ${entry.account} · ${result} · ${safe} · ${entry.queried ? '已请求' : '本地推算，未发请求'}`,
+        ),
+      )
+    }
+    host.append(details)
+  }
+}
+
+/** 毫秒 → 3:12:44。 */
+function formatRemaining(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '—'
+  const total = Math.floor(ms / 1000)
+  const days = Math.floor(total / 86400)
+  const hours = Math.floor((total % 86400) / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const seconds = total % 60
+  const pad = (value) => String(value).padStart(2, '0')
+  return days > 0 ? `${days}天 ${pad(hours)}:${pad(minutes)}` : `${hours}:${pad(minutes)}:${pad(seconds)}`
+}
+
+/** 每秒把倒计时往前推一秒；不重新请求后端。 */
+function tickCountdowns() {
+  for (const node of document.querySelectorAll('[data-reset-at]')) {
+    const at = Date.parse(node.dataset.resetAt)
+    if (Number.isNaN(at)) continue
+    node.textContent = formatRemaining(at - Date.now())
+  }
+}
+
+async function refreshQuota() {
+  try {
+    renderQuota(await api('/api/quota'))
+  } catch {
+    // 读不到就保持上一屏
+  }
+}
+
 async function refreshAccounts() {
   try {
     renderAccounts(await api('/api/accounts'))
@@ -2263,6 +2374,9 @@ setInterval(() => {
   // 本机回环请求很便宜，8 秒一次可以接受。
   void refresh()
 }, 8_000)
+
+// 倒计时每秒走一格，纯本地计算，不打后端。
+setInterval(tickCountdowns, 1_000)
 
 /**
  * 侧栏导航：滚动时高亮当前所在面板（对齐 MoA Studio 的导航态）。

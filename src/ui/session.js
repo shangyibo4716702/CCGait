@@ -65,6 +65,12 @@ import {
 } from '../proxy-mode.js'
 import { verifyClaudeRouting } from '../proxy-connections.js'
 import { repairSystemDns } from '../win/system-dns.js'
+import {
+  appendQuotaAudit,
+  estimateFiveHourWindow,
+  parseUsageSamples,
+  readQuotaAudit,
+} from '../quota.js'
 import { startupStatus } from '../startup.js'
 import { isWfpBlocking, listWfpHosts, readWfpPid, startWfpBlock, stopWfpBlock } from '../win/wfp.js'
 
@@ -1302,6 +1308,70 @@ function resolveAppUserModelId() {
       return outcome
     })
 
+  /**
+   * 5 小时额度的现状：每个账号的窗口推算 + 重置倒计时 + 审计记录。
+   *
+   * 只读本地 `plan-usage-history.json`，**不发起任何网络请求** —— 查准需要 Claude
+   * 的登录态，那是动它自身；这里宁可报"推算 + 误差范围"，也不偷偷用它的凭据。
+   * 每次结论变化都记一条审计，写明当时环境是否安全、有没有真的发请求。
+   */
+  const buildQuotaState = () => {
+    const profile = resolveProfile()
+    const current = readCurrentAccount(accountsBase)
+    const environmentSafe = lastCheck ? lastCheck.allow === true : null
+    const rows = []
+
+    for (const account of listAccounts(accountsBase)) {
+      const dir = profile && account.name === current ? profile : accountDir(accountsBase, account.name)
+      let samples = []
+      try {
+        samples = parseUsageSamples(readFileSync(join(dir, 'plan-usage-history.json'), 'utf8'))
+      } catch {
+        // 没有采样文件（空白账号、还没用过）就当没有数据。
+      }
+      const estimate = estimateFiveHourWindow(samples)
+      const resetIso = typeof estimate.resetAt === 'number' ? new Date(estimate.resetAt).toISOString() : null
+
+      appendQuotaAudit(accountsBase, {
+        account: account.name,
+        // 这条链路上没有外部请求：写死 queried=false，审计里不冒充"查过"。
+        queried: false,
+        source: 'plan-usage-history',
+        environmentSafe,
+        resetAt: resetIso,
+        confidence: estimate.confidence,
+        percent: typeof estimate.percent === 'number' ? estimate.percent : null,
+        note: estimate.reason,
+      })
+
+      rows.push({
+        name: account.name,
+        label: account.email ?? (account.uuid ? `账号 ${account.uuid.slice(0, 8)}` : account.name),
+        current: account.name === current,
+        empty: Boolean(account.empty),
+        percent: typeof estimate.percent === 'number' ? estimate.percent : null,
+        weeklyPercent: account.usage?.weeklyPercent ?? null,
+        sampledAt: estimate.sampledAt ?? null,
+        active: estimate.active === true,
+        confidence: estimate.confidence,
+        resetAt: resetIso,
+        remainingMs: typeof estimate.remainingMs === 'number' ? estimate.remainingMs : null,
+        uncertaintyMs: estimate.uncertaintyMs ?? null,
+        stale: estimate.stale === true,
+        reason: estimate.reason,
+      })
+    }
+
+    return {
+      environmentSafe,
+      checkedAt: lastCheck?.at ?? null,
+      accounts: rows,
+      audit: readQuotaAudit(accountsBase).slice(0, 20),
+    }
+  }
+
+  const getQuotaState = () => serialize(async () => buildQuotaState())
+
   const getAccounts = () => serialize(async () => readAccountsState())
 
   /**
@@ -1669,6 +1739,7 @@ function resolveAppUserModelId() {
     setProxyMode,
     setUuDirect,
     ensureSystemDns,
+    getQuotaState,
     getAccounts,
     saveCurrentAccount,
     createEmptyAccountFor,

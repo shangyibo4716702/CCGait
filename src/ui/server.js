@@ -261,6 +261,11 @@ export function createUiServer({ session, logger, token = randomBytes(24).toStri
         return
       }
 
+      if (path === '/api/quota' && request.method === 'GET') {
+        sendJson(response, 200, await session.getQuotaState())
+        return
+      }
+
       if (request.method !== 'POST') {
         sendJson(response, 405, { error: '只支持 GET / POST' })
         return
