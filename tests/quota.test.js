@@ -12,6 +12,9 @@ import {
   parseUsageSamples,
   quotaAuditPath,
   readQuotaAudit,
+  isExactReset,
+  detectResets,
+  measurePredictionError,
 } from '../src/quota.js'
 
 const tempDirs = []
@@ -147,5 +150,49 @@ describe('额度审计', () => {
     const path = quotaAuditPath(dir)
     assert.ok(path.endsWith('quota-audit.json'))
     assert.deepEqual(readQuotaAudit(dir, () => '{bad'), [])
+  })
+})
+
+describe('精确性门禁与真实重置', () => {
+  it('只有 measured / api 算精确，推算一律不算', () => {
+    assert.equal(isExactReset({ method: 'measured' }), true)
+    assert.equal(isExactReset({ method: 'api' }), true)
+    assert.equal(isExactReset({ method: 'zero-crossing' }), false)
+    assert.equal(isExactReset({ method: 'extrapolation' }), false)
+    assert.equal(isExactReset({ confidence: 'high' }), false, '高置信也只是推算')
+    assert.equal(isExactReset(null), false)
+  })
+
+  it('推算出来的窗口不会被当成精确', () => {
+    const out = estimateFiveHourWindow([sample(0, 0), sample(6, 2), sample(20, 9)], { now: T0 + 30 * MIN })
+    assert.equal(isExactReset(out), false)
+  })
+
+  it('从采样里找出真实重置区间', () => {
+    const resets = detectResets([sample(0, 0), sample(10, 40), sample(20, 0), sample(30, 5)])
+    assert.equal(resets.length, 1)
+    assert.equal(resets[0].lowerAt, T0 + 10 * MIN)
+    assert.equal(resets[0].upperAt, T0 + 20 * MIN)
+    assert.equal(resets[0].spanMs, 10 * MIN)
+    assert.equal(resets[0].fromPercent, 40)
+  })
+
+  it('预测落在真实区间内 = 命中', () => {
+    const resets = detectResets([sample(0, 10), sample(20, 0)])
+    const hit = measurePredictionError({ resetAt: T0 + 15 * MIN }, resets)
+    assert.equal(hit.hit, true)
+    assert.equal(hit.errorMs, 0)
+  })
+
+  it('预测偏出区间会算出偏差毫秒数', () => {
+    const resets = detectResets([sample(0, 10), sample(20, 0)])
+    const miss = measurePredictionError({ resetAt: T0 + 27 * MIN }, resets)
+    assert.equal(miss.hit, false)
+    assert.equal(miss.errorMs, 7 * MIN)
+  })
+
+  it('没有真实重置可对照时返回 null', () => {
+    assert.equal(measurePredictionError({ resetAt: T0 }, []), null)
+    assert.equal(measurePredictionError(null, detectResets([sample(0, 0)])), null)
   })
 })

@@ -1647,9 +1647,15 @@ function renderQuota(data) {
 
     const notes = []
     if (row.active) {
-      if (row.confidence === 'high') notes.push('推算 ±10 分钟内')
-      else if (row.confidence === 'estimate') notes.push(`推算 ±${Math.round((row.uncertaintyMs ?? 0) / 60000)} 分钟`)
+      // 精确性写清楚：采样推算出来的时间不能用来触发自动发送，界面上不能含糊。
+      if (row.exact) notes.push('精确来源')
+      else if (row.confidence === 'high') notes.push('推算 ±10 分钟内 · 不能用于自动发送')
+      else if (row.confidence === 'estimate')
+        notes.push(`推算 ±${Math.round((row.uncertaintyMs ?? 0) / 60000)} 分钟 · 不能用于自动发送`)
       else notes.push('采样不足')
+    }
+    if (row.lastReset) {
+      notes.push(`上次真实重置 ${new Date(row.lastReset.upperAt).toLocaleTimeString()}`)
     }
     if (row.stale) notes.push('采样已过期')
     if (row.sampledAt) notes.push(`采样 ${new Date(row.sampledAt).toLocaleTimeString()}`)

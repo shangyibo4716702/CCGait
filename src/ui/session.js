@@ -67,7 +67,9 @@ import { verifyClaudeRouting } from '../proxy-connections.js'
 import { repairSystemDns } from '../win/system-dns.js'
 import {
   appendQuotaAudit,
+  detectResets,
   estimateFiveHourWindow,
+  isExactReset,
   parseUsageSamples,
   readQuotaAudit,
 } from '../quota.js'
@@ -1331,6 +1333,10 @@ function resolveAppUserModelId() {
       }
       const estimate = estimateFiveHourWindow(samples)
       const resetIso = typeof estimate.resetAt === 'number' ? new Date(estimate.resetAt).toISOString() : null
+      // 采样里真实发生过的重置：给界面一个"上次实际几点重置"的参照，
+      // 也是以后检验推算准不准的原始证据。
+      const resets = detectResets(samples)
+      const lastReset = resets.length > 0 ? resets[resets.length - 1] : null
 
       appendQuotaAudit(accountsBase, {
         account: account.name,
@@ -1354,6 +1360,17 @@ function resolveAppUserModelId() {
         sampledAt: estimate.sampledAt ?? null,
         active: estimate.active === true,
         confidence: estimate.confidence,
+        // 精确性门禁：只有 measured（自己发的）和 api（接口给的）算精确。
+        // 采样推算一律为 false —— 自动发送只能建立在真实来源上。
+        exact: isExactReset(estimate),
+        method: estimate.method ?? null,
+        lastReset: lastReset
+          ? {
+              lowerAt: new Date(lastReset.lowerAt).toISOString(),
+              upperAt: new Date(lastReset.upperAt).toISOString(),
+              spanMs: lastReset.spanMs,
+            }
+          : null,
         resetAt: resetIso,
         remainingMs: typeof estimate.remainingMs === 'number' ? estimate.remainingMs : null,
         uncertaintyMs: estimate.uncertaintyMs ?? null,

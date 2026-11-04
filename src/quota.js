@@ -248,3 +248,78 @@ export function appendQuotaAudit(
   }
   return next
 }
+
+/* ------------------------------------------------- 精确性与实测误差 */
+
+/**
+ * 只有这两种来源算"精确"，才允许触发自动发送。
+ *
+ * - `measured`：CCGait 自己发的那条消息，窗口起点是它记的，精确到秒。
+ * - `api`：usage 接口返回的 `resets_at`，服务端给的真值。
+ *
+ * 采样推算（zero-crossing / extrapolation）一律不算 —— 它只能用来显示，
+ * 不能用来决定"什么时候替你发消息"。这条是硬规则，不给开关。
+ */
+export function isExactReset(window) {
+  return window?.method === 'api' || window?.method === 'measured'
+}
+
+/**
+ * 从采样里找"真实发生过的重置"：上一条非零、这一条是 0。
+ *
+ * 返回的是一段区间而不是一个点：重置发生在两次采样之间，只剩这个范围。
+ * 采样越密，区间越窄。用它来回头检验我们的推算准不准。
+ */
+export function detectResets(samples = [], { windowMs = FIVE_HOUR_WINDOW_MS } = {}) {
+  const rows = (Array.isArray(samples) ? samples : [])
+    .map((item) => ({
+      t: typeof item?.t === 'number' ? item.t : undefined,
+      fh: typeof item?.fh === 'number' ? item.fh : typeof item?.u?.fh === 'number' ? item.u.fh : undefined,
+    }))
+    .filter((item) => item.t !== undefined && item.fh !== undefined)
+    .sort((a, b) => a.t - b.t)
+
+  const resets = []
+  for (let i = 1; i < rows.length; i += 1) {
+    if (rows[i].fh === 0 && rows[i - 1].fh > 0) {
+      resets.push({
+        lowerAt: rows[i - 1].t,
+        upperAt: rows[i].t,
+        spanMs: rows[i].t - rows[i - 1].t,
+        fromPercent: rows[i - 1].fh,
+      })
+    }
+  }
+  // windowMs 目前用不上，保留参数是为了将来按窗口长度做筛选。
+  void windowMs
+  return resets
+}
+
+/**
+ * 用真实重置区间检验一次推算：预测的重置时刻落在区间里就是命中。
+ *
+ * 返回 `null` 表示没有可对照的真实重置（采样不够）。
+ */
+export function measurePredictionError(prediction, resets = []) {
+  if (!prediction || typeof prediction.resetAt !== 'number' || resets.length === 0) return null
+  // 找离预测最近的那次真实重置
+  let best = null
+  for (const reset of resets) {
+    const distance =
+      prediction.resetAt < reset.lowerAt
+        ? reset.lowerAt - prediction.resetAt
+        : prediction.resetAt > reset.upperAt
+          ? prediction.resetAt - reset.upperAt
+          : 0
+    if (!best || distance < best.distance) best = { reset, distance }
+  }
+  if (!best) return null
+  return {
+    lowerAt: best.reset.lowerAt,
+    upperAt: best.reset.upperAt,
+    spanMs: best.reset.spanMs,
+    // 落在区间外多少毫秒；0 表示预测落在真实区间内
+    errorMs: best.distance,
+    hit: best.distance === 0,
+  }
+}
