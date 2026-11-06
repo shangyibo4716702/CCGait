@@ -1383,14 +1383,14 @@ function renderProxyPanel(data) {
   const button = document.querySelector('#proxy-fix')
   if (!host || !sub || !button) return
 
-  // UU 远程直连：已符合=绿（点它是撤销），不符合=红（点它是写入）。
-  const uuButton = document.querySelector('#proxy-uu')
+  // 远程软件直连（UU / ToDesk / 向日葵）：已符合=绿（点它是撤销），不符合=红（点它是写入）。
+  const uuButton = document.querySelector('#proxy-remote')
   if (uuButton) {
     const available = Boolean(data?.found)
-    const on = Boolean(data?.uuDirect)
+    const on = Boolean(data?.remoteDirect)
     uuButton.hidden = !available
     uuButton.disabled = false
-    uuButton.textContent = on ? 'UU 直连已开启' : 'UU 远程直连'
+    uuButton.textContent = on ? '远程直连已开启' : '远程软件直连'
     uuButton.classList.toggle('is-uu-on', on)
     uuButton.classList.toggle('is-uu-off', available && !on)
   }
@@ -1556,23 +1556,23 @@ async function switchProxyMode() {
 }
 
 /**
- * UU 远程直连开关。
+ * 远程软件直连开关（UU / ToDesk / 向日葵 / AweSun）。
  *
  * 开启时不只是写规则：全局模式会忽略所有规则，所以后端会顺手切到规则模式
  * （同样走内核自证）。这里把这一点明说，避免用户以为点了没反应。
  */
-async function toggleUuDirect() {
-  const button = document.querySelector('#proxy-uu')
+async function toggleRemoteDirect() {
+  const button = document.querySelector('#proxy-remote')
   if (!button || button.disabled) return
-  const enable = !proxyState?.uuDirect
+  const enable = !proxyState?.remoteDirect
   const confirmed = window.confirm(
     enable
-      ? '开启 UU 远程直连？\n\n' +
-          '· 本机 UU 进程、局域网网段（192.168/10/172.16）、UU 域名一律直连\n' +
+      ? '开启远程软件直连（UU / ToDesk / 向日葵）？\n\n' +
+          '· 这些软件的进程与域名、局域网网段（192.168/10/172.16）一律直连\n' +
           '· 当前是全局模式的话会同时切到规则模式 —— 全局模式忽略规则，不切等于没写\n' +
           '· 切模式会重启代理内核，网络中断几秒，并让内核自证 Claude 仍走代理\n\n' +
           '继续吗？'
-      : '撤销 UU 远程直连？\n\n' +
+      : '撤销远程软件直连？\n\n' +
           '· 会把刚写入的那组直连规则删掉，不改当前模式\n\n' +
           '继续吗？',
   )
@@ -1588,9 +1588,9 @@ async function toggleUuDirect() {
         'ok',
         enable
           ? result.switched
-            ? '已开启 UU 直连，并切到规则模式'
-            : '已开启 UU 直连'
-          : '已撤销 UU 直连',
+            ? '已开启远程直连，并切到规则模式'
+            : '已开启远程直连'
+          : '已撤销远程直连',
         enable
           ? result.switched
             ? '全局模式会忽略规则，所以一并切了；内核自证通过'
@@ -1603,7 +1603,7 @@ async function toggleUuDirect() {
     renderProxyPanel(result)
     void refresh()
   } catch (error) {
-    toast('error', enable ? '没有开启 UU 直连' : '没有撤销', error instanceof Error ? error.message : String(error))
+    toast('error', enable ? '没有开启远程直连' : '没有撤销', error instanceof Error ? error.message : String(error))
     void refreshProxyPanel()
   } finally {
     button.disabled = false
@@ -2339,8 +2339,8 @@ document.querySelector('#proxy-rule')?.addEventListener('click', () => {
   void switchProxyMode()
 })
 
-document.querySelector('#proxy-uu')?.addEventListener('click', () => {
-  void toggleUuDirect()
+document.querySelector('#proxy-remote')?.addEventListener('click', () => {
+  void toggleRemoteDirect()
 })
 
 document.querySelector('#account-create-empty')?.addEventListener('click', () => {

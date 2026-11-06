@@ -53,14 +53,14 @@ import {
   applyClashFix,
   applyClaudeRules,
   claudeRuleCoverage,
-  hasUuDirectRules,
+  hasRemoteDirectRules,
   judgeDnsUpstreams,
   judgeProxySettings,
   needsClashFix,
   probeProxyMode,
   readClashRules,
   readProxySettings,
-  setUuDirectRules,
+  setRemoteDirectRules,
   writeProxyMode,
 } from '../proxy-mode.js'
 import { verifyClaudeRouting } from '../proxy-connections.js'
@@ -575,8 +575,8 @@ function resolveAppUserModelId() {
     writeProxyMode: options.deps?.writeProxyMode ?? writeProxyMode,
     verifyClaudeRouting: options.deps?.verifyClaudeRouting ?? verifyClaudeRouting,
     repairSystemDns: options.deps?.repairSystemDns ?? repairSystemDns,
-    setUuDirectRules: options.deps?.setUuDirectRules ?? setUuDirectRules,
-    hasUuDirectRules: options.deps?.hasUuDirectRules ?? hasUuDirectRules,
+    setRemoteDirectRules: options.deps?.setRemoteDirectRules ?? setRemoteDirectRules,
+    hasRemoteDirectRules: options.deps?.hasRemoteDirectRules ?? hasRemoteDirectRules,
     restartProxyCore: options.deps?.restartProxyCore ?? restartProxyCore,
     accountsRoot: options.deps?.accountsRoot ?? accountsRoot,
     locateDesktopProfile: options.deps?.locateDesktopProfile ?? locateDesktopProfile,
@@ -1103,7 +1103,7 @@ function resolveAppUserModelId() {
       mode: probe.mode,
       settings,
       coverage,
-      uuDirect: deps.hasUuDirectRules(deps.readClashRules(probe.dir)),
+      remoteDirect: deps.hasRemoteDirectRules(deps.readClashRules(probe.dir)),
       issues,
       needsFix: deps.needsClashFix(settings) || Boolean(coverage && !coverage.ok),
     }
@@ -1275,7 +1275,7 @@ function resolveAppUserModelId() {
    * 全局模式下规则根本不生效，所以只写规则不够 —— 写了不切成规则模式，
    * UU 该被塞进代理还是被塞进去。这里两步一起做，切模式仍然走自证。
    */
-  const setUuDirect = (enable) =>
+  const setRemoteDirect = (enable) =>
     serialize(async () => {
       const probe = await deps.probeProxyMode()
       if (!probe.dir) throw new Error('没找到受支持的代理客户端配置，无法写入直连规则')
@@ -1287,7 +1287,7 @@ function resolveAppUserModelId() {
 
       // 撤销时不动模式：原来的模式是用户自己选的。
       if (enable === false) {
-        pushLog('info', '已撤销 UU 远程直连规则', '规则模式下内网与 UU 仍会由 GEOIP,PRIVATE 与 CN 分流直连')
+        pushLog('info', '已撤销远程软件直连规则', '规则模式下内网与这些软件仍会由 GEOIP,PRIVATE 与 CN 分流直连')
         emit({ type: 'status' })
         return { ok: true, enabled: false, ...(await readProxyFixStateInternal()) }
       }
@@ -1296,9 +1296,9 @@ function resolveAppUserModelId() {
       const switchResult = probe.mode === 'rule' ? null : await runProxyModeSwitch('rule')
       pushLog(
         'info',
-        '已写入 UU 远程直连规则',
+        '已写入远程软件直连规则',
         [
-          '本机 UU 进程、局域网网段、UU 域名一律直连',
+          'UU / ToDesk / 向日葵(AweSun) 的进程与域名、局域网网段一律直连',
           switchResult ? '已同时切到规则模式（全局模式忽略规则）' : '当前已是规则模式',
         ].join('；'),
       )
@@ -1793,7 +1793,7 @@ function resolveAppUserModelId() {
     getProxyFixState,
     fixClashSettings,
     setProxyMode,
-    setUuDirect,
+    setRemoteDirect,
     ensureSystemDns,
     getQuotaState,
     getAccounts,

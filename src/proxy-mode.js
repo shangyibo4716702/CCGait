@@ -1,6 +1,7 @@
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 /**
  * 代理模式检查：代理客户端是不是"全局模式"。
@@ -804,34 +805,63 @@ export function insertPrependRules(text, rules) {
 /* ------------------------------------------------------- UU 远程直连 */
 
 /**
- * UU 远程 / 内网一律直连。
+ * 远程软件 / 内网一律直连（UU 远程、ToDesk、向日葵 / AweSun / Oray）。
  *
  * 为什么需要专门的规则：全局模式下规则不生效，连 192.168.x.x 都会被塞进代理；
- * 而 UU 这类远程工具靠 UDP 打洞，绕一圈代理后 NAT 类型变了，打洞基本失败。
- * 这条规则把"本机进程 + 局域网 + UU 域名"整段摘出来直连。
+ * 而远程工具靠 UDP 打洞，绕一圈代理后 NAT 类型变了，打洞基本失败。
+ * 这条规则把"本机进程 + 局域网 + 官方域名"整段摘出来直连。
  *
- * 进程用正则而不是精确名：不同版本的 UU 客户端 exe 叫 uu.exe / UUClient.exe /
- * uu_remote.exe 不等，`^uu` 一把罩住。已用 `mihomo -t` 验证过内核认这两个规则类型。
+ * 进程用正则而不是精确名：各家客户端的 exe 名字随版本变（UU 的 uu.exe /
+ * UUClient.exe；ToDesk 的 ToDesk.exe / todesk-mcp.exe；向日葵家族有 AweSun.exe /
+ * awesun_guard.exe / OldAweSun.exe / SunloginClient.exe），按前缀/关键词一把罩住。
+ * 已用 `mihomo -t` 验证过内核认这两个规则类型。
  */
-export const UU_DIRECT_RULES = [
+export const REMOTE_DIRECT_RULES = [
+  // 网易 UU 远程
   'PROCESS-NAME-REGEX,(?i)^uu,DIRECT',
   'PROCESS-PATH-REGEX,(?i).*\\\\uu[^\\\\]*\\\\.exe,DIRECT',
   'DOMAIN-SUFFIX,uu.163.com,DIRECT',
   'DOMAIN-SUFFIX,uu.netease.com,DIRECT',
   'DOMAIN-SUFFIX,uu.126.net,DIRECT',
+  // ToDesk
+  'PROCESS-NAME-REGEX,(?i)^todesk,DIRECT',
+  'PROCESS-PATH-REGEX,(?i).*\\\\todesk\\\\[^\\\\]*\\\\.exe,DIRECT',
+  'DOMAIN-SUFFIX,todesk.com,DIRECT',
+  'DOMAIN-SUFFIX,todesk.cn,DIRECT',
+  'DOMAIN-SUFFIX,todesk.net,DIRECT',
+  // 向日葵 / AweSun / Oray
+  'PROCESS-NAME-REGEX,(?i)(awesun|sunlogin|oray),DIRECT',
+  'PROCESS-PATH-REGEX,(?i).*\\\\(awesun|sunlogin|oray)\\\\.*\\\\.exe,DIRECT',
+  'DOMAIN-SUFFIX,oray.com,DIRECT',
+  'DOMAIN-SUFFIX,oray.net,DIRECT',
+  'DOMAIN-SUFFIX,aweray.com,DIRECT',
+  // 局域网 / 运营商级 NAT
   'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve',
   'IP-CIDR,10.0.0.0/8,DIRECT,no-resolve',
   'IP-CIDR,172.16.0.0/12,DIRECT,no-resolve',
   'IP-CIDR,100.64.0.0/10,DIRECT,no-resolve',
 ]
 
-/** 当前生效规则里有没有 UU 直连那一组。 */
-export function hasUuDirectRules(rules = []) {
+/** 旧名：历史上只有 UU 一家，规则集后来扩成了全家桶。 */
+export const UU_DIRECT_RULES = REMOTE_DIRECT_RULES
+
+/**
+ * 直连规则是否**全部**在位。
+ *
+ * 必须用 every 而不是 some：规则集扩容后（新增 ToDesk / 向日葵），旧配置里只
+ * 有 UU 那几条，some 会误报"已开启"，按钮绿着但新软件照样被塞进代理。
+ */
+export function hasRemoteDirectRules(rules = []) {
   const list = rules.map((rule) => String(rule ?? '').trim())
-  return UU_DIRECT_RULES.some((rule) => list.includes(rule))
+  return REMOTE_DIRECT_RULES.every((rule) => list.includes(rule))
 }
 
-/** 从配置里删掉指定规则（U 撤销直连用）。 */
+/** 旧名兼容。 */
+export function hasUuDirectRules(rules = []) {
+  return hasRemoteDirectRules(rules)
+}
+
+/** 从配置里删掉指定规则（撤销直连用）。 */
 export function removeRulesFromConfig(text, rules) {
   const set = new Set(rules.map((rule) => String(rule).trim()))
   const lines = String(text ?? '').split(/\r?\n/)
@@ -853,8 +883,11 @@ export function removeRulesFromConfig(text, rules) {
  * 写入 / 撤销 UU 直连规则。
  *
  * 和 Claude 规则同一个落点：规则增强文件（订阅更新不覆盖）+ 生效配置（立刻生效）。
+ *
+ * 写入是**补差集**：规则集扩容后（旧配置里只有 UU 那几条），只把缺的补进去，
+ * 不重复写已有的 —— 否则每点一次按钮 rules 就多一份。
  */
-export function setUuDirectRules(
+export function setRemoteDirectRules(
   dir,
   enable,
   {
@@ -862,12 +895,22 @@ export function setUuDirectRules(
     readFile = (p) => readFileSync(p, 'utf8'),
     writeFile = (p, t) => writeFileSync(p, t),
     programData = process.env.ProgramData ?? 'C:\\ProgramData',
+    // 测试注入：模拟内核 -t 的行为，真实路径走 defaultValidateRun。
+    validateRun,
   } = {},
 ) {
   const effective = readClashRules(dir, { exists, readFile })
-  const present = hasUuDirectRules(effective)
+  const present = hasRemoteDirectRules(effective)
   if (enable === present) {
-    return { changed: false, enabled: present, reason: enable ? '已经写入过了' : '本来就没有' }
+    return { changed: false, enabled: present, reason: enable ? '已经全部在位' : '本来就没有' }
+  }
+
+  // 要写进文件的规则：开启时只补缺的；撤销时删整组。
+  const rulesToWrite = enable
+    ? REMOTE_DIRECT_RULES.filter((rule) => !effective.includes(rule))
+    : REMOTE_DIRECT_RULES
+  if (rulesToWrite.length === 0) {
+    return { changed: false, enabled: true, reason: '没有缺失的规则' }
   }
 
   const results = []
@@ -878,6 +921,7 @@ export function setUuDirectRules(
     if (file !== path) targets.push(file)
   }
 
+  const writes = []
   for (const file of targets) {
     let text
     try {
@@ -889,22 +933,38 @@ export function setUuDirectRules(
     // 三种改写函数的返回形状不一样，先归一成 { changed, text, reason }。
     let outcome
     if (enable && file === path) {
-      outcome = { changed: true, text: insertPrependRules(text, UU_DIRECT_RULES) }
+      outcome = { changed: true, text: insertPrependRules(text, rulesToWrite) }
     } else if (enable) {
-      outcome = prependRulesToConfig(text, UU_DIRECT_RULES)
+      outcome = prependRulesToConfig(text, rulesToWrite)
     } else {
-      outcome = removeRulesFromConfig(text, UU_DIRECT_RULES)
+      outcome = removeRulesFromConfig(text, REMOTE_DIRECT_RULES)
     }
     if (!outcome.changed) {
       results.push({ file, changed: false, reason: outcome.reason ?? '没有匹配的规则' })
       continue
     }
+    writes.push({ file, previous: text, next: outcome.text })
+  }
+
+  // 先全部落盘，再用内核 -t 自检；验不过就把动过的文件全部还原。
+  for (const item of writes) {
     try {
-      writeFile(file, outcome.text)
-      results.push({ file, changed: true })
+      writeFile(item.file, item.next)
+      item.written = true
+      results.push({ file: item.file, changed: true })
     } catch (error) {
-      results.push({ file, changed: false, reason: `写入失败：${error.code ?? error.message}` })
+      results.push({ file: item.file, changed: false, reason: `写入失败：${error.code ?? error.message}` })
     }
+  }
+  const written = writes.filter((item) => item.written)
+  const commit = commitConfigWrites(written, {
+    corePath: findClashCore({ programData, exists }),
+    run: validateRun,
+  })
+  if (!commit.ok) {
+    for (const item of results) if (item.changed) item.changed = false
+    results.push({ file: '(回滚)', changed: false, reason: `内核自检失败，已全部还原：${commit.error}` })
+    return { changed: false, enabled: !enable, rolledBack: true, reason: commit.error, results }
   }
 
   const changedFiles = results.filter((item) => item.changed)
@@ -916,6 +976,9 @@ export function setUuDirectRules(
     results,
   }
 }
+
+/** 旧名兼容：规则集从 UU 一家扩成了全家桶。 */
+export const setUuDirectRules = setRemoteDirectRules
 
 /** 把规则插到配置 `rules:` 段的最前面（两份配置都要，见 applyClaudeRules）。 */
 export function prependRulesToConfig(text, rules) {
@@ -952,6 +1015,7 @@ export function applyClaudeRules(dir, options = {}) {
     writeFile = (p, t) => writeFileSync(p, t),
     group,
     programData = process.env.ProgramData ?? 'C:\\ProgramData',
+    validateRun,
   } = options
 
   // 覆盖判定用生效配置（订阅 + 增强合并后的结果），不是增强文件本身。
@@ -961,16 +1025,16 @@ export function applyClaudeRules(dir, options = {}) {
   const target = claudeRuleBlock(group ?? claudeRuleGroup(effective))
   const results = []
 
+  const writes = []
   const path = ruleEnhancementPath(dir, { exists, readFile })
   if (path) {
     try {
-      writeFile(path, insertPrependRules(readFile(path), target))
-      results.push({ file: path, changed: true })
+      const before = readFile(path)
+      writes.push({ file: path, previous: before, next: insertPrependRules(before, target) })
     } catch (error) {
-      results.push({ file: path, changed: false, reason: `写入失败：${error.code ?? error.message}` })
+      results.push({ file: path, changed: false, reason: `读取失败：${error.code ?? error.message}` })
     }
   }
-
   for (const file of clashConfigTargets(dir, { exists, programData })) {
     if (file === path) continue
     let text
@@ -985,11 +1049,32 @@ export function applyClaudeRules(dir, options = {}) {
       results.push({ file, changed: false, reason: outcome.reason })
       continue
     }
+    writes.push({ file, previous: text, next: outcome.text })
+  }
+
+  // 先全部落盘，再用内核 -t 自检；验不过就整体还原。
+  for (const item of writes) {
     try {
-      writeFile(file, outcome.text)
-      results.push({ file, changed: true })
+      writeFile(item.file, item.next)
+      item.written = true
+      results.push({ file: item.file, changed: true })
     } catch (error) {
-      results.push({ file, changed: false, reason: `写入失败：${error.code ?? error.message}` })
+      results.push({ file: item.file, changed: false, reason: `写入失败：${error.code ?? error.message}` })
+    }
+  }
+  const written = writes.filter((item) => item.written)
+  const commit = commitConfigWrites(written, {
+    corePath: findClashCore({ programData, exists }),
+    run: validateRun,
+  })
+  if (!commit.ok) {
+    for (const item of results) if (item.changed) item.changed = false
+    return {
+      changed: false,
+      durable: false,
+      rolledBack: true,
+      reason: `内核自检失败，已全部还原：${commit.error}`,
+      results,
     }
   }
 
@@ -1025,3 +1110,81 @@ export function readClashRules(dir, options = {}) {
 }
 
 export { CORE_PROCESS_NAMES, SAFE_NAMESERVERS }
+
+/* --------------------------------------------- 内核自检：写坏就整体回滚 */
+
+/**
+ * 找内核可执行文件（clash-verge-service 的 cores 目录）。
+ *
+ * 找不到就返回 null —— 测试环境 / 非服务模式安装时没有它，验证跳过而不是报错。
+ */
+export function findClashCore({
+  programData = process.env.ProgramData ?? 'C:\ProgramData',
+  exists = existsSync,
+} = {}) {
+  const cores = join(programData, 'clash-verge-service', 'cores')
+  for (const name of ['verge-mihomo.exe', 'mihomo.exe', 'clash-meta.exe']) {
+    const path = join(cores, name)
+    if (exists(path)) return path
+  }
+  return null
+}
+
+/**
+ * 用内核自带的 `-t` 验证一份配置能不能被解析。
+ *
+ * 今天的教训：往规则里写的组名和 proxy-groups 里的对不上（大小写差一个字母），
+ * 内核直接 Fatal，代理起不来 —— 而写的时候没有任何报错。写完必验，验不过就
+ * 把这次动过的文件全部还原。
+ */
+export function validateClashConfig(
+  configPath,
+  { corePath, run = defaultValidateRun, timeoutMs = 60_000 } = {},
+) {
+  // 找不到内核：真实环境（没装服务模式）跳过自检；测试注入了自定义 run 就照跑。
+  if (!corePath && run === defaultValidateRun) return { ok: true, skipped: true }
+  const geoDir = dirname(configPath)
+  try {
+    run([corePath, ['-t', '-f', configPath, '-d', geoDir], timeoutMs])
+    return { ok: true }
+  } catch (error) {
+    const output = String(error?.stdout ?? '') + String(error?.stderr ?? '') + String(error?.message ?? '')
+    const detail =
+      output.match(/level=(?:error|fatal)[^\r\n]*/)?.[0] ??
+      output.split(/\r?\n/).find((line) => /error|fatal/i.test(line)) ??
+      `退出码 ${error?.status ?? 'unknown'}`
+    return { ok: false, error: detail.trim().slice(0, 300) }
+  }
+}
+
+function defaultValidateRun([exe, args, timeoutMs]) {
+  execFileSync(exe, args, { windowsHide: true, encoding: 'utf8', timeout: timeoutMs, stdio: ['ignore', 'pipe', 'pipe'] })
+}
+
+/**
+ * 提交一批配置写入：内核自检不过就把所有动过的文件还原。
+ *
+ * `writes` 的每项是 `{ file, previous, next }`，调用方写完后把清单交进来。
+ * `previous` 为 null 表示这个文件是新建的（还原 = 删掉）。
+ */
+export function commitConfigWrites(
+  writes,
+  { corePath, run = defaultValidateRun, removeFile, writeFile = (p, t) => writeFileSync(p, t) } = {},
+) {
+  if (writes.length === 0) return { ok: true }
+  // 只验运行时那份：内核真正读的是它。
+  const runtime = [...writes].reverse().find((item) => /[\/]runtime[\/]config\.yaml$/i.test(item.file))
+  const check = validateClashConfig(runtime ? runtime.file : writes[writes.length - 1].file, { corePath, run })
+  if (check.ok) return { ok: true }
+
+  const remove = removeFile ?? ((p) => unlinkSync(p))
+  for (const item of writes) {
+    try {
+      if (item.previous === null) remove(item.file)
+      else writeFile(item.file, item.previous)
+    } catch {
+      // 还原失败时已无更好的动作；错误信息里会带上内核的报错。
+    }
+  }
+  return { ok: false, error: check.error }
+}

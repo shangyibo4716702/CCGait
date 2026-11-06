@@ -308,7 +308,7 @@ export function createUiServer({ session, logger, token = randomBytes(24).toStri
             return
           case '/api/proxy/uu': {
             const body = await readJsonBody(request).catch(() => ({}))
-            sendJson(response, 200, await session.setUuDirect(body?.enable !== false))
+            sendJson(response, 200, await session.setRemoteDirect(body?.enable !== false))
             return
           }
           case '/api/dns/repair':

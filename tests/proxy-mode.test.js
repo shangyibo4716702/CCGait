@@ -32,10 +32,14 @@ import {
   readClashRules,
   writeProxyMode,
   prependRulesToConfig,
+  findClashCore,
   UU_DIRECT_RULES,
+  REMOTE_DIRECT_RULES,
   hasUuDirectRules,
+  hasRemoteDirectRules,
   removeRulesFromConfig,
   setUuDirectRules,
+  setRemoteDirectRules,
 } from '../src/proxy-mode.js'
 
 const tempDirs = []
@@ -678,7 +682,7 @@ describe('规则增强文件写入', () => {
       ['mode: rule', 'rules:', '- GEOSITE,CN,DIRECT', '- MATCH,IPEqual'].join('\n'),
     )
 
-    const first = applyClaudeRules(root)
+    const first = applyClaudeRules(root, { programData: join(root, 'nope') })
     assert.equal(first.changed, true)
     const written = readFileSync(join(profilesDir, 'RULES.yaml'), 'utf8')
     assert.ok(written.includes('DOMAIN-SUFFIX,anthropic.com,IPEqual'))
@@ -820,6 +824,135 @@ describe('UU 远程直连规则', () => {
     const off = setUuDirectRules(root, false, { programData: join(root, 'nope') })
     assert.equal(off.changed, true)
     assert.equal(hasUuDirectRules(readClashRules(root)), false)
+    assert.equal(readFileSync(join(root, 'clash-verge.yaml'), 'utf8'), original)
+  })
+})
+
+describe('远程软件直连（UU / ToDesk / 向日葵）', () => {
+  it('规则覆盖三家进程、域名与内网网段', () => {
+    assert.ok(REMOTE_DIRECT_RULES.includes('PROCESS-NAME-REGEX,(?i)^todesk,DIRECT'))
+    assert.ok(REMOTE_DIRECT_RULES.includes('PROCESS-NAME-REGEX,(?i)(awesun|sunlogin|oray),DIRECT'))
+    assert.ok(REMOTE_DIRECT_RULES.includes('DOMAIN-SUFFIX,oray.com,DIRECT'))
+    assert.ok(REMOTE_DIRECT_RULES.includes('DOMAIN-SUFFIX,todesk.com,DIRECT'))
+    assert.ok(REMOTE_DIRECT_RULES.includes('DOMAIN-SUFFIX,uu.163.com,DIRECT'))
+    for (const cidr of ['192.168.0.0/16', '10.0.0.0/8', '172.16.0.0/12', '100.64.0.0/10']) {
+      assert.ok(REMOTE_DIRECT_RULES.includes(`IP-CIDR,${cidr},DIRECT,no-resolve`), cidr)
+    }
+  })
+
+  it('旧配置只写了 UU 那几条 → 判定不算开启，补写只加缺的不重复', () => {
+    const root = tempDir()
+    const profilesDir = join(root, 'profiles')
+    mkdirSync(profilesDir, { recursive: true })
+    writeFileSync(
+      join(root, 'profiles.yaml'),
+      ['current: SUB', 'items:', '- uid: RULES', '  type: rules', '  file: RULES.yaml', '- uid: SUB', '  type: remote', '  file: SUB.yaml', '  option:', '    rules: RULES'].join('\n'),
+    )
+    writeFileSync(join(profilesDir, 'RULES.yaml'), 'prepend: []\n')
+    const oldRules = [
+      'PROCESS-NAME-REGEX,(?i)^uu,DIRECT',
+      'DOMAIN-SUFFIX,uu.163.com,DIRECT',
+      'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve',
+    ]
+    writeFileSync(
+      join(root, 'clash-verge.yaml'),
+      ['mode: rule', 'rules:', ...oldRules.map((rule) => `- ${rule}`)].join('\n'),
+    )
+    // some 语义会误报"已开启"，必须 every
+    assert.equal(hasRemoteDirectRules(readClashRules(root)), false)
+
+    const outcome = setRemoteDirectRules(root, true, { programData: join(root, 'nope') })
+    assert.equal(outcome.changed, true)
+    const rules = readClashRules(root)
+    assert.equal(hasRemoteDirectRules(rules), true)
+    // 旧的 UU 规则不重复出现
+    assert.equal(rules.filter((rule) => rule === 'PROCESS-NAME-REGEX,(?i)^uu,DIRECT').length, 1)
+    assert.ok(rules.includes('PROCESS-NAME-REGEX,(?i)^todesk,DIRECT'))
+  })
+
+  it('撤销时整组移除（包括之前手写的那几条）', () => {
+    const root = tempDir()
+    const profilesDir = join(root, 'profiles')
+    mkdirSync(profilesDir, { recursive: true })
+    writeFileSync(
+      join(root, 'profiles.yaml'),
+      ['current: SUB', 'items:', '- uid: RULES', '  type: rules', '  file: RULES.yaml', '- uid: SUB', '  type: remote', '  file: SUB.yaml', '  option:', '    rules: RULES'].join('\n'),
+    )
+    writeFileSync(join(profilesDir, 'RULES.yaml'), 'prepend: []\n')
+    writeFileSync(
+      join(root, 'clash-verge.yaml'),
+      ['mode: rule', 'rules:', '- PROCESS-NAME-REGEX,(?i)^uu,DIRECT', '- GEOSITE,CN,DIRECT', '- MATCH,IPEqual'].join('\n'),
+    )
+    const on = setRemoteDirectRules(root, true, { programData: join(root, 'nope') })
+    assert.equal(on.changed, true)
+    const off = setRemoteDirectRules(root, false, { programData: join(root, 'nope') })
+    assert.equal(off.changed, true)
+    const rules = readClashRules(root)
+    assert.equal(hasRemoteDirectRules(rules), false)
+    assert.ok(rules.includes('GEOSITE,CN,DIRECT'), '别人的规则要原样保留')
+  })
+})
+
+describe('内核自检与回滚', () => {
+  const setup = () => {
+    const root = tempDir()
+    const profilesDir = join(root, 'profiles')
+    mkdirSync(profilesDir, { recursive: true })
+    writeFileSync(
+      join(root, 'profiles.yaml'),
+      ['current: SUB', 'items:', '- uid: RULES', '  type: rules', '  file: RULES.yaml', '- uid: SUB', '  type: remote', '  file: SUB.yaml', '  option:', '    rules: RULES'].join('\n'),
+    )
+    writeFileSync(join(profilesDir, 'RULES.yaml'), 'prepend: []\n')
+    const original = ['mode: rule', 'rules:', '- GEOSITE,CN,DIRECT', '- MATCH,IpEqual'].join('\n')
+    writeFileSync(join(root, 'clash-verge.yaml'), original)
+    return { root, profilesDir, original }
+  }
+
+  const fatal = () => {
+    const error = new Error('exited non-zero')
+    error.stdout = 'level=fatal msg="Parse config error: rules[0] error: proxy [X] not found"'
+    throw error
+  }
+
+  it('内核自检失败 → 整体还原，一个文件都不留改动', () => {
+    const { root, profilesDir, original } = setup()
+    const outcome = applyClaudeRules(root, {
+      programData: join(root, 'nope'),
+      validateRun: fatal,
+    })
+    assert.equal(outcome.changed, false)
+    assert.equal(outcome.rolledBack, true)
+    assert.match(outcome.reason, /Parse config error/)
+    assert.equal(readFileSync(join(root, 'clash-verge.yaml'), 'utf8'), original)
+    assert.equal(readFileSync(join(profilesDir, 'RULES.yaml'), 'utf8'), 'prepend: []\n')
+  })
+
+  it('内核自检通过 → 正常写入', () => {
+    const { root, profilesDir } = setup()
+    const outcome = applyClaudeRules(root, {
+      programData: join(root, 'nope'),
+      validateRun: () => {},
+    })
+    assert.equal(outcome.changed, true)
+    assert.ok(readFileSync(join(root, 'clash-verge.yaml'), 'utf8').includes('anthropic.com'))
+    assert.ok(readFileSync(join(profilesDir, 'RULES.yaml'), 'utf8').includes('anthropic.com'))
+  })
+
+  it('找不到内核（非服务模式 / 测试环境）→ 跳过自检，照常写入', () => {
+    const { root } = setup()
+    const outcome = applyClaudeRules(root, { programData: join(root, 'nope') })
+    assert.equal(outcome.changed, true)
+    assert.equal(findClashCore({ programData: join(root, 'nope') }), null)
+  })
+
+  it('setRemoteDirectRules 同样受自检保护', () => {
+    const { root, original } = setup()
+    const outcome = setRemoteDirectRules(root, true, {
+      programData: join(root, 'nope'),
+      validateRun: fatal,
+    })
+    assert.equal(outcome.changed, false)
+    assert.equal(outcome.rolledBack, true)
     assert.equal(readFileSync(join(root, 'clash-verge.yaml'), 'utf8'), original)
   })
 })
