@@ -1641,7 +1641,15 @@ function renderQuota(data) {
       const countdown = el('span', 'quota-countdown')
       countdown.dataset.resetAt = row.resetAt
       countdown.textContent = formatRemaining(Date.parse(row.resetAt) - Date.now())
-      line.append(el('span', 'quota-tag', '重置'), countdown)
+      const resetAt = new Date(row.resetAt)
+      // 重置时刻直接给出来：今天只给时分秒，跨天带上日期，倒计时旁边就能看到几点重置。
+      const absolute =
+        resetAt.toDateString() === new Date().toDateString()
+          ? resetAt.toLocaleTimeString()
+          : resetAt.toLocaleString()
+      const clock = el('span', 'quota-clock', absolute)
+      clock.title = `预计 ${resetAt.toLocaleString()} 重置（${row.exact ? '精确来源' : '推算，误差见下行'}）`
+      line.append(el('span', 'quota-tag', '重置'), countdown, el('span', 'quota-at', '于'), clock)
       if (typeof row.weeklyPercent === 'number') {
         line.append(el('span', 'quota-week', `周 ${row.weeklyPercent}%`))
       }
