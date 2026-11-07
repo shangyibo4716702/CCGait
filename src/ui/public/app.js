@@ -1642,16 +1642,14 @@ function renderQuota(data) {
       countdown.dataset.resetAt = row.resetAt
       countdown.textContent = formatRemaining(Date.parse(row.resetAt) - Date.now())
       const resetAt = new Date(row.resetAt)
-      // 重置时刻直接给出来：今天只给时分秒，跨天带上日期，倒计时旁边就能看到几点重置。
-      const absolute =
-        resetAt.toDateString() === new Date().toDateString()
-          ? resetAt.toLocaleTimeString()
-          : resetAt.toLocaleString()
+      const absolute = formatResetTime(resetAt)
       const clock = el('span', 'quota-clock', absolute)
       clock.title = `预计 ${resetAt.toLocaleString()} 重置（${row.exact ? '精确来源' : '推算，误差见下行'}）`
       line.append(el('span', 'quota-tag', '重置'), countdown, el('span', 'quota-at', '于'), clock)
       if (typeof row.weeklyPercent === 'number') {
-        line.append(el('span', 'quota-week', `周 ${row.weeklyPercent}%`))
+        const week = el('span', 'quota-week', `周 ${row.weeklyPercent}%`)
+        week.title = '周额度的重置时刻本地采样里没有 —— Claude 只写占用百分比。要精确时刻得接入 usage 接口（需要 CLI 授权一次）。'
+        line.append(week)
       }
     } else if (row.confidence === 'unknown') {
       line.append(el('span', 'quota-tag is-unknown', '重置时间无法推算'))
@@ -1699,6 +1697,20 @@ function renderQuota(data) {
     }
     host.append(details)
   }
+}
+
+/**
+ * 时刻 → 「星期五 晚上11:27」。
+ *
+ * 用户点名要这个格式：周几、上午/下午、几点。用 zh-CN 的 dayPeriod，
+ * 它会给出 凌晨/早上/上午/中午/下午/晚上 的正确分段。
+ */
+function formatResetTime(date) {
+  const h = date.getHours()
+  // 用户点名的分段：凌晨 / 上午 / 中午 / 下午 / 晚上（zh-CN 的 dayPeriod 把 23 点也算下午，不直观）
+  const period = h < 6 ? '凌晨' : h < 12 ? '上午' : h < 13 ? '中午' : h < 18 ? '下午' : '晚上'
+  const hh12 = h % 12 === 0 ? 12 : h % 12
+  return `${date.toLocaleString('zh-CN', { weekday: 'long' })} ${period}${hh12}:${String(date.getMinutes()).padStart(2, '0')}`
 }
 
 /** 毫秒 → 3:12:44。 */
